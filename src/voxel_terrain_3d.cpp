@@ -31,19 +31,27 @@ void VoxelTerrain3D::_bind_methods() {
     ClassDB::bind_method(D_METHOD("core_idle"), &VoxelTerrain3D::core_idle);
     ClassDB::bind_method(D_METHOD("fully_committed"), &VoxelTerrain3D::fully_committed);
     ClassDB::bind_method(D_METHOD("get_effective_view_distance_chunks"), &VoxelTerrain3D::get_effective_view_distance_chunks);
+    ClassDB::bind_method(D_METHOD("get_view_distance_chunks"), &VoxelTerrain3D::get_view_distance_chunks);
+    ClassDB::bind_method(D_METHOD("set_view_distance_chunks", "distance"), &VoxelTerrain3D::set_view_distance_chunks);
     ClassDB::bind_method(D_METHOD("get_prefetch_distance_chunks"), &VoxelTerrain3D::get_prefetch_distance_chunks);
     ClassDB::bind_method(D_METHOD("set_prefetch_distance_chunks", "distance"), &VoxelTerrain3D::set_prefetch_distance_chunks);
     ClassDB::bind_method(D_METHOD("get_resident_memory_budget_mb"), &VoxelTerrain3D::get_resident_memory_budget_mb);
     ClassDB::bind_method(D_METHOD("set_resident_memory_budget_mb", "mb"), &VoxelTerrain3D::set_resident_memory_budget_mb);
     ClassDB::bind_method(D_METHOD("get_upload_budget_ms"), &VoxelTerrain3D::get_upload_budget_ms);
     ClassDB::bind_method(D_METHOD("set_upload_budget_ms", "ms"), &VoxelTerrain3D::set_upload_budget_ms);
+    ClassDB::bind_method(D_METHOD("get_terrain_material"), &VoxelTerrain3D::get_terrain_material);
+    ClassDB::bind_method(D_METHOD("set_terrain_material", "material"), &VoxelTerrain3D::set_terrain_material);
 
+    ADD_PROPERTY(PropertyInfo(Variant::INT, "view_distance_chunks", PROPERTY_HINT_RANGE, "1,24,1"),
+                 "set_view_distance_chunks", "get_view_distance_chunks");
     ADD_PROPERTY(PropertyInfo(Variant::INT, "prefetch_distance_chunks", PROPERTY_HINT_RANGE, "0,8,1"),
                  "set_prefetch_distance_chunks", "get_prefetch_distance_chunks");
     ADD_PROPERTY(PropertyInfo(Variant::INT, "resident_memory_budget_mb", PROPERTY_HINT_RANGE, "128,4096,64"),
                  "set_resident_memory_budget_mb", "get_resident_memory_budget_mb");
     ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "upload_budget_ms", PROPERTY_HINT_RANGE, "0.5,16.0,0.5"),
                  "set_upload_budget_ms", "get_upload_budget_ms");
+    ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "terrain_material", PROPERTY_HINT_RESOURCE_TYPE, "Material"),
+                 "set_terrain_material", "get_terrain_material");
 
     ADD_SIGNAL(MethodInfo("explosion_requested",
         PropertyInfo(Variant::VECTOR3, "position"),
@@ -67,6 +75,14 @@ VoxelTerrain3D::~VoxelTerrain3D() {
     }
 }
 
+#if defined(VOXEL_WITH_GODOT_CPP)
+void VoxelTerrain3D::set_terrain_material(const Ref<Material>& p_mat) {
+    terrain_material = p_mat;
+    server_slot_manager.set_material_override(
+        p_mat.is_valid() ? p_mat->get_rid() : RID());
+}
+#endif
+
 void VoxelTerrain3D::set_resident_memory_budget_mb(int p_mb) {
     resident_memory_budget_mb = p_mb;
     if (core_engine) {
@@ -84,8 +100,23 @@ void VoxelTerrain3D::_enter_tree() {
         std::string(save_directory_path.c_str()));
     core_engine->worker_pool->start();
 
-    navigation_manager.initialize(voxel::ServerRid{1});
-    server_slot_manager.initialize(voxel::ServerRid{2}, voxel::ServerRid{3});
+    voxel::ServerRid scenario_rid{2};
+    voxel::ServerRid space_rid{3};
+    voxel::ServerRid nav_map_rid{1};
+
+#if defined(VOXEL_WITH_GODOT_CPP)
+    if (get_world_3d().is_valid()) {
+        scenario_rid.native_rid = get_world_3d()->get_scenario();
+        space_rid.native_rid = get_world_3d()->get_space();
+        nav_map_rid.native_rid = get_world_3d()->get_navigation_map();
+    }
+    if (terrain_material.is_valid()) {
+        server_slot_manager.set_material_override(terrain_material->get_rid());
+    }
+#endif
+
+    navigation_manager.initialize(nav_map_rid);
+    server_slot_manager.initialize(scenario_rid, space_rid);
 }
 
 void VoxelTerrain3D::_exit_tree() {
@@ -135,12 +166,18 @@ void VoxelTerrain3D::save_world() {
 void VoxelTerrain3D::set_stream_focus(Vector3 p_position, Vector3 p_velocity) {
     stream_focus_position = p_position;
     stream_focus_velocity = p_velocity;
-    if (core_engine) {
-        const voxel::ChunkKey focus_ck = voxel::ChunkKey::from_world_sample(
-            static_cast<int32_t>( std::floor(p_position.x)),
-            static_cast<int32_t>(std::floor(p_position.y)),
-            static_cast<int32_t>(std::floor(p_position.z)));
-        core_engine->dirty_scheduler.set_focus_chunk(focus_ck);
+    if (core_engine && core_engine->streaming_manager) {
+        const std::vector<voxel::ChunkKey> unloaded =
+            core_engine->streaming_manager->update_stream_focus(
+                voxel::Vec3f{p_position.x, p_position.y, p_position.z},
+                voxel::Vec3f{p_velocity.x, p_velocity.y, p_velocity.z},
+                get_effective_view_distance_chunks(),
+                prefetch_distance_chunks,
+                core_engine->stream_grid34);
+        for (const voxel::ChunkKey uk : unloaded) {
+            server_slot_manager.free_chunk_slot(uk);
+            navigation_manager.note_chunk_unloaded(uk);
+        }
     }
 }
 
@@ -161,8 +198,8 @@ int VoxelTerrain3D::get_effective_view_distance_chunks() const {
     }
     const std::size_t reserved = core_engine->ledger.total_reserved_bytes();
     const std::size_t budget = core_engine->ledger.budget_bytes();
-    if (reserved >= budget && view_distance_chunks > 4) {
-        return view_distance_chunks - 2;
+    if (reserved >= budget && view_distance_chunks > 1) {
+        return std::max(1, view_distance_chunks - 2);
     }
     return view_distance_chunks;
 }
@@ -223,8 +260,6 @@ void VoxelTerrain3D::_process(double /*delta*/) {
             break;
         }
 
-        // Dynamic per-iteration check: only bypass soft_budget_us while depth is at/above 32,
-        // and never exceed emergency_budget_us on any single frame (Section 4.3, 5.2).
         const bool currently_over_cap = (remaining_depth >= 32ULL);
         if (!currently_over_cap && elapsed_us >= soft_budget_us) {
             break;
@@ -234,7 +269,6 @@ void VoxelTerrain3D::_process(double /*delta*/) {
         }
     }
 
-    // Async navigation group submissions (< 0.2 ms main-thread cost per group).
     navigation_manager.submit_ready_groups_to_server(server_slot_manager);
 
     for (const voxel::ChunkKey key : navigation_manager.drain_newly_committed_chunks()) {

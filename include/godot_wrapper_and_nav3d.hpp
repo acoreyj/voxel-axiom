@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <optional>
 #include <string>
@@ -14,17 +15,41 @@
 #include <unordered_set>
 #include <vector>
 
+#if defined(VOXEL_WITH_GODOT_CPP)
+#include <godot_cpp/classes/array_mesh.hpp>
+#include <godot_cpp/classes/material.hpp>
+#include <godot_cpp/classes/navigation_mesh.hpp>
+#include <godot_cpp/classes/navigation_mesh_source_geometry_data3d.hpp>
+#include <godot_cpp/classes/navigation_server3d.hpp>
+#include <godot_cpp/classes/physics_server3d.hpp>
+#include <godot_cpp/classes/rendering_server.hpp>
+#include <godot_cpp/variant/array.hpp>
+#include <godot_cpp/variant/callable_method_pointer.hpp>
+#include <godot_cpp/variant/packed_int32_array.hpp>
+#include <godot_cpp/variant/packed_vector3_array.hpp>
+#include <godot_cpp/variant/rid.hpp>
+#include <godot_cpp/variant/transform3d.hpp>
+#endif
+
 namespace voxel {
 
 // ============================================================================
 // 1. Direct Server RID Slot Manager (HLD v4.0 Sections 4.1, 4.4, 5.3)
 // ============================================================================
 
-/// Lightweight handle representing a Godot RenderingServer or PhysicsServer3D RID.
 struct ServerRid {
     uint64_t id = 0;
-    [[nodiscard]] constexpr bool is_valid() const noexcept { return id != 0; }
-    constexpr bool operator==(const ServerRid&) const noexcept = default;
+#if defined(VOXEL_WITH_GODOT_CPP)
+    godot::RID native_rid{};
+#endif
+    [[nodiscard]] bool is_valid() const noexcept {
+#if defined(VOXEL_WITH_GODOT_CPP)
+        return native_rid.is_valid() || id != 0;
+#else
+        return id != 0;
+#endif
+    }
+    bool operator==(const ServerRid& o) const noexcept { return id == o.id; }
 };
 
 struct ChunkServerSlot {
@@ -33,6 +58,9 @@ struct ChunkServerSlot {
     ServerRid body_rid{};
     ServerRid shape_rid{};
     std::vector<Vec3f> cached_nav_faces; // Retained for 3D NavigationGroup rebakes
+#if defined(VOXEL_WITH_GODOT_CPP)
+    godot::PackedVector3Array godot_nav_faces;
+#endif
     uint64_t committed_version = 0;
     uint64_t committed_terrain_revision = 0;
 };
@@ -48,6 +76,12 @@ public:
         space_rid_ = space_rid;
         initialized_ = true;
     }
+
+#if defined(VOXEL_WITH_GODOT_CPP)
+    void set_material_override(godot::RID material_rid) noexcept {
+        material_override_rid_ = material_rid;
+    }
+#endif
 
     void set_commit_hook(CommitHookFn hook) {
         commit_hook_ = std::move(hook);
@@ -65,10 +99,78 @@ public:
             slot.instance_rid = allocate_rid();
             slot.body_rid = allocate_rid();
             slot.shape_rid = allocate_rid();
+
+#if defined(VOXEL_WITH_GODOT_CPP)
+            auto* rs = godot::RenderingServer::get_singleton();
+            auto* ps = godot::PhysicsServer3D::get_singleton();
+            if (rs && ps) {
+                slot.mesh_rid.native_rid = rs->mesh_create();
+                slot.instance_rid.native_rid = rs->instance_create();
+                rs->instance_set_base(slot.instance_rid.native_rid, slot.mesh_rid.native_rid);
+                if (scenario_rid_.native_rid.is_valid()) {
+                    rs->instance_set_scenario(slot.instance_rid.native_rid, scenario_rid_.native_rid);
+                }
+                if (material_override_rid_.is_valid()) {
+                    rs->instance_geometry_set_material_override(
+                        slot.instance_rid.native_rid, material_override_rid_);
+                }
+
+                slot.body_rid.native_rid = ps->body_create();
+                ps->body_set_mode(slot.body_rid.native_rid, godot::PhysicsServer3D::BODY_MODE_STATIC);
+                if (space_rid_.native_rid.is_valid()) {
+                    ps->body_set_space(slot.body_rid.native_rid, space_rid_.native_rid);
+                }
+                slot.shape_rid.native_rid = ps->concave_polygon_shape_create();
+                ps->body_add_shape(slot.body_rid.native_rid, slot.shape_rid.native_rid);
+            }
+#endif
         }
 
-        // Atomic swap of pre-unpacked triangle soup shared between PhysicsServer3D
-        // concave polygon shape and cached_nav_faces (Section 4.1, 4.4).
+#if defined(VOXEL_WITH_GODOT_CPP)
+        auto* rs = godot::RenderingServer::get_singleton();
+        auto* ps = godot::PhysicsServer3D::get_singleton();
+        if (rs && ps && slot.mesh_rid.native_rid.is_valid()) {
+            rs->mesh_clear(slot.mesh_rid.native_rid);
+
+            if (!mesh.vertices.empty() && !mesh.indices.empty()) {
+                godot::PackedVector3Array verts;
+                verts.resize(static_cast<int64_t>(mesh.vertices.size()));
+                std::memcpy(verts.ptrw(), mesh.vertices.data(), mesh.vertices.size() * sizeof(Vec3f));
+
+                godot::PackedVector3Array norms;
+                norms.resize(static_cast<int64_t>(mesh.normals.size()));
+                std::memcpy(norms.ptrw(), mesh.normals.data(), mesh.normals.size() * sizeof(Vec3f));
+
+                godot::PackedInt32Array indices;
+                indices.resize(static_cast<int64_t>(mesh.indices.size()));
+                std::memcpy(indices.ptrw(), mesh.indices.data(), mesh.indices.size() * sizeof(int32_t));
+
+                godot::Array surface_arrays;
+                surface_arrays.resize(godot::RenderingServer::ARRAY_MAX);
+                surface_arrays[godot::RenderingServer::ARRAY_VERTEX] = verts;
+                surface_arrays[godot::RenderingServer::ARRAY_NORMAL] = norms;
+                surface_arrays[godot::RenderingServer::ARRAY_INDEX]  = indices;
+
+                rs->mesh_add_surface_from_arrays(
+                    slot.mesh_rid.native_rid,
+                    godot::RenderingServer::PRIMITIVE_TRIANGLES,
+                    surface_arrays);
+            }
+
+            // Copy pre-unpacked triangle soup once and share between PhysicsServer3D and cached_nav_faces.
+            slot.godot_nav_faces.resize(static_cast<int64_t>(mesh.collision_faces.size()));
+            if (!mesh.collision_faces.empty()) {
+                std::memcpy(slot.godot_nav_faces.ptrw(),
+                            mesh.collision_faces.data(),
+                            mesh.collision_faces.size() * sizeof(Vec3f));
+            }
+            godot::Dictionary shape_dict;
+            shape_dict["faces"] = slot.godot_nav_faces;
+            shape_dict["backface_collision"] = false;
+            ps->shape_set_data(slot.shape_rid.native_rid, shape_dict);
+        }
+#endif
+
         slot.cached_nav_faces = mesh.collision_faces;
         slot.committed_version = mesh.captured_version;
         slot.committed_terrain_revision = mesh.captured_terrain_revision;
@@ -77,6 +179,7 @@ public:
     void free_chunk_slot(ChunkKey key) noexcept {
         auto it = slots_.find(key);
         if (it != slots_.end()) {
+            release_slot_rids(it->second);
             freed_rids_count_ += 4;
             slots_.erase(it);
         }
@@ -84,6 +187,9 @@ public:
 
     /// Step 7 of Ordered Teardown (Section 5.3): Free all RenderingServer & PhysicsServer3D RIDs.
     void free_all_rids() noexcept {
+        for (auto& [ck, slot] : slots_) {
+            release_slot_rids(slot);
+        }
         freed_rids_count_ += slots_.size() * 4;
         slots_.clear();
         initialized_ = false;
@@ -108,9 +214,29 @@ private:
         return ServerRid{++next_rid_counter_};
     }
 
+    static void release_slot_rids(ChunkServerSlot& slot) noexcept {
+#if defined(VOXEL_WITH_GODOT_CPP)
+        auto* rs = godot::RenderingServer::get_singleton();
+        auto* ps = godot::PhysicsServer3D::get_singleton();
+        if (rs) {
+            if (slot.instance_rid.native_rid.is_valid()) rs->free_rid(slot.instance_rid.native_rid);
+            if (slot.mesh_rid.native_rid.is_valid()) rs->free_rid(slot.mesh_rid.native_rid);
+        }
+        if (ps) {
+            if (slot.body_rid.native_rid.is_valid()) ps->free_rid(slot.body_rid.native_rid);
+            if (slot.shape_rid.native_rid.is_valid()) ps->free_rid(slot.shape_rid.native_rid);
+        }
+#else
+        (void)slot;
+#endif
+    }
+
     bool initialized_ = false;
     ServerRid scenario_rid_{};
     ServerRid space_rid_{};
+#if defined(VOXEL_WITH_GODOT_CPP)
+    godot::RID material_override_rid_{};
+#endif
     uint64_t next_rid_counter_ = 0;
     std::size_t freed_rids_count_ = 0;
     CommitHookFn commit_hook_;
@@ -136,12 +262,10 @@ struct CaveNavMeshConfig {
     bool filter_ledge_spans = true;
     bool filter_walkable_low_height_spans = true;
 
-    /// Horizontal border padding: P_xz = r_agent + r_connection + 2*s (Section 4.5)
     [[nodiscard]] constexpr float horizontal_padding() const noexcept {
         return agent_radius + region_connection_margin + 2.0f * voxel_scale;
     }
 
-    /// Vertical border padding: P_y = h_agent + h_max_climb + 2*s (Section 4.5)
     [[nodiscard]] constexpr float vertical_padding() const noexcept {
         return agent_height + agent_max_climb + 2.0f * voxel_scale;
     }
@@ -165,6 +289,11 @@ struct NavigationGroupState {
     Aabb3f owned_aabb{};
     Aabb3f baking_aabb{};
     float border_size = 0.0f;
+
+#if defined(VOXEL_WITH_GODOT_CPP)
+    godot::Ref<godot::NavigationMesh> nav_mesh;
+    godot::Ref<godot::NavigationMeshSourceGeometryData3D> source_data;
+#endif
 
     std::vector<Vec3f> assembled_source_faces;
 
@@ -194,6 +323,15 @@ public:
     }
 
     void shutdown() noexcept {
+#if defined(VOXEL_WITH_GODOT_CPP)
+        if (auto* ns = godot::NavigationServer3D::get_singleton()) {
+            for (auto& [gk, g] : groups_) {
+                if (g.region_rid.native_rid.is_valid()) {
+                    ns->free_rid(g.region_rid.native_rid);
+                }
+            }
+        }
+#endif
         groups_.clear();
         chunk_revisions_.clear();
         waiting_chunks_.clear();
@@ -201,8 +339,6 @@ public:
         initialized_ = false;
     }
 
-    /// Computes the owned AABB for a 3D `4 x 2 x 4` navigation group:
-    ///   [(128*gx, 64*gy, 128*gz)*s, (128*(gx+1), 64*(gy+1), 128*(gz+1))*s]
     [[nodiscard]] Aabb3f compute_owned_aabb(NavigationGroupKey key) const noexcept {
         const float s = config_.voxel_scale;
         return Aabb3f{
@@ -215,7 +351,6 @@ public:
         };
     }
 
-    /// Computes the padded baking AABB expanded outward by (P_xz, P_y, P_xz) (Section 4.5).
     [[nodiscard]] Aabb3f compute_baking_aabb(NavigationGroupKey key) const noexcept {
         const Aabb3f owned = compute_owned_aabb(key);
         const float pxz = config_.horizontal_padding();
@@ -226,15 +361,12 @@ public:
         };
     }
 
-    /// Called when a chunk mesh is committed on the main thread.
     void note_chunk_mesh_committed(ChunkKey key,
                                    uint64_t captured_terrain_revision,
                                    const std::vector<Vec3f>& /*faces*/) {
         chunk_revisions_[key] = captured_terrain_revision;
         waiting_chunks_.insert(key);
 
-        // Touch owning 3D navigation group AND any adjacent 3D navigation group whose
-        // 3D border padding halo (P_xz, P_y, P_xz) intersects this chunk's 32^3 AABB!
         const Aabb3f chunk_box = chunk_aabb(key);
         const NavigationGroupKey owner_gk = NavigationGroupKey::from_chunk_key(key);
 
@@ -244,7 +376,6 @@ public:
                     const NavigationGroupKey candidate{
                         owner_gk.gx + dgx, owner_gk.gy + dgy, owner_gk.gz + dgz};
                     if (compute_baking_aabb(candidate).intersects(chunk_box)) {
-                        // Only instantiate neighbor groups that already exist or are the owner group.
                         if (candidate == owner_gk || groups_.find(candidate) != groups_.end()) {
                             NavigationGroupState& g = get_or_create_group(candidate);
                             g.desired_source_epoch += 1;
@@ -267,7 +398,6 @@ public:
         }
     }
 
-    /// Invalidates affected 3D `4 x 2 x 4` navigation groups when an EditTransaction completes.
     void apply_edit_transaction(const EditTransactionCompletedPayload& tx) {
         for (const NavigationGroupKey gk : tx.affected_nav_groups) {
             NavigationGroupState& g = get_or_create_group(gk);
@@ -275,7 +405,6 @@ public:
         }
     }
 
-    /// Submits ready dirty 3D navigation groups to NavigationServer3D async baking (< 0.2 ms).
     void submit_ready_groups_to_server(const ServerSlotManager& slot_mgr) {
         for (auto& [gk, g] : groups_) {
             if (g.rebuild_in_flight) {
@@ -287,8 +416,6 @@ public:
                 continue;
             }
 
-            // Readiness Check (Section 4.5 Step 2):
-            // Ensure all resident chunks in this group have committed meshes at >= desired_terrain_revision.
             bool all_chunks_ready = true;
             for (const auto& [ck, rev] : chunk_revisions_) {
                 if (NavigationGroupKey::from_chunk_key(ck) == gk && rev < g.desired_terrain_revision) {
@@ -300,9 +427,12 @@ public:
                 continue;
             }
 
-            // Fast Async Submission: clear source_data and gather cached_nav_faces from
-            // the group's 32 owned chunks plus any border chunks intersecting baking_aabb.
             g.assembled_source_faces.clear();
+#if defined(VOXEL_WITH_GODOT_CPP)
+            if (g.source_data.is_valid()) {
+                g.source_data->clear();
+            }
+#endif
             const int32_t cx_min = gk.gx * 4 - 1;
             const int32_t cx_max = (gk.gx + 1) * 4;
             const int32_t cy_min = gk.gy * 2 - 1;
@@ -314,12 +444,18 @@ public:
                 for (int32_t cy = cy_min; cy <= cy_max; ++cy) {
                     for (int32_t cx = cx_min; cx <= cx_max; ++cx) {
                         const ChunkKey ck = ChunkKey::from_coords(cx, cy, cz);
-                        if (! g.baking_aabb.intersects(chunk_aabb(ck))) {
+                        if (!g.baking_aabb.intersects(chunk_aabb(ck))) {
                             continue;
                         }
                         const auto& faces = slot_mgr.get_cached_nav_faces(ck);
                         g.assembled_source_faces.insert(
                             g.assembled_source_faces.end(), faces.begin(), faces.end());
+#if defined(VOXEL_WITH_GODOT_CPP)
+                        if (const ChunkServerSlot* cslot = slot_mgr.find_slot(ck);
+                            cslot != nullptr && !cslot->godot_nav_faces.is_empty() && g.source_data.is_valid()) {
+                            g.source_data->add_faces(cslot->godot_nav_faces, godot::Transform3D());
+                        }
+#endif
                     }
                 }
             }
@@ -329,11 +465,25 @@ public:
             g.submitted_terrain_revision = g.desired_terrain_revision;
             g.submitted_source_epoch = g.desired_source_epoch;
             g.total_bakes_submitted += 1;
+
+#if defined(VOXEL_WITH_GODOT_CPP)
+            if (auto* ns = godot::NavigationServer3D::get_singleton();
+                ns != nullptr && g.nav_mesh.is_valid() && g.source_data.is_valid()) {
+                ns->bake_from_source_geometry_data_async(
+                    g.nav_mesh,
+                    g.source_data,
+                    godot::Callable());
+                ns->region_set_navigation_mesh(g.region_rid.native_rid, g.nav_mesh);
+                g.bake_callback_received = true;
+                g.pending_callback_map_iteration =
+                    nav_map_rid_.native_rid.is_valid()
+                        ? ns->map_get_iteration_id(nav_map_rid_.native_rid)
+                        : map_iteration_id_;
+            }
+#endif
         }
     }
 
-    /// Simulates the background `bake_from_source_geometry_data_async` completion callback
-    /// and subsequent `NavigationServer3D` map iteration synchronization (Section 4.5 Step 4).
     void complete_in_flight_async_bakes_and_advance_map_iteration() {
         for (auto& [gk, g] : groups_) {
             if (g.rebuild_in_flight && !g.bake_callback_received) {
@@ -346,6 +496,12 @@ public:
     }
 
     void poll_server_synchronization() {
+#if defined(VOXEL_WITH_GODOT_CPP)
+        if (auto* ns = godot::NavigationServer3D::get_singleton();
+            ns != nullptr && nav_map_rid_.native_rid.is_valid()) {
+            map_iteration_id_ = ns->map_get_iteration_id(nav_map_rid_.native_rid);
+        }
+#endif
         for (auto& [gk, g] : groups_) {
             if (g.rebuild_in_flight &&
                 g.bake_callback_received &&
@@ -357,7 +513,6 @@ public:
             }
         }
 
-        // Any waiting chunk whose owning 3D navigation group is now synced emits chunk_committed.
         for (auto it = waiting_chunks_.begin(); it != waiting_chunks_.end();) {
             const NavigationGroupKey gk = NavigationGroupKey::from_chunk_key(*it);
             if (is_group_synced(gk)) {
@@ -386,7 +541,6 @@ public:
                g.synced_source_epoch == g.desired_source_epoch;
     }
 
-    /// Used by `VoxelAICompanion::is_path_region_synced(Vector3 position)` (Section 4.2).
     [[nodiscard]] bool is_path_region_synced(Vec3f world_pos) const noexcept {
         const float s = config_.voxel_scale;
         const int32_t px = static_cast<int32_t>(std::floor(world_pos.x / s));
@@ -438,6 +592,29 @@ private:
         g.owned_aabb = compute_owned_aabb(gk);
         g.baking_aabb = compute_baking_aabb(gk);
         g.border_size = config_.horizontal_padding();
+
+#if defined(VOXEL_WITH_GODOT_CPP)
+        if (auto* ns = godot::NavigationServer3D::get_singleton()) {
+            g.region_rid.native_rid = ns->region_create();
+            if (nav_map_rid_.native_rid.is_valid()) {
+                ns->region_set_map(g.region_rid.native_rid, nav_map_rid_.native_rid);
+            }
+        }
+        g.nav_mesh.instantiate();
+        g.nav_mesh->set_cell_size(config_.cell_size);
+        g.nav_mesh->set_cell_height(config_.cell_height);
+        g.nav_mesh->set_agent_radius(config_.agent_radius);
+        g.nav_mesh->set_agent_height(config_.agent_height);
+        g.nav_mesh->set_agent_max_climb(config_.agent_max_climb);
+        g.nav_mesh->set_agent_max_slope(config_.agent_max_slope);
+        g.nav_mesh->set_region_min_size(config_.region_min_size);
+        g.nav_mesh->set_border_size(g.border_size);
+        g.nav_mesh->set_filter_low_hanging_obstacles(config_.filter_low_hanging_obstacles);
+        g.nav_mesh->set_filter_ledge_spans(config_.filter_ledge_spans);
+        g.nav_mesh->set_filter_walkable_low_height_spans(config_.filter_walkable_low_height_spans);
+        g.source_data.instantiate();
+#endif
+
         auto [ins_it, _] = groups_.emplace(gk, std::move(g));
         return ins_it->second;
     }
@@ -464,10 +641,6 @@ struct ProcessFrameStats {
     uint64_t elapsed_us = 0;
 };
 
-/// Executes the exact v4.0 `_process()` main-thread commit loop (Section 4.3, 5.2):
-///   - Re-evaluates `currently_over_cap = (remaining_depth >= 32)` on EVERY iteration.
-///   - Enforces `soft_budget_us` whenever `remaining_depth < 32`.
-///   - Enforces `emergency_budget_us = 2 * soft_budget_us` unconditionally on every frame.
 template <typename PopFn, typename DepthFn, typename ClockUsFn>
 inline ProcessFrameStats run_main_thread_process_frame(
     float upload_budget_ms,
@@ -520,8 +693,6 @@ inline ProcessFrameStats run_main_thread_process_frame(
             break;
         }
 
-        // Dynamic per-iteration check (Section 4.3, 5.2):
-        // Only bypass soft_budget_us while depth is at/above 32, and NEVER exceed emergency_budget_us.
         const bool currently_over_cap = (remaining_depth >= 32ULL);
         if (!currently_over_cap && elapsed_us >= soft_budget_us) {
             break;

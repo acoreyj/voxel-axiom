@@ -30,7 +30,7 @@ int g_assertions_checked = 0;
         }                                                                             \
     } while (0)
 
-void test_gdextension_registration_and_end_to_end_lifecycle() {
+void test_gdextension_streaming_explosion_and_nav_lifecycle() {
     ++g_tests_run;
 
     const std::filesystem::path save_dir = "/tmp/voxel_gdextension_e2e_test";
@@ -42,28 +42,49 @@ void test_gdextension_registration_and_end_to_end_lifecycle() {
     REQUIRE(ClassRegistryTracker::registered_classes()[0] == "VoxelTerrain3D");
     REQUIRE(ClassRegistryTracker::registered_classes()[1] == "VoxelAICompanion");
 
-    // 2. Instantiate VoxelTerrain3D and VoxelAICompanion and run full _enter_tree -> explosion -> _process -> _exit_tree.
+    // 2. Instantiate VoxelTerrain3D and VoxelAICompanion.
     VoxelTerrain3D terrain;
     terrain.set_save_directory_path(save_dir.string());
+    terrain.set_view_distance_chunks(1);
+    terrain.set_prefetch_distance_chunks(0);
+    terrain.set_world_height_chunks(3);
     terrain.set_upload_budget_ms(4.0f);
     terrain._enter_tree();
 
     VoxelAICompanion companion;
     companion.set_terrain_node(&terrain);
 
-    // Invalid explosion radius (<= 0) must emit explosion_failed immediately.
-    terrain.trigger_explosion(Vector3(16.0f, 16.0f, 16.0f), -1.0f);
+    // 3. Verify continuous terrain streaming from set_stream_focus() alone (before any explosion!):
+    //    Calling set_stream_focus generates the active Chebyshev neighborhood + 26-neighbor closure,
+    //    pushes active chunks into dirty_stream_chunks, meshes them on worker threads, and commits
+    //    their visual/collision RIDs and 3D navigation groups in _process().
+    terrain.set_stream_focus(Vector3(16.0f, 48.0f, 16.0f), Vector3(1.0f, 0.0f, 0.0f));
+
+    const auto stream_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < stream_deadline) {
+        terrain._process(0.016);
+        terrain.get_navigation_manager().complete_in_flight_async_bakes_and_advance_map_iteration();
+        terrain._process(0.016);
+        if (terrain.fully_committed() && terrain.get_server_slot_manager().active_slot_count() > 0) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    REQUIRE(terrain.fully_committed());
+    REQUIRE(terrain.get_server_slot_manager().active_slot_count() > 0ULL);
+
+    // 4. Invalid explosion radius (<= 0) must emit explosion_failed immediately.
+    terrain.trigger_explosion(Vector3(16.0f, 48.0f, 16.0f), -1.0f);
     REQUIRE(!terrain.emitted_signals().empty());
     REQUIRE(terrain.emitted_signals().back().name == "explosion_failed");
 
-    // Valid explosion emits explosion_requested immediately (< 0.1 ms).
-    terrain.set_stream_focus(Vector3(16.0f, 16.0f, 16.0f), Vector3(1.0f, 0.0f, 0.0f));
-    terrain.trigger_explosion(Vector3(16.0f, 16.0f, 16.0f), 6.0f);
+    // 5. Valid explosion carves the streamed terrain and prioritizes dirty_edit_chunks.
+    terrain.trigger_explosion(Vector3(16.0f, 48.0f, 16.0f), 6.0f);
     REQUIRE(terrain.emitted_signals().back().name == "explosion_requested");
 
-    // Tick _process() frames until explosion_completed and chunk_committed fire and fully_committed() is true.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (std::chrono::steady_clock::now() < deadline) {
+    const auto blast_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < blast_deadline) {
         terrain._process(0.016);
         terrain.get_navigation_manager().complete_in_flight_async_bakes_and_advance_map_iteration();
         terrain._process(0.016);
@@ -75,10 +96,10 @@ void test_gdextension_registration_and_end_to_end_lifecycle() {
 
     REQUIRE(terrain.core_idle());
     REQUIRE(terrain.fully_committed());
-    REQUIRE(companion.is_path_region_synced(Vector3(16.0f, 16.0f, 16.0f)));
+    REQUIRE(companion.is_path_region_synced(Vector3(16.0f, 48.0f, 16.0f)));
 
     const PackedVector3Array path =
-        companion.get_voxel_path(Vector3(4.0f, 16.0f, 4.0f), Vector3(28.0f, 50.0f, 28.0f));
+        companion.get_voxel_path(Vector3(4.0f, 48.0f, 4.0f), Vector3(28.0f, 50.0f, 28.0f));
     REQUIRE(path.size() == 3ULL);
 
     bool saw_explosion_completed = false;
@@ -94,19 +115,19 @@ void test_gdextension_registration_and_end_to_end_lifecycle() {
     REQUIRE(saw_explosion_completed);
     REQUIRE(saw_chunk_committed);
 
-    // 3. Ordered teardown via _exit_tree().
+    // 6. Ordered teardown via _exit_tree().
     terrain._exit_tree();
     uninitialize_voxel_module(MODULE_INITIALIZATION_LEVEL_SCENE);
     std::filesystem::remove_all(save_dir);
 
-    std::printf("[PASS] test_gdextension_registration_and_end_to_end_lifecycle (VoxelTerrain3D + VoxelAICompanion verified)\n");
+    std::printf("[PASS] test_gdextension_streaming_explosion_and_nav_lifecycle (stream + blast + nav3d verified)\n");
 }
 
 } // namespace
 
 int main() {
-    std::printf("=== Running GDExtension End-to-End Binding & Lifecycle Test Suite ===\n");
-    test_gdextension_registration_and_end_to_end_lifecycle();
+    std::printf("=== Running GDExtension End-to-End Streaming, Destruction & Nav3D Test Suite ===\n");
+    test_gdextension_streaming_explosion_and_nav_lifecycle();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",
                 g_tests_run, g_assertions_checked);
     return EXIT_SUCCESS;

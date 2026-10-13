@@ -6,6 +6,7 @@
 #include <array>
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -15,6 +16,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #if defined(__unix__) || defined(__APPLE__)
@@ -99,7 +101,6 @@ struct BytePlaneCodec {
 
         std::size_t i = 0;
         while (i < len) {
-            // Check for a run of >= 3 identical bytes starting at i.
             std::size_t run_len = 1;
             while (i + run_len < len && run_len < 130ULL && src[i + run_len] == src[i]) {
                 ++run_len;
@@ -111,7 +112,6 @@ struct BytePlaneCodec {
                 continue;
             }
 
-            // Collect literal sequence up to 128 bytes or until a run of >= 3 begins.
             const std::size_t lit_start = i;
             std::size_t lit_len = 0;
             while (i < len && lit_len < 128ULL) {
@@ -174,8 +174,6 @@ struct CompressedChunkBlob {
     uint64_t captured_version = 0;
     bool dirty_for_disk = true;
 
-    // Populated only when form == SerializedChunkForm::Dense:
-    // Header inside payload: [uint32_t low_size][uint32_t high_size][uint32_t mat_size] followed by bytes
     std::vector<uint8_t> payload;
 
     [[nodiscard]] std::size_t ram_bytes() const noexcept {
@@ -224,8 +222,6 @@ public:
     RegionSaveManager& operator=(const RegionSaveManager&) = delete;
 
     /// Stage 1: `PersistCompress` (In-Memory Worker Job, ~50 us per chunk, Section 3.2 & 3.6).
-    /// Reads `version_before` under shared read lock, compresses canonical 32^3 samples via
-    /// byte-plane split, verifies `version_after == version_before`, and stores in `RegionBlobTable`.
     [[nodiscard]] bool persist_compress_chunk(ChunkStore& store, ChunkKey key) {
         ChunkSlot* slot = store.find_slot(key);
         if (!slot) {
@@ -257,7 +253,6 @@ public:
             }
         }
 
-        // Perform byte-plane split & compression outside the chunk lock (or verify version_after).
         CompressedChunkBlob blob{};
         blob.base_material_id = base_mat;
         blob.has_material_plane = has_mat_array;
@@ -314,11 +309,10 @@ public:
             std::shared_lock<std::shared_mutex> verify_lock(slot->mutex);
             const uint64_t version_after = slot->version.load(std::memory_order_acquire);
             if (version_after != version_before) {
-                return false; // Discarded due to concurrent edit; caller will retry
+                return false;
             }
         }
 
-        // Reserve memory in MemoryPoolId::RegionBlobCache (bounded to 32 MiB).
         std::lock_guard<std::mutex> table_lock(mutex_);
         const RegionKey rk = RegionKey::from_chunk_key(key);
         const uint16_t toc_idx = RegionKey::local_toc_index(key);
@@ -343,7 +337,6 @@ public:
         region.dirty_bytes = region.dirty_bytes - old_bytes + new_bytes;
         region.blobs[toc_idx] = std::move(blob);
 
-        // Mark chunk clean for eviction if version still matches.
         {
             std::unique_lock<std::shared_mutex> slot_lock(slot->mutex);
             if (slot->version.load(std::memory_order_acquire) == version_before) {
@@ -353,15 +346,11 @@ public:
         return true;
     }
 
-    /// Stage 2: `RegionFlush` (Atomic 8x8x8 Region Disk Flush, Section 3.6).
-    /// Merges in-memory `RegionBlobTable` with any untouched chunks in the live `.vreg` file,
-    /// writes `region_X_Y_Z.vreg.tmp`, calls `fsync`, and atomically renames over `region_X_Y_Z.vreg`.
     [[nodiscard]] bool flush_region_to_disk(RegionKey rk) {
         std::lock_guard<std::mutex> table_lock(mutex_);
         return flush_region_unlocked(rk);
     }
 
-    /// Flushes all dirty 8x8x8 regions to disk (called on `save_world()` or `shutdown(true)`).
     void flush_all_dirty_regions() {
         std::lock_guard<std::mutex> table_lock(mutex_);
         for (auto& [rk, region] : regions_) {
@@ -371,15 +360,10 @@ public:
         }
     }
 
-    /// Load Routing (Section 3.3):
-    ///   1. Try `RegionBlobTable` (in-memory compressed cache)
-    ///   2. Try Region File TOC on disk (`region_X_Y_Z.vreg`)
-    ///   3. Fall back to `CaveNoiseGenerator` procedural generation
     [[nodiscard]] bool load_or_generate_chunk(ChunkStore& store,
                                               ChunkKey key,
                                               const CaveNoiseGenerator& procgen,
                                               WorkerDensityGrid34& grid34) {
-        // 1. Check in-memory RegionBlobTable first.
         {
             std::lock_guard<std::mutex> table_lock(mutex_);
             const RegionKey rk = RegionKey::from_chunk_key(key);
@@ -390,17 +374,14 @@ public:
             }
         }
 
-        // 2. Check live .vreg region file on disk.
         if (auto disk_blob = read_chunk_blob_from_disk(key); disk_blob.has_value()) {
             return populate_slot_from_blob(store, key, *disk_blob);
         }
 
-        // 3. Procedural Fallback.
         procgen.generate_chunk(store, key, grid34);
         return true;
     }
 
-    /// Releases all cached blobs in `RegionBlobTable` and returns their bytes to `MemoryLedger`.
     void clear_ram_cache() noexcept {
         std::lock_guard<std::mutex> table_lock(mutex_);
         for (auto& [rk, region] : regions_) {
@@ -604,7 +585,6 @@ private:
         }
         RegionEntry& region = it->second;
 
-        // Merge with existing untouched chunks on disk if a live .vreg file already exists.
         std::array<std::optional<CompressedChunkBlob>, RegionKey::kChunksPerRegion> merged{};
         (void)load_existing_region_file(rk, merged);
 
@@ -684,6 +664,149 @@ private:
     std::filesystem::path save_dir_;
     mutable std::mutex mutex_;
     std::unordered_map<RegionKey, RegionEntry, RegionKeyHash> regions_;
+};
+
+// ============================================================================
+// 5. Continuous Chunk Streaming & Residency Manager (HLD v4.0 Section 3.3)
+// ============================================================================
+class StreamingManager {
+public:
+    StreamingManager(ChunkStore& store,
+                     DualDirtyScheduler& dirty_scheduler,
+                     RegionSaveManager& save_manager,
+                     CaveNoiseGenerator& procgen)
+        : store_(store),
+          dirty_scheduler_(dirty_scheduler),
+          save_manager_(save_manager),
+          procgen_(procgen) {}
+
+    /// Updates the streaming focus position and velocity bias, loads/generates newly
+    /// desired chunks within Chebyshev radius `active_radius` (+ 1-chunk neighbor closure
+    /// for 36^3 mesh windows), schedules active chunks into `dirty_stream_chunks`, and
+    /// evicts out-of-range chunks (emitting `ChunkUnloaded` records).
+    std::vector<ChunkKey> update_stream_focus(Vec3f position,
+                                              Vec3f velocity,
+                                              int32_t active_radius_chunks,
+                                              int32_t prefetch_radius_chunks,
+                                              WorkerDensityGrid34& grid34) {
+        const ChunkKey focus_ck = ChunkKey::from_world_sample(
+            static_cast<int32_t>(std::floor(position.x)),
+            static_cast<int32_t>(std::floor(position.y)),
+            static_cast<int32_t>(std::floor(position.z)));
+
+        dirty_scheduler_.set_focus_chunk(focus_ck);
+
+        const int32_t world_h = store_.world_height_chunks();
+        const int32_t closure_radius = active_radius_chunks + 1; // 26-neighbor closure shell
+
+        struct CandidateChunk {
+            ChunkKey key{};
+            bool in_active_set = false;
+            float priority_score = 0.0f;
+        };
+
+        std::vector<CandidateChunk> candidates;
+        std::unordered_set<ChunkKey, ChunkKeyHash> desired_residency_set;
+
+        const int32_t max_r = std::max(closure_radius, active_radius_chunks + prefetch_radius_chunks);
+        for (int32_t dz = -max_r; dz <= max_r; ++dz) {
+            for (int32_t dy = -max_r; dy <= max_r; ++dy) {
+                const int32_t cy = focus_ck.y() + dy;
+                if (cy < 0 || cy >= world_h) {
+                    continue;
+                }
+                for (int32_t dx = -max_r; dx <= max_r; ++dx) {
+                    const int32_t chebyshev = std::max({std::abs(dx), std::abs(dy), std::abs(dz)});
+                    const ChunkKey ck = ChunkKey::from_coords(
+                        focus_ck.x() + dx, cy, focus_ck.z() + dz);
+
+                    const float dist_sq = static_cast<float>(dx * dx + dy * dy + dz * dz);
+                    const float vel_dot =
+                        static_cast<float>(dx) * velocity.x +
+                        static_cast<float>(dy) * velocity.y +
+                        static_cast<float>(dz) * velocity.z;
+
+                    if (chebyshev <= closure_radius) {
+                        desired_residency_set.insert(ck);
+                        candidates.push_back(CandidateChunk{
+                            ck,
+                            /*in_active_set=*/(chebyshev <= active_radius_chunks),
+                            dist_sq - 0.25f * vel_dot
+                        });
+                    } else if (vel_dot > 0.0f &&
+                               store_.ledger().total_reserved_bytes() * 4ULL <
+                                   store_.ledger().budget_bytes() * 3ULL) {
+                        // Velocity-biased prefetch admission when below 75% memory budget.
+                        desired_residency_set.insert(ck);
+                        candidates.push_back(CandidateChunk{
+                            ck,
+                            /*in_active_set=*/false,
+                            dist_sq - 0.5f * vel_dot
+                        });
+                    }
+                }
+            }
+        }
+
+        // Sort nearest / velocity-aligned first.
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const CandidateChunk& a, const CandidateChunk& b) {
+                      return a.priority_score < b.priority_score;
+                  });
+
+        // Step 1: Evict resident chunks that fell outside desired_residency_set (compressing dirty ones first).
+        std::vector<ChunkKey> unloaded;
+        std::vector<ChunkKey> to_evict;
+        for (const ChunkKey rk : tracked_resident_) {
+            if (desired_residency_set.find(rk) == desired_residency_set.end()) {
+                to_evict.push_back(rk);
+            }
+        }
+        for (const ChunkKey ek : to_evict) {
+            if (const ChunkSlot* slot = store_.find_slot(ek); slot != nullptr && slot->dirty_persist) {
+                (void)save_manager_.persist_compress_chunk(store_, ek);
+            }
+            if (store_.evict_slot(ek)) {
+                tracked_resident_.erase(ek);
+                meshed_active_.erase(ek);
+                unloaded.push_back(ek);
+            }
+        }
+
+        // Step 2: Ensure all closure chunks are loaded/generated before scheduling active meshes
+        // so every active chunk's 36^3 scratch gather sees its complete 26-neighbor shell!
+        for (const CandidateChunk& cand : candidates) {
+            if (tracked_resident_.find(cand.key) == tracked_resident_.end()) {
+                if (save_manager_.load_or_generate_chunk(store_, cand.key, procgen_, grid34)) {
+                    tracked_resident_.insert(cand.key);
+                }
+            }
+        }
+
+        // Step 3: Enqueue newly active chunks into `dirty_stream_chunks`.
+        for (const CandidateChunk& cand : candidates) {
+            if (cand.in_active_set &&
+                tracked_resident_.find(cand.key) != tracked_resident_.end() &&
+                meshed_active_.find(cand.key) == meshed_active_.end()) {
+                meshed_active_.insert(cand.key);
+                dirty_scheduler_.mark_stream_dirty(cand.key);
+            }
+        }
+
+        return unloaded;
+    }
+
+    [[nodiscard]] std::size_t resident_chunk_count() const noexcept {
+        return tracked_resident_.size();
+    }
+
+private:
+    ChunkStore& store_;
+    DualDirtyScheduler& dirty_scheduler_;
+    RegionSaveManager& save_manager_;
+    CaveNoiseGenerator& procgen_;
+    std::unordered_set<ChunkKey, ChunkKeyHash> tracked_resident_;
+    std::unordered_set<ChunkKey, ChunkKeyHash> meshed_active_;
 };
 
 } // namespace voxel

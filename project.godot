@@ -1,0 +1,14 @@
+; Engine configuration file.
+; HLD v4.0 Real-Time Destructible Voxel Engine & 3D Cave Navigation Demo
+
+config_version=5
+
+[application]
+
+config/name="Voxel Engine v4.0 Cave & Destruction Demo"
+run/main_scene="res://voxel_terrain_demo.tscn"
+config/features=PackedStringArray("4.2", "Forward Plus")
+
+[rendering]
+
+anti_aliasing/quality/msaa_3d=2
