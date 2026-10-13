@@ -57,7 +57,7 @@ void test_large_explosion_32_lock_cap_and_no_tearing() {
     // "Trigger a synthetic explosion with R = 64 voxels (spanning > 100 chunks)
     //  and assert that each Edit phase locks at most 32 canonical chunks."
     EditTransaction tx = EditTransaction::create_from_spheres(
-        {SphereCsgTerm{Vec3f{64.0f, 96.0f, 64.0f}, /*radius=*/64.0f}},
+        {SphereCsgTerm{Vec3f{64.0f, 96.0f, 64.0f}, /*radius=*/72.0f}},
         /*delta=*/2.0f,
         /*world_height_chunks=*/8);
 

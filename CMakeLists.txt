@@ -16,7 +16,10 @@ option(VOXEL_ENABLE_TSAN "Enable ThreadSanitizer for concurrency tests" OFF)
 #    Zero Godot headers; statically linked into tests and libvoxel_engine.
 # ==============================================================================
 add_library(voxel_core INTERFACE)
-target_include_directories(voxel_core INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(voxel_core INTERFACE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
 
 find_package(Threads REQUIRED)
 target_link_libraries(voxel_core INTERFACE Threads::Threads)
@@ -40,9 +43,9 @@ if(VOXEL_BUILD_GDEXTENSION)
     endif()
 
     add_library(voxel_engine SHARED
-        register_types.cpp
-        voxel_terrain_3d.cpp
-        voxel_ai_companion.cpp
+        src/register_types.cpp
+        src/voxel_terrain_3d.cpp
+        src/voxel_ai_companion.cpp
     )
     target_compile_definitions(voxel_engine PRIVATE VOXEL_WITH_GODOT_CPP=1)
     target_link_libraries(voxel_engine PRIVATE voxel_core godot::cpp)
@@ -77,17 +80,17 @@ if(VOXEL_BUILD_TESTS)
         add_test(NAME ${target_name} COMMAND ${target_name})
     endfunction()
 
-    add_voxel_test(test_chunk_key                test_chunk_key.cpp)
-    add_voxel_test(test_chunk_store              test_chunk_store.cpp)
-    add_voxel_test(test_scratch_and_dirty        test_scratch_and_dirty.cpp)
-    add_voxel_test(test_edit_and_worker_pool     test_edit_and_worker_pool.cpp)
-    add_voxel_test(test_procgen_and_surface_nets test_procgen_and_surface_nets.cpp)
-    add_voxel_test(test_persistence_and_streaming test_persistence_and_streaming.cpp)
-    add_voxel_test(test_integration_m3_m4        test_integration_m3_m4.cpp)
+    add_voxel_test(test_chunk_key                tests/test_chunk_key.cpp)
+    add_voxel_test(test_chunk_store              tests/test_chunk_store.cpp)
+    add_voxel_test(test_scratch_and_dirty        tests/test_scratch_and_dirty.cpp)
+    add_voxel_test(test_edit_and_worker_pool     tests/test_edit_and_worker_pool.cpp)
+    add_voxel_test(test_procgen_and_surface_nets tests/test_procgen_and_surface_nets.cpp)
+    add_voxel_test(test_persistence_and_streaming tests/test_persistence_and_streaming.cpp)
+    add_voxel_test(test_integration_m3_m4        tests/test_integration_m3_m4.cpp)
     add_voxel_test(test_gdextension_bindings
-        test_gdextension_bindings.cpp
-        register_types.cpp
-        voxel_terrain_3d.cpp
-        voxel_ai_companion.cpp
+        tests/test_gdextension_bindings.cpp
+        src/register_types.cpp
+        src/voxel_terrain_3d.cpp
+        src/voxel_ai_companion.cpp
     )
 endif()

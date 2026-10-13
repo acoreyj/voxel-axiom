@@ -232,7 +232,7 @@ void test_2x2x2_watertight_chunk_seams() {
         if (count % 2 != 0) {
             ++open_edges;
         }
-        REQUIRE(directed_edge_counts[edge] == directed_edge_counts[{edge.second, edge.first}]);
+        REQUIRE((directed_edge_counts[edge] == directed_edge_counts[{edge.second, edge.first}]));
     }
     REQUIRE(open_edges == 0ULL);
 

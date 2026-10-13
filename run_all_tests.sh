@@ -6,7 +6,7 @@ BUILD_DIR="${BUILD_DIR:-/tmp/voxel_engine_build}"
 mkdir -p "${BUILD_DIR}"
 
 CXX="${CXX:-g++}"
-CXXFLAGS=(-std=c++20 -O2 -Wall -Wextra -Werror -pedantic -pthread -I"${SCRIPT_DIR}")
+CXXFLAGS=(-std=c++20 -O2 -Wall -Wextra -Werror -pedantic -pthread -I"${SCRIPT_DIR}/include" -I"${SCRIPT_DIR}/src")
 ASAN_FLAGS=(-fsanitize=address,undefined)
 TSAN_FLAGS=(-fsanitize=thread)
 
@@ -26,15 +26,15 @@ SIMPLE_TESTS=(
 
 for t in "${SIMPLE_TESTS[@]}"; do
     "${CXX}" "${CXXFLAGS[@]}" "${ASAN_FLAGS[@]}" \
-        "${SCRIPT_DIR}/${t}.cpp" -o "${BUILD_DIR}/${t}"
+        "${SCRIPT_DIR}/tests/${t}.cpp" -o "${BUILD_DIR}/${t}"
     "${BUILD_DIR}/${t}"
 done
 
 "${CXX}" "${CXXFLAGS[@]}" "${ASAN_FLAGS[@]}" \
-    "${SCRIPT_DIR}/test_gdextension_bindings.cpp" \
-    "${SCRIPT_DIR}/register_types.cpp" \
-    "${SCRIPT_DIR}/voxel_terrain_3d.cpp" \
-    "${SCRIPT_DIR}/voxel_ai_companion.cpp" \
+    "${SCRIPT_DIR}/tests/test_gdextension_bindings.cpp" \
+    "${SCRIPT_DIR}/src/register_types.cpp" \
+    "${SCRIPT_DIR}/src/voxel_terrain_3d.cpp" \
+    "${SCRIPT_DIR}/src/voxel_ai_companion.cpp" \
     -o "${BUILD_DIR}/test_gdextension_bindings"
 "${BUILD_DIR}/test_gdextension_bindings"
 
@@ -43,15 +43,15 @@ echo " Running Multi-Threaded Concurrency & Teardown Suites Under TSan"
 echo "=================================================================="
 
 "${CXX}" "${CXXFLAGS[@]}" "${TSAN_FLAGS[@]}" \
-    "${SCRIPT_DIR}/test_edit_and_worker_pool.cpp" \
+    "${SCRIPT_DIR}/tests/test_edit_and_worker_pool.cpp" \
     -o "${BUILD_DIR}/test_edit_and_worker_pool_tsan"
 "${BUILD_DIR}/test_edit_and_worker_pool_tsan"
 
 "${CXX}" "${CXXFLAGS[@]}" "${TSAN_FLAGS[@]}" \
-    "${SCRIPT_DIR}/test_gdextension_bindings.cpp" \
-    "${SCRIPT_DIR}/register_types.cpp" \
-    "${SCRIPT_DIR}/voxel_terrain_3d.cpp" \
-    "${SCRIPT_DIR}/voxel_ai_companion.cpp" \
+    "${SCRIPT_DIR}/tests/test_gdextension_bindings.cpp" \
+    "${SCRIPT_DIR}/src/register_types.cpp" \
+    "${SCRIPT_DIR}/src/voxel_terrain_3d.cpp" \
+    "${SCRIPT_DIR}/src/voxel_ai_companion.cpp" \
     -o "${BUILD_DIR}/test_gdextension_bindings_tsan"
 "${BUILD_DIR}/test_gdextension_bindings_tsan"
 
