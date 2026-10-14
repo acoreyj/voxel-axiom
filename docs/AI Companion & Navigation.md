@@ -333,6 +333,27 @@ In `voxel_terrain_demo.tscn`:
 - Because nothing calls `set_terrain_node()` in the scene, the live demo runs with the
   companion unlinked — see gotcha 8.2 for the consequences.
 
+### 7.1 Pill companion patrol
+
+Both demo scenes attach `ai_companion_patrol.gd` to the `VoxelAICompanion` node,
+which gives it a visible pill capsule and drives it around a triangular patrol
+route around spawn. The companion remains a query facade — this script is the
+"gameplay that consumes it" that Section 1 anticipates:
+
+- `patrol_points` are **world XZ** points looped in order; their Y is ignored.
+- Each frame the node is placed at the route position with
+  `y = VoxelTerrain3D.get_surface_height(x, z) + ground_offset`, so the pill
+  walks down into fresh craters and over added terrain while the player edits.
+- Each waypoint arrival prints `[Pill] waypoint N/M reached at (x, z) (y=…)`.
+- No navigation query is involved: the patrol works on a freshly loaded world,
+  where `get_voxel_path()` would still return an empty array (gotcha 8.1).
+
+`get_surface_height(x, z)` lives on `VoxelTerrain3D` (not the companion): it casts
+the vertical surface ray through the resident TSDF column via
+`voxel::raycast_terrain` and falls back to the analytic generator scan in
+`voxel::sample_top_surface_y` (`include/procgen_and_surface_nets.hpp`) when the
+ray finds no crossing — see gotcha 8.9.
+
 ---
 
 ## 8. Gotchas, Quirks & Limitations
@@ -385,6 +406,13 @@ In `voxel_terrain_demo.tscn`:
    has no work in flight and is fully synced (or when the group does not exist). For
    edited regions this is later than the visual mesh commit, so treat it as the
    "mesh + collision + navigation are consistent" signal.
+9. **`get_surface_height` semantics.** Main-thread only (takes a shared slot lock per
+   sampled chunk). It returns the top-most air→solid crossing of the resident TSDF
+   column — overhangs resolve to the highest crossing — and falls back to the
+   procedural generator when the ray finds no crossing. Edited terrain is
+   reflected wherever chunks are resident; far from the streaming focus the fallback
+   describes the pristine generated surface and ignores edits. It does not depend on
+   `collision_distance_chunks`, so it works while physics collision is gated off.
 
 ---
 
@@ -395,6 +423,7 @@ In `voxel_terrain_demo.tscn`:
 | Registration order (`VoxelTerrain3D` then `VoxelAICompanion` at SCENE level) | `tests/test_gdextension_bindings.cpp:95-99` |
 | Stream → explosion → `fully_committed()` + `is_path_region_synced()` at the blast site | `tests/test_gdextension_bindings.cpp:139-170` |
 | Path query (`size == 3` on the offline fallback) and `navigation` stage timing | `tests/test_gdextension_bindings.cpp:175-181` |
+| Surface-height query: resident plane (68) → edited plane (40) → generator fallback | `tests/test_procgen_and_surface_nets.cpp` (`test_surface_height_query`) |
 | `chunk_committed` and `explosion_completed` emission | `tests/test_gdextension_bindings.cpp:183-194` |
 | Vertical isolation: cave blast (`gy = 0`) rebakes only its group; surface (`gy = 2`) records zero rebuilds | `tests/test_integration_m3_m4.cpp:133-216` |
 | Vertical halo stitching: a ramp across `Cy=1/Cy=2` appears in both groups' source faces | `tests/test_integration_m3_m4.cpp:221-283` |

@@ -1,10 +1,13 @@
 #include "voxel_terrain_3d.h"
 
+#include "terrain_raycast.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <thread>
 #include <utility>
 
@@ -34,6 +37,8 @@ void VoxelTerrain3D::_bind_methods() {
 #if defined(VOXEL_WITH_GODOT_CPP)
     ClassDB::bind_method(D_METHOD("trigger_explosion", "position", "radius"), &VoxelTerrain3D::trigger_explosion);
     ClassDB::bind_method(D_METHOD("add_terrain", "position", "radius"), &VoxelTerrain3D::add_terrain);
+    ClassDB::bind_method(D_METHOD("raycast_terrain", "from", "to"), &VoxelTerrain3D::raycast_terrain);
+    ClassDB::bind_method(D_METHOD("get_surface_height", "x", "z"), &VoxelTerrain3D::get_surface_height);
     ClassDB::bind_method(D_METHOD("save_world"), &VoxelTerrain3D::save_world);
     ClassDB::bind_method(D_METHOD("set_stream_focus", "position", "velocity"), &VoxelTerrain3D::set_stream_focus);
     ClassDB::bind_method(D_METHOD("core_idle"), &VoxelTerrain3D::core_idle);
@@ -329,6 +334,28 @@ void VoxelTerrain3D::add_terrain(Vector3 p_position, float p_radius) {
         emitted_signals_.push_back(EmittedSignalRecord{"terrain_add_failed", {}, 0.0f, 0, reason, 0});
 #endif
     }
+}
+
+Vector3 VoxelTerrain3D::raycast_terrain(Vector3 p_from, Vector3 p_to) const {
+    constexpr float kInf = std::numeric_limits<float>::infinity();
+    if (!core_engine) {
+        return Vector3(kInf, kInf, kInf);
+    }
+    const std::optional<voxel::Vec3f> hit = voxel::raycast_terrain(
+        core_engine->store,
+        voxel::Vec3f{p_from.x, p_from.y, p_from.z},
+        voxel::Vec3f{p_to.x, p_to.y, p_to.z});
+    if (!hit.has_value()) {
+        return Vector3(kInf, kInf, kInf);
+    }
+    return Vector3(hit->x, hit->y, hit->z);
+}
+
+float VoxelTerrain3D::get_surface_height(float p_x, float p_z) const {
+    if (!core_engine) {
+        return surface_base_height;
+    }
+    return voxel::sample_top_surface_y(core_engine->store, core_engine->procgen, p_x, p_z);
 }
 
 void VoxelTerrain3D::save_world() {

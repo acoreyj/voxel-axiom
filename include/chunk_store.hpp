@@ -24,6 +24,27 @@
 namespace voxel {
 
 // ============================================================================
+// Material IDs & Persistent Damage Hardness Thresholds
+// ============================================================================
+struct MaterialHardness {
+    static constexpr uint8_t kMaterialAir      = 0;
+    static constexpr uint8_t kMaterialSoil     = 1; // Soft terrain / standard rock: breaks in 1 explosion
+    static constexpr uint8_t kMaterialHardRock = 2; // Hard Rock: takes 3 explosions to break, shows progressive cracks
+
+    static constexpr uint8_t kDamagePerExplosionHit = 85; // 3 * 85 = 255
+
+    /// Returns the cumulative damage threshold in [0, 255] required before TSDF carving occurs.
+    ///   - kMaterialSoil (1): threshold = 85  (1 hit  * 85 = 85  >= 85  -> breaks on 1st explosion)
+    ///   - kMaterialHardRock (2): threshold = 255 (1st hit = 85, 2nd hit = 170, 3rd hit = 255 -> breaks on 3rd explosion)
+    [[nodiscard]] static constexpr uint8_t break_threshold(uint8_t material_id) noexcept {
+        if (material_id == kMaterialHardRock) {
+            return 255U;
+        }
+        return kDamagePerExplosionHit;
+    }
+};
+
+// ============================================================================
 // TSDF Sample Format & Constants (HLD v4.0 Section 3.1)
 // ============================================================================
 struct TsdfFormat {
@@ -33,6 +54,7 @@ struct TsdfFormat {
     static constexpr std::size_t kChunkSamples = 32ULL * 32ULL * 32ULL; // 32,768 canonical samples
     static constexpr std::size_t kTsdfSlabBytes = kChunkSamples * sizeof(int16_t);     // 65,536 B (64.0 KiB)
     static constexpr std::size_t kMaterialSlabBytes = kChunkSamples * sizeof(uint8_t); // 32,768 B (32.0 KiB)
+    static constexpr std::size_t kDamageSlabBytes = kChunkSamples * sizeof(uint8_t);   // 32,768 B (32.0 KiB)
 
     /// Encodes a continuous signed distance value into normalized int16_t in [-32767, +32767].
     [[nodiscard]] static int16_t encode(float sdf, float delta = kDefaultTruncationDelta) noexcept {
@@ -255,7 +277,8 @@ enum class ChunkLifecycleState : uint8_t {
 };
 
 /// Authoritative per-chunk storage slot in ChunkStore (HLD v4.0 Sections 3.1, 3.2).
-/// Stores ONLY canonical 32^3 samples (never persistent boundary aprons).
+/// Stores canonical 32^3 TSDF samples, lazily allocated material_data, and lazily
+/// allocated persistent damage_data (`uint8_t[32768]`). Never stores boundary aprons.
 struct ChunkSlot {
     ChunkKey key{};
     mutable std::shared_mutex mutex;
@@ -265,6 +288,7 @@ struct ChunkSlot {
 
     int16_t* tsdf_data = nullptr;     // Non-null iff form == ChunkStorageForm::Dense (64.0 KiB)
     uint8_t* material_data = nullptr; // Lazily allocated (32.0 KiB); null while uniform base_material_id
+    uint8_t* damage_data = nullptr;   // Lazily allocated (32.0 KiB); null while all samples have 0 damage
     uint8_t base_material_id = 0;
 
     std::atomic<uint64_t> version{0};
@@ -281,6 +305,10 @@ struct ChunkSlot {
         return material_data != nullptr;
     }
 
+    [[nodiscard]] bool has_damage_array() const noexcept {
+        return damage_data != nullptr;
+    }
+
     /// Returns the authoritative heap bytes currently held by this chunk slot in ChunkStore.
     [[nodiscard]] std::size_t resident_heap_bytes() const noexcept {
         std::size_t bytes = (form == ChunkStorageForm::Dense && tsdf_data != nullptr)
@@ -288,6 +316,9 @@ struct ChunkSlot {
                                 : 0ULL;
         if (material_data != nullptr) {
             bytes += TsdfFormat::kMaterialSlabBytes;
+        }
+        if (damage_data != nullptr) {
+            bytes += TsdfFormat::kDamageSlabBytes;
         }
         return bytes;
     }
@@ -321,6 +352,15 @@ struct ChunkSlot {
         return material_data ? material_data[idx] : base_material_id;
     }
 
+    [[nodiscard]] uint8_t get_damage(LocalCoord local) const noexcept {
+        return get_damage_linear(local.to_linear_index());
+    }
+
+    [[nodiscard]] uint8_t get_damage_linear(uint32_t idx) const noexcept {
+        assert(idx < TsdfFormat::kChunkSamples);
+        return damage_data ? damage_data[idx] : 0U;
+    }
+
     /// Resets the chunk to uniform EMPTY or SOLID representation, returning any slabs to the pools.
     void reset_to_uniform(ChunkStorageForm uniform_form,
                           uint8_t uniform_material,
@@ -334,6 +374,10 @@ struct ChunkSlot {
         if (material_data) {
             mat_pool.deallocate(material_data);
             material_data = nullptr;
+        }
+        if (damage_data) {
+            mat_pool.deallocate(damage_data);
+            damage_data = nullptr;
         }
         form = uniform_form;
         base_material_id = uniform_material;
@@ -412,6 +456,50 @@ struct ChunkSlot {
         return true;
     }
 
+    /// Writes a canonical persistent damage value in [0, 255], lazily allocating the 32.0 KiB
+    /// `damage_data` array only when `dmg > 0` (caller holds exclusive write lock).
+    [[nodiscard]] bool set_damage(LocalCoord local, uint8_t dmg, MaterialSlabPool& mat_pool) noexcept {
+        return set_damage_linear(local.to_linear_index(), dmg, mat_pool);
+    }
+
+    [[nodiscard]] bool set_damage_linear(uint32_t idx, uint8_t dmg, MaterialSlabPool& mat_pool) noexcept {
+        assert(idx < TsdfFormat::kChunkSamples);
+        if (!damage_data) {
+            if (dmg == 0U) {
+                return true;
+            }
+            uint8_t* slab = mat_pool.allocate();
+            if (!slab) {
+                return false;
+            }
+            std::memset(slab, 0, TsdfFormat::kDamageSlabBytes);
+            damage_data = slab;
+        }
+        damage_data[idx] = dmg;
+        return true;
+    }
+
+    /// Accumulates `delta_damage` onto sample `local`, clamping at 255, and returns the new damage total.
+    [[nodiscard]] uint8_t add_damage(LocalCoord local,
+                                     uint8_t delta_damage,
+                                     MaterialSlabPool& mat_pool,
+                                     bool* out_changed = nullptr) noexcept {
+        const uint32_t idx = local.to_linear_index();
+        const uint8_t cur = get_damage_linear(idx);
+        const uint32_t sum = static_cast<uint32_t>(cur) + static_cast<uint32_t>(delta_damage);
+        const uint8_t next = static_cast<uint8_t>(std::min<uint32_t>(255U, sum));
+        if (next == cur) {
+            if (out_changed) *out_changed = false;
+            return cur;
+        }
+        if (!set_damage_linear(idx, next, mat_pool)) {
+            if (out_changed) *out_changed = false;
+            return cur;
+        }
+        if (out_changed) *out_changed = true;
+        return next;
+    }
+
     /// Inspects all 32^3 canonical samples after an edit or generation pass; if all samples are
     /// uniformly kClampedAir or kClampedSolid, demotes the chunk to EMPTY or SOLID and returns
     /// its 64.0 KiB buffer to the slab pool (Section 3.1). Also compacts uniform material arrays.
@@ -451,6 +539,20 @@ struct ChunkSlot {
                 mat_pool.deallocate(material_data);
                 material_data = nullptr;
                 base_material_id = first_mat;
+            }
+        }
+
+        if (damage_data != nullptr) {
+            bool all_zero_dmg = true;
+            for (std::size_t i = 0; i < TsdfFormat::kChunkSamples; ++i) {
+                if (damage_data[i] != 0U) {
+                    all_zero_dmg = false;
+                    break;
+                }
+            }
+            if (all_zero_dmg || form == ChunkStorageForm::Empty) {
+                mat_pool.deallocate(damage_data);
+                damage_data = nullptr;
             }
         }
         return demoted_tsdf;

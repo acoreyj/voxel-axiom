@@ -3,6 +3,7 @@
 #include "voxel_ai_companion.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -144,6 +145,18 @@ void test_gdextension_streaming_explosion_and_nav_lifecycle() {
     REQUIRE(contains("mesh"));
     REQUIRE(contains("commit"));
     REQUIRE(contains("initial fill complete in"));
+
+    // 3c. Engine-side voxel raycast: downward from above the surface must hit
+    // terrain, upward into the sky must miss (INF sentinel).
+    const Vector3 down_hit =
+        terrain.raycast_terrain(Vector3(16.0f, 90.0f, 16.0f), Vector3(16.0f, 0.0f, 16.0f));
+    REQUIRE(std::isfinite(down_hit.x));
+    REQUIRE(down_hit.y > 0.0f);
+    REQUIRE(down_hit.y < 90.0f);
+
+    const Vector3 sky_hit =
+        terrain.raycast_terrain(Vector3(16.0f, 90.0f, 16.0f), Vector3(16.0f, 250.0f, 16.0f));
+    REQUIRE(std::isinf(sky_hit.x));
 
     // 4. Invalid explosion radius (<= 0) must emit explosion_failed immediately.
     terrain.trigger_explosion(Vector3(16.0f, 48.0f, 16.0f), -1.0f);

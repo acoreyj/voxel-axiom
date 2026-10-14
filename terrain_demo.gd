@@ -181,13 +181,11 @@ func _active_radius() -> float:
 			return explosion_radius
 
 func _aim_point() -> Vector3:
-	var space_state := get_world_3d().direct_space_state
 	var from := camera.global_position
 	var to := from - camera.global_transform.basis.z * max_ray_distance
-	var query := PhysicsRayQueryParameters3D.create(from, to)
-	var hit := space_state.intersect_ray(query)
-	if not hit.is_empty():
-		return hit.position
+	var hit := terrain.raycast_terrain(from, to)
+	if is_finite(hit.x):
+		return hit
 	return from - camera.global_transform.basis.z * 24.0
 
 func _process_brush(delta: float) -> void:

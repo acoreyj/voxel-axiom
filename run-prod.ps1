@@ -5,11 +5,12 @@
     step, no debugger, optimized engine DLL.
 
 .DESCRIPTION
-    Step 1 - freshness: the release DLL in bin/ is compared against include/,
-    src/ and CMakeLists.txt. If any source is newer (or the DLL is missing),
-    build-release is configured if needed and rebuilt, and the freshly built
-    artifact is copied into bin/. Skipped with -SkipBuild; forced with
-    -ForceBuild.
+    Step 1 - freshness: the build-release artifact is compared against include/,
+    src/ and CMakeLists.txt. If any source is newer (or the artifact is
+    missing), build-release is configured if needed and rebuilt. The artifact
+    is then always copied into bin/ (the test tree also writes a same-named DLL
+    there, so this re-syncs the release slot). Skipped with -SkipBuild; forced
+    with -ForceBuild.
 
     Step 2 - launch, in order of preference:
 
@@ -41,7 +42,8 @@
 
 .PARAMETER GodotArgs
     Any extra arguments are forwarded verbatim to the host (e.g. a scene path,
-    `--resolution 1280x720`, `--headless`).
+    `--resolution 1280x720`, `--headless`). Positional binding is disabled so
+    dashed Godot flags never bind to the named parameters by mistake.
 
 .EXAMPLE
     .\run-prod.ps1
@@ -52,7 +54,7 @@
 .EXAMPLE
     .\run-prod.ps1 -SkipBuild --headless --quit
 #>
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [string]$GodotVersion = '4.7.2.stable',
     [string]$EditorExe = '',
@@ -90,29 +92,29 @@ function Find-CMake {
 }
 
 function Test-ReleaseBuildStale {
-    param([string]$Root, [string]$DllPath)
+    param([string]$Root, [string]$ArtifactPath)
 
-    if (-not (Test-Path -LiteralPath $DllPath)) { return $true }
-    $dllTime = (Get-Item -LiteralPath $DllPath).LastWriteTimeUtc
+    if (-not (Test-Path -LiteralPath $ArtifactPath)) { return $true }
+    $artifactTime = (Get-Item -LiteralPath $ArtifactPath).LastWriteTimeUtc
 
     foreach ($dir in @((Join-Path $Root 'include'), (Join-Path $Root 'src'))) {
         if (-not (Test-Path -LiteralPath $dir)) { continue }
         $newer = Get-ChildItem -LiteralPath $dir -Recurse -File -Include *.hpp, *.h, *.cpp |
-            Where-Object { $_.LastWriteTimeUtc -gt $dllTime } |
+            Where-Object { $_.LastWriteTimeUtc -gt $artifactTime } |
             Select-Object -First 1
         if ($newer) { return $true }
     }
 
     $cmakeLists = Join-Path $Root 'CMakeLists.txt'
     if ((Test-Path -LiteralPath $cmakeLists) -and
-        (Get-Item -LiteralPath $cmakeLists).LastWriteTimeUtc -gt $dllTime) {
+        (Get-Item -LiteralPath $cmakeLists).LastWriteTimeUtc -gt $artifactTime) {
         return $true
     }
     return $false
 }
 
 function Invoke-ReleaseBuild {
-    param([string]$Root, [string]$BuildDir, [string]$CMake, [string]$DllPath)
+    param([string]$Root, [string]$BuildDir, [string]$CMake)
 
     if (-not (Test-Path -LiteralPath (Join-Path $BuildDir 'CMakeCache.txt'))) {
         $godotCpp = Join-Path (Split-Path -Parent $Root) 'Terrain3D\godot-cpp'
@@ -132,14 +134,6 @@ function Invoke-ReleaseBuild {
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Release build failed - not launching."
         exit $LASTEXITCODE
-    }
-
-    $artifact = Join-Path $BuildDir 'bin\Release\libvoxel_engine.dll'
-    if (Test-Path -LiteralPath $artifact) {
-        $destTime = if (Test-Path -LiteralPath $DllPath) { (Get-Item -LiteralPath $DllPath).LastWriteTimeUtc } else { [datetime]::MinValue }
-        if ((Get-Item -LiteralPath $artifact).LastWriteTimeUtc -gt $destTime) {
-            Copy-Item -LiteralPath $artifact -Destination $DllPath -Force
-        }
     }
 }
 
@@ -168,10 +162,11 @@ if ($GodotArgs.Count -gt 0) {
     Write-Host ("  args:     " + ($GodotArgs -join ' '))
 }
 
+$artifact = Join-Path $buildDir 'bin\Release\libvoxel_engine.dll'
 if ($SkipBuild) {
     Write-Host "  dll:      build check skipped (-SkipBuild)"
 } else {
-    $stale = $ForceBuild -or (Test-ReleaseBuildStale -Root $projectRoot -DllPath $releaseDll)
+    $stale = $ForceBuild -or (Test-ReleaseBuildStale -Root $projectRoot -ArtifactPath $artifact)
     if ($stale) {
         $cmake = Find-CMake
         if (-not $cmake) {
@@ -179,10 +174,32 @@ if ($SkipBuild) {
                          "cannot rebuild the release DLL. Install CMake or run with -SkipBuild.")
             exit 1
         }
-        Invoke-ReleaseBuild -Root $projectRoot -BuildDir $buildDir -CMake $cmake -DllPath $releaseDll
-        Write-Host "  dll:      rebuilt $(Split-Path -Leaf $releaseDll)"
+        Invoke-ReleaseBuild -Root $projectRoot -BuildDir $buildDir -CMake $cmake
+        Write-Host "  dll:      rebuilt release artifact"
     } else {
-        Write-Host "  dll:      up to date (use -ForceBuild to rebuild anyway)"
+        Write-Host "  dll:      release artifact up to date (use -ForceBuild to rebuild anyway)"
+    }
+
+    if (-not (Test-Path -LiteralPath $artifact)) {
+        Write-Error "Release artifact not found at '$artifact'."
+        exit 1
+    }
+    # The test tree (build/) links godot-cpp template_debug but copies to the same
+    # bin/ filename, so re-sync the release-slot DLL whenever the contents differ.
+    $needs_copy = $true
+    if (Test-Path -LiteralPath $releaseDll) {
+        $artifactHash = (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash
+        $destHash = (Get-FileHash -LiteralPath $releaseDll -Algorithm SHA256).Hash
+        $needs_copy = ($artifactHash -ne $destHash)
+    }
+    if ($needs_copy) {
+        try {
+            Copy-Item -LiteralPath $artifact -Destination $releaseDll -Force -ErrorAction Stop
+        } catch {
+            Write-Error ("bin/ DLL is locked and out of date (is the Godot editor or a running game " +
+                         "holding it?). Close it and rerun so the release DLL can be synced.")
+            exit 1
+        }
     }
 }
 

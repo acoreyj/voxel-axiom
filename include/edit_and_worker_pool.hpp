@@ -175,6 +175,8 @@ struct ChunkMeshPayload {
     uint64_t captured_terrain_revision = 0;
     std::vector<Vec3f> vertices;
     std::vector<Vec3f> normals;
+    // Per-vertex attributes: x = damage_ratio in [0, 1], y = hard-rock flag, z = 0
+    std::vector<Vec3f> colors;
     std::vector<int32_t> indices;
     std::vector<Vec3f> collision_faces;
     std::size_t reserved_ledger_bytes = 0;
@@ -198,7 +200,7 @@ struct CompletionRecord {
 };
 
 // ============================================================================
-// 4. 26-Neighbor Closure Readiness Check & Phased CSG Executor
+// 4. 26-Neighbor Closure Readiness Check & Phased CSG + Persistent Damage Executor
 // ============================================================================
 
 [[nodiscard]] inline bool are_all_in_bounds_neighbors_resident(
@@ -292,28 +294,65 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                         const float px = static_cast<float>(chunk_min.x + lx);
 
                         float d_blast = -1e30f;
+                        int spheres_hitting_sample = 0;
                         for (const SphereCsgTerm& s : tx.spheres) {
                             const float dx = px - s.center.x;
                             const float dy = py - s.center.y;
                             const float dz = pz - s.center.z;
                             const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
-                            d_blast = std::max(d_blast, s.radius - dist);
+                            const float d = s.radius - dist;
+                            d_blast = std::max(d_blast, d);
+                            if (d > -delta) {
+                                ++spheres_hitting_sample;
+                            }
                         }
 
                         if (d_blast > -delta) {
-                            const int16_t q_blast = additive
-                                                        ? TsdfFormat::encode(-d_blast, delta)
-                                                        : TsdfFormat::encode(d_blast, delta);
                             const LocalCoord lc{lx, ly, lz};
                             const int16_t q_cur = slot->get_tsdf(lc);
-                            const int16_t q_new = additive ? std::min(q_cur, q_blast)
-                                                           : std::max(q_cur, q_blast);
 
-                            if (q_new != q_cur) {
-                                bool changed = false;
-                                if (slot->set_tsdf(lc, q_new, store.tsdf_pool(), &changed) && changed) {
+                            if (additive) {
+                                const int16_t q_blast = TsdfFormat::encode(-d_blast, delta);
+                                const int16_t q_new = std::min(q_cur, q_blast);
+
+                                if (q_new != q_cur) {
+                                    bool changed = false;
+                                    if (slot->set_tsdf(lc, q_new, store.tsdf_pool(), &changed) && changed) {
+                                        chunk_modified = true;
+                                        local_dirty_mask.record_mutated_sample(lc);
+                                    }
+                                }
+                            } else {
+                                const uint8_t mat_id = slot->get_material(lc);
+                                const uint8_t threshold = MaterialHardness::break_threshold(mat_id);
+
+                                // Accumulate persistent damage from each sphere term intersecting this sample
+                                const uint32_t added_dmg = std::min<uint32_t>(
+                                    255U,
+                                    static_cast<uint32_t>(spheres_hitting_sample) *
+                                        static_cast<uint32_t>(MaterialHardness::kDamagePerExplosionHit));
+                                bool dmg_changed = false;
+                                const uint8_t total_dmg = slot->add_damage(
+                                    lc, static_cast<uint8_t>(added_dmg), store.material_pool(), &dmg_changed);
+                                if (dmg_changed) {
                                     chunk_modified = true;
                                     local_dirty_mask.record_mutated_sample(lc);
+                                }
+
+                                // Only carve TSDF once cumulative damage reaches the material's hardness threshold!
+                                // (For kMaterialSoil=1, threshold=85 -> carves on 1st hit;
+                                //  For kMaterialHardRock=2, threshold=255 -> cracks on hits 1 & 2, shatters on 3rd hit!)
+                                if (total_dmg >= threshold) {
+                                    const int16_t q_blast = TsdfFormat::encode(d_blast, delta);
+                                    const int16_t q_new = std::max(q_cur, q_blast);
+
+                                    if (q_new != q_cur) {
+                                        bool changed = false;
+                                        if (slot->set_tsdf(lc, q_new, store.tsdf_pool(), &changed) && changed) {
+                                            chunk_modified = true;
+                                            local_dirty_mask.record_mutated_sample(lc);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -657,6 +696,7 @@ private:
             const std::size_t bytes =
                 rec.chunk_mesh.vertices.size() * sizeof(Vec3f) +
                 rec.chunk_mesh.normals.size() * sizeof(Vec3f) +
+                rec.chunk_mesh.colors.size() * sizeof(Vec3f) +
                 rec.chunk_mesh.indices.size() * sizeof(int32_t) +
                 rec.chunk_mesh.collision_faces.size() * sizeof(Vec3f);
             if (bytes > 0 && store_.ledger().try_reserve(bytes, MemoryPoolId::CompletionQueue)) {

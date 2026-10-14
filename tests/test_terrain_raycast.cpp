@@ -97,13 +97,16 @@ void test_ray_crosses_chunk_boundary() {
     ChunkStore store(ledger, /*world_height_chunks=*/8);
     build_flat_ground_chunk(store, ChunkKey::from_coords(0, 0, 0), /*surface_local_y=*/16);
 
-    // Solid wall at world x = 40..47 inside chunk (1, 0, 0); air elsewhere.
+    // Solid wall at world x = 40..47 inside chunk (1, 0, 0); explicit +1.0 air
+    // at world x = 39 so the face interpolates between two smooth samples.
     const float delta = TsdfFormat::kDefaultTruncationDelta;
     ChunkSlot* wall = make_resident_slot(store, ChunkKey::from_coords(1, 0, 0), ChunkStorageForm::Empty);
     {
         std::unique_lock<std::shared_mutex> lock(wall->mutex);
         for (int32_t y = 0; y < 32; ++y) {
             for (int32_t z = 0; z < 32; ++z) {
+                (void)wall->set_tsdf(LocalCoord{7, y, z}, TsdfFormat::encode(+1.0f, delta),
+                                     store.tsdf_pool());
                 for (int32_t x = 8; x < 16; ++x) {
                     (void)wall->set_tsdf(LocalCoord{x, y, z}, TsdfFormat::encode(-1.0f, delta),
                                          store.tsdf_pool());
@@ -114,8 +117,7 @@ void test_ray_crosses_chunk_boundary() {
 
     const auto hit = raycast_terrain(store, Vec3f{16.0f, 20.0f, 16.0f}, Vec3f{60.0f, 20.0f, 16.0f});
     REQUIRE(hit.has_value());
-    std::printf("[DBG] cross-chunk hit = (%.3f, %.3f, %.3f)\n", hit->x, hit->y, hit->z);
-    // Surface between sample x=39 (S=+1.0) and x=40 (S=-1.0): t = 0.5.
+    // Surface between world x=39 (S=+1.0) and x=40 (S=-1.0): t = 0.5.
     REQUIRE(std::abs(hit->x - 39.5f) < 0.05f);
     REQUIRE(std::abs(hit->y - 20.0f) < 0.05f);
     REQUIRE(std::abs(hit->z - 16.0f) < 0.05f);

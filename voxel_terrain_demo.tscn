@@ -2,6 +2,7 @@
 
 [ext_resource type="Script" uid="uid://bhuhnykvb2uuo" path="res://terrain_demo.gd" id="1_demo_script"]
 [ext_resource type="Shader" uid="uid://oucs7i2mnfnn" path="res://voxel_triplanar.gdshader" id="2_triplanar_shader"]
+[ext_resource type="Script" uid="uid://css26at8wuwc0" path="res://ai_companion_patrol.gd" id="3_pill_patrol"]
 
 [sub_resource type="ProceduralSkyMaterial" id="ProceduralSkyMaterial_1"]
 
@@ -23,6 +24,23 @@ shader_parameter/deep_cave_color = Color(0.22, 0.24, 0.29, 1)
 shader_parameter/surface_height_threshold = 56.0
 shader_parameter/triplanar_scale = 0.25
 
+[sub_resource type="CapsuleMesh" id="CapsuleMesh_pill"]
+radius = 0.6
+height = 2.6
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_pill_body"]
+albedo_color = Color(0.94, 0.42, 0.32, 1)
+roughness = 0.35
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_pill_band"]
+top_radius = 0.62
+bottom_radius = 0.62
+height = 0.36
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_pill_band"]
+albedo_color = Color(0.96, 0.96, 0.93, 1)
+roughness = 0.3
+
 [node name="VoxelTerrainDemo" type="Node3D" unique_id=1977873775]
 script = ExtResource("1_demo_script")
 
@@ -36,12 +54,22 @@ shadow_enabled = true
 [node name="VoxelTerrain3D" type="VoxelTerrain3D" parent="." unique_id=1732306372]
 view_distance_chunks = 6
 prefetch_distance_chunks = 2
-collision_distance_chunks = 0
 world_height_chunks = 6
 terrain_material = SubResource("ShaderMaterial_Terrain")
 
 [node name="VoxelAICompanion" type="VoxelAICompanion" parent="." unique_id=1917223628]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 16, 48, 16)
+script = ExtResource("3_pill_patrol")
+
+[node name="PillBody" type="MeshInstance3D" parent="VoxelAICompanion" unique_id=214629451]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.3, 0)
+mesh = SubResource("CapsuleMesh_pill")
+surface_material_override/0 = SubResource("StandardMaterial3D_pill_body")
+
+[node name="PillBand" type="MeshInstance3D" parent="VoxelAICompanion" unique_id=386318829]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.3, 0)
+mesh = SubResource("CylinderMesh_pill_band")
+surface_material_override/0 = SubResource("StandardMaterial3D_pill_band")
 
 [node name="Camera3D" type="Camera3D" parent="." unique_id=263971570]
 transform = Transform3D(1, 0, 0, 0, 0.968912, 0.247404, 0, -0.247404, 0.968912, 16, 84, 48)

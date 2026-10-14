@@ -140,9 +140,12 @@ without re-exporting each time, use the launcher:
 ```
 
 **It rebuilds first.** If `include/`, `src/` or `CMakeLists.txt` are newer than
-`bin/libvoxel_engine.windows.release.x86_64.dll` (or the DLL is missing), it
-configures `build-release` when necessary and rebuilds it, then copies the fresh
-artifact into `bin/`. The loaded engine always matches the sources.
+the `build-release` artifact (or it is missing), it configures `build-release`
+when necessary and rebuilds it. The artifact is then synced into `bin/` whenever
+the contents differ — the test tree (`build/`) links godot-cpp `template_debug`
+but writes a same-named DLL into `bin/`, so this guarantees the release slot is
+the one Godot loads. If that DLL is locked by a running editor/game *and* out of
+date, the launcher stops with a clear message.
 
 **Then it launches**, preferring the installed Windows **release** export
 template (`%APPDATA%\Godot\export_templates\<version>\windows_release_x86_64.exe`,

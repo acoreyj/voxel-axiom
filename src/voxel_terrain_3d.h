@@ -55,6 +55,14 @@ public:
     // Core GDScript-exposed API (Section 4.2)
     void trigger_explosion(Vector3 p_position, float p_radius);
     void add_terrain(Vector3 p_position, float p_radius);
+    /// Engine-side voxel raycast against resident TSDF chunks. Returns the
+    /// interpolated surface point, or a Vector3 of +INF when nothing is hit
+    /// (ray starts inside solid, ends in air, or crosses only unloaded space).
+    [[nodiscard]] Vector3 raycast_terrain(Vector3 p_from, Vector3 p_to) const;
+    /// Top-most terrain surface height at world (x, z); main thread only. Casts the
+    /// vertical surface ray first (edited terrain) and falls back to the procedural
+    /// generator when no crossing is found (column not streamed).
+    [[nodiscard]] float get_surface_height(float p_x, float p_z) const;
     void save_world();
     void set_stream_focus(Vector3 p_position, Vector3 p_velocity);
     [[nodiscard]] bool core_idle() const;

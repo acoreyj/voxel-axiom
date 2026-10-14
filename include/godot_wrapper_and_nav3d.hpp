@@ -25,6 +25,8 @@
 #include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/variant/array.hpp>
 #include <godot_cpp/variant/callable_method_pointer.hpp>
+#include <godot_cpp/variant/color.hpp>
+#include <godot_cpp/variant/packed_color_array.hpp>
 #include <godot_cpp/variant/packed_int32_array.hpp>
 #include <godot_cpp/variant/packed_vector3_array.hpp>
 #include <godot_cpp/variant/rid.hpp>
@@ -161,6 +163,14 @@ public:
                 norms.resize(static_cast<int64_t>(mesh.normals.size()));
                 std::memcpy(norms.ptrw(), mesh.normals.data(), mesh.normals.size() * sizeof(Vec3f));
 
+                godot::PackedColorArray colors;
+                colors.resize(static_cast<int64_t>(mesh.vertices.size()));
+                godot::Color* color_ptr = colors.ptrw();
+                for (std::size_t i = 0; i < mesh.vertices.size(); ++i) {
+                    const Vec3f c = (i < mesh.colors.size()) ? mesh.colors[i] : Vec3f{};
+                    color_ptr[i] = godot::Color(c.x, c.y, c.z, 1.0f);
+                }
+
                 godot::PackedInt32Array indices;
                 indices.resize(static_cast<int64_t>(mesh.indices.size()));
                 std::memcpy(indices.ptrw(), mesh.indices.data(), mesh.indices.size() * sizeof(int32_t));
@@ -169,6 +179,7 @@ public:
                 surface_arrays.resize(godot::RenderingServer::ARRAY_MAX);
                 surface_arrays[godot::RenderingServer::ARRAY_VERTEX] = verts;
                 surface_arrays[godot::RenderingServer::ARRAY_NORMAL] = norms;
+                surface_arrays[godot::RenderingServer::ARRAY_COLOR]  = colors;
                 surface_arrays[godot::RenderingServer::ARRAY_INDEX]  = indices;
 
                 rs->mesh_add_surface_from_arrays(
@@ -317,11 +328,17 @@ struct CaveNavMeshConfig {
     float voxel_scale = 1.0f;
     float cell_size = 0.25f;   // 0.25 * s
     float cell_height = 0.20f; // 0.20 * s
-    float agent_radius = 0.6f;
-    float agent_height = 1.8f;
-    float agent_max_climb = 0.5f;
+    // Agent values are exact multiples of the live NavigationMesh cell sizes
+    // (cell_size 0.5 / cell_height 0.4) so Recast never logs the
+    // "ceiled/floored ... loses precision" warnings on every bake.
+    float agent_radius = 0.5f;
+    float agent_height = 2.0f;
+    float agent_max_climb = 0.4f;
     float agent_max_slope = 45.0f;
-    float region_connection_margin = 0.4f;
+    // 0.5 keeps horizontal_padding() (agent_radius + margin + 2 voxels = 3.0)
+    // an exact multiple of the live cell_size 0.5, so Recast never logs the
+    // "border_size is ceiled to cell_size voxel units" warning per bake.
+    float region_connection_margin = 0.5f;
     float region_min_size = 8.0f;
 
     bool filter_low_hanging_obstacles = true;
@@ -497,6 +514,13 @@ public:
             if (g.rebuild_in_flight) {
                 continue;
             }
+#if defined(VOXEL_WITH_GODOT_CPP)
+            if (auto* ns = godot::NavigationServer3D::get_singleton();
+                ns != nullptr && g.nav_mesh.is_valid() &&
+                ns->is_baking_navigation_mesh(g.nav_mesh)) {
+                continue;
+            }
+#endif
             const bool dirty = (g.desired_terrain_revision > g.synced_terrain_revision) ||
                                (g.desired_source_epoch > g.synced_source_epoch);
             if (!dirty) {
@@ -600,9 +624,21 @@ public:
         }
 #endif
         for (auto& [gk, g] : groups_) {
-            if (g.rebuild_in_flight &&
-                g.bake_callback_received &&
-                map_iteration_id_ > g.pending_callback_map_iteration) {
+            if (!g.rebuild_in_flight) {
+                continue;
+            }
+            bool bake_done = g.bake_callback_received;
+#if defined(VOXEL_WITH_GODOT_CPP)
+            if (auto* ns = godot::NavigationServer3D::get_singleton();
+                ns != nullptr && g.nav_mesh.is_valid()) {
+                // The async bake only counts as done once the server finished
+                // rasterizing; otherwise the group would be considered synced
+                // while its navmesh is still being written and a later edit
+                // would resubmit it mid-bake ("NavigationMesh is already baking").
+                bake_done = bake_done && !ns->is_baking_navigation_mesh(g.nav_mesh);
+            }
+#endif
+            if (bake_done && map_iteration_id_ > g.pending_callback_map_iteration) {
 #if defined(VOXEL_WITH_GODOT_CPP)
                 if (auto* ns = godot::NavigationServer3D::get_singleton();
                     ns != nullptr && g.region_rid.native_rid.is_valid() && g.nav_mesh.is_valid()) {

@@ -44,12 +44,13 @@ public:
     static constexpr int32_t kDim = 36; // -1 .. 34 inclusive
     static constexpr std::size_t kTotalSamples = 36ULL * 36ULL * 36ULL; // 46,656 samples
     static constexpr std::size_t kScratchBytes =
-        kTotalSamples * (sizeof(int16_t) + sizeof(uint8_t)); // 139,968 B (~136.7 KiB)
+        kTotalSamples * (sizeof(int16_t) + 2 * sizeof(uint8_t)); // 186,624 B (~182.3 KiB): tsdf + material + damage
 
     explicit WorkerScratchWindow36(MemoryLedger& ledger)
         : ledger_(ledger),
           tsdf_(kTotalSamples, TsdfFormat::kClampedAir),
-          material_(kTotalSamples, 0) {
+          material_(kTotalSamples, 0),
+          damage_(kTotalSamples, 0) {
         reserved_ = ledger_.try_reserve(kScratchBytes, MemoryPoolId::WorkerScratch);
         assert(reserved_ && "WorkerScratchWindow36 reservation must succeed within budget");
     }
@@ -95,14 +96,24 @@ public:
         material_[linear_index(sx, sy, sz)] = mat;
     }
 
+    [[nodiscard]] uint8_t get_damage(int32_t sx, int32_t sy, int32_t sz) const noexcept {
+        return damage_[linear_index(sx, sy, sz)];
+    }
+
+    void set_damage(int32_t sx, int32_t sy, int32_t sz, uint8_t dmg) noexcept {
+        damage_[linear_index(sx, sy, sz)] = dmg;
+    }
+
     [[nodiscard]] const std::vector<int16_t>& raw_tsdf() const noexcept { return tsdf_; }
     [[nodiscard]] const std::vector<uint8_t>& raw_material() const noexcept { return material_; }
+    [[nodiscard]] const std::vector<uint8_t>& raw_damage() const noexcept { return damage_; }
 
 private:
     MemoryLedger& ledger_;
     bool reserved_ = false;
     std::vector<int16_t> tsdf_;
     std::vector<uint8_t> material_;
+    std::vector<uint8_t> damage_;
 };
 
 /// Gathers the 36^3 (-1..34) worker scratch window for `center` from `store` under
@@ -196,6 +207,7 @@ private:
                         const LocalCoord lc{lx, ly, lz};
                         scratch.set_tsdf(sx, sy, sz, n.slot->get_tsdf(lc));
                         scratch.set_material(sx, sy, sz, n.slot->get_material(lc));
+                        scratch.set_damage(sx, sy, sz, n.slot->get_damage(lc));
                     }
                 }
             }
@@ -211,6 +223,7 @@ private:
                     for (int32_t sx = sx0; sx <= sx1; ++sx) {
                         scratch.set_tsdf(sx, sy, sz, fallback_tsdf);
                         scratch.set_material(sx, sy, sz, 0);
+                        scratch.set_damage(sx, sy, sz, 0);
                     }
                 }
             }

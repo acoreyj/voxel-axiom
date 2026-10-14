@@ -1,6 +1,7 @@
 #pragma once
 
 #include "edit_and_worker_pool.hpp"
+#include "terrain_raycast.hpp"
 
 #include <algorithm>
 #include <array>
@@ -88,6 +89,10 @@ struct CaveNoiseGenerator {
     /// sample, so toggling it affects only chunks generated afterwards.
     bool caves_enabled = true;
 
+    // Prominent 3-hit Hard Rock boulder right in front of the demo camera at (16, 70, 24)
+    Vec3f demo_hard_boulder_center{16.0f, 70.0f, 24.0f};
+    float demo_hard_boulder_radius = 7.5f;
+
     static constexpr float kEpsilonGrad = 0.05f; // Regularization floor (Section 3.5.2)
 
     [[nodiscard]] static constexpr float fade(float t) noexcept {
@@ -138,6 +143,23 @@ struct CaveNoiseGenerator {
         return lerp(y0, y1, w);
     }
 
+    [[nodiscard]] float hard_boulder_sdf(float wx, float wy, float wz) const noexcept {
+        const float dx = wx - demo_hard_boulder_center.x;
+        const float dy = wy - demo_hard_boulder_center.y;
+        const float dz = wz - demo_hard_boulder_center.z;
+        return std::sqrt(dx * dx + dy * dy + dz * dz) - demo_hard_boulder_radius;
+    }
+
+    /// Returns true if world position (wx, wy, wz) belongs to a 3-hit Hard Rock formation
+    /// (either the showcase boulder in front of the camera or procedural hard-rock outcrops).
+    [[nodiscard]] bool is_hard_rock_region(float wx, float wy, float wz) const noexcept {
+        if (hard_boulder_sdf(wx, wy, wz) <= 1.5f) {
+            return true;
+        }
+        const float vein = smooth_noise_3d(wx * 0.045f, wy * 0.045f, wz * 0.045f, seed + 707U);
+        return vein > 0.38f;
+    }
+
     /// Evaluates composite surface + 3D dual-noise spaghetti cave density D(x, y, z)
     /// (Negative = solid, Positive = air) per HLD v4.0 Section 3.5.2.
     [[nodiscard]] float evaluate_composite_density(float wx, float wy, float wz) const noexcept {
@@ -150,7 +172,7 @@ struct CaveNoiseGenerator {
         // Cave generation is optional: when disabled, the terrain is the pure
         // 2D surface + overhang field with no 3D cavities carved into it.
         if (!caves_enabled) {
-            return d_surf;
+            return std::min(d_surf, hard_boulder_sdf(wx, wy, wz));
         }
 
         // 2. 3D Dual-Noise Ridge Intersection Cave Density:
@@ -165,8 +187,9 @@ struct CaveNoiseGenerator {
         const float n_b = 20.0f * smooth_noise_3d(wx * 0.022f, wy * 0.028f, wz * 0.022f, seed + 303U);
         const float d_cave = r_y - std::sqrt(n_a * n_a + n_b * n_b);
 
-        // 3. Combined density: D(x,y,z) = max(D_surf(x,y,z), D_cave(x,y,z))
-        return std::max(d_surf, d_cave);
+        // 3. Combined density: D(x,y,z) = min(max(D_surf, D_cave), D_boulder)
+        const float terrain_and_caves = std::max(d_surf, d_cave);
+        return std::min(terrain_and_caves, hard_boulder_sdf(wx, wy, wz));
     }
 
     /// Pass 2 of chunk population: converts an already-filled 34^3 ([-1..32]^3) density
@@ -174,17 +197,23 @@ struct CaveNoiseGenerator {
     /// regularized gradient normalization max(||grad D||, 0.05), then publishes the slot
     /// as Resident (HLD v4.0 Section 3.5.2). Shared by the generic density-fn path and the
     /// cached composite-density path so both stay bit-identical.
+    /// @param mark_hard_rock  When true, solid samples inside a Hard Rock formation
+    ///   (showcase boulder or procedural hard-rock veins) are tagged
+    ///   `MaterialHardness::kMaterialHardRock` so explosions crack them over 3 hits
+    ///   instead of shattering them on the first.
     void encode_chunk_from_density_grid(
         ChunkStore& store,
         ChunkKey chunk_key,
         WorkerDensityGrid34& grid34,
-        uint8_t base_material = 1) const {
+        uint8_t base_material = MaterialHardness::kMaterialSoil,
+        bool mark_hard_rock = false) const {
 
         ChunkSlot* slot = store.get_or_create_slot(chunk_key);
         std::unique_lock<std::shared_mutex> lock(slot->mutex);
         slot->reset_to_uniform(ChunkStorageForm::Solid, base_material, store.tsdf_pool(), store.material_pool());
         REQUIRE_OR_ASSERT(slot->promote_to_dense(store.tsdf_pool()));
 
+        const IVec3 chunk_min = chunk_key.min_world_sample();
         const float inv_2s = 1.0f / (2.0f * voxel_scale);
         for (int32_t lz = 0; lz < 32; ++lz) {
             for (int32_t ly = 0; ly < 32; ++ly) {
@@ -202,6 +231,16 @@ struct CaveNoiseGenerator {
                     const int16_t q = TsdfFormat::encode(sdf_approx, truncation_delta);
                     const LocalCoord lc{lx, ly, lz};
                     (void)slot->set_tsdf(lc, q, store.tsdf_pool());
+
+                    if (mark_hard_rock && q < 0) {
+                        const float wx = static_cast<float>(chunk_min.x + lx) * voxel_scale;
+                        const float wy = static_cast<float>(chunk_min.y + ly) * voxel_scale;
+                        const float wz = static_cast<float>(chunk_min.z + lz) * voxel_scale;
+                        if (is_hard_rock_region(wx, wy, wz)) {
+                            (void)slot->set_material(
+                                lc, MaterialHardness::kMaterialHardRock, store.material_pool());
+                        }
+                    }
                 }
             }
         }
@@ -221,7 +260,7 @@ struct CaveNoiseGenerator {
         ChunkKey chunk_key,
         WorkerDensityGrid34& grid34,
         DensityFn&& density_fn,
-        uint8_t base_material = 1) const {
+        uint8_t base_material = MaterialHardness::kMaterialSoil) const {
 
         const IVec3 chunk_min = chunk_key.min_world_sample();
 
@@ -276,7 +315,7 @@ struct CaveNoiseGenerator {
                     // Cave generation is optional: when disabled, the terrain is the pure
                     // 2D surface + overhang field with no 3D cavities carved into it.
                     if (!caves_enabled) {
-                        grid34.set(lx, ly, lz, d_surf);
+                        grid34.set(lx, ly, lz, std::min(d_surf, hard_boulder_sdf(wx, wy, wz)));
                         continue;
                     }
 
@@ -287,12 +326,13 @@ struct CaveNoiseGenerator {
                     const float n_b = 20.0f * smooth_noise_3d(wx * 0.022f, wy * 0.028f, wz * 0.022f, seed + 303U);
                     const float d_cave = r_y - std::sqrt(n_a * n_a + n_b * n_b);
 
-                    grid34.set(lx, ly, lz, std::max(d_surf, d_cave));
+                    grid34.set(lx, ly, lz, std::min(std::max(d_surf, d_cave), hard_boulder_sdf(wx, wy, wz)));
                 }
             }
         }
 
-        encode_chunk_from_density_grid(store, chunk_key, grid34);
+        encode_chunk_from_density_grid(
+            store, chunk_key, grid34, MaterialHardness::kMaterialSoil, /*mark_hard_rock=*/true);
     }
 
 private:
@@ -301,6 +341,55 @@ private:
         (void)ok;
     }
 };
+
+/// World-space top-surface height query for gameplay (spawn points, patrols).
+///
+/// Casts a vertical ray against the resident TSDF column under (wx, wz) via
+/// `raycast_terrain` and returns the world-space y of the top-most air -> solid
+/// crossing: the surface a character would stand on (overhangs resolve to the
+/// highest crossing). The procedural generator is evaluated as a fallback whenever
+/// the ray finds no crossing (column not streamed, ray swallowed by a missing
+/// chunk, or terrain taller than the world ceiling), so edited terrain is
+/// reflected wherever chunks are streamed, and pristine terrain everywhere else.
+///
+/// Main-thread only: takes a shared slot lock per sampled chunk.
+[[nodiscard]] inline float sample_top_surface_y(
+    const ChunkStore& store,
+    const CaveNoiseGenerator& procgen,
+    float wx,
+    float wz) {
+
+    const float ceiling = static_cast<float>(store.world_height_chunks() * ChunkKey::kChunkDim) - 1.0f;
+    if (const std::optional<Vec3f> hit =
+            raycast_terrain(store, Vec3f{wx, ceiling, wz}, Vec3f{wx, 0.0f, wz})) {
+        return hit->y;
+    }
+
+    // Analytic fallback on the procedural generator. The +-3 m overhang term means
+    // the surface sits within +-3 m of the 2D height, so 4 m above it is safe air.
+    const float h_2d = procgen.surface_base_height +
+                       procgen.surface_amplitude *
+                           CaveNoiseGenerator::smooth_noise_3d(wx * 0.012f, 0.0f, wz * 0.012f, procgen.seed);
+    const float step = 0.5f;
+    float air_y = std::min(h_2d + 4.0f, ceiling);
+    float solid_y = air_y - step;
+    while (solid_y > 0.0f && procgen.evaluate_composite_density(wx, solid_y, wz) >= 0.0f) {
+        air_y = solid_y;
+        solid_y -= step;
+    }
+    if (solid_y <= 0.0f) {
+        return 0.0f; // all air down to bedrock; nothing to stand on.
+    }
+    for (int i = 0; i < 12; ++i) {
+        const float mid = 0.5f * (air_y + solid_y);
+        if (procgen.evaluate_composite_density(wx, mid, wz) < 0.0f) {
+            solid_y = mid;
+        } else {
+            air_y = mid;
+        }
+    }
+    return 0.5f * (air_y + solid_y);
+}
 
 // ============================================================================
 // 2. Seamless Surface Nets Mesher over the 36^3 Scratch Window (Section 3.5.3)
@@ -316,6 +405,7 @@ public:
         Vec3f local_pos{};
         Vec3f normal{};
         uint8_t material_id = 0;
+        uint8_t damage = 0;
     };
 
     /// Meshes chunk `chunk_key` from its populated 36^3 (`-1..34`) scratch window:
@@ -381,6 +471,7 @@ public:
                     uint8_t mask = 0;
                     int16_t best_solid_q = INT16_MIN;
                     uint8_t best_material = 0;
+                    uint8_t max_solid_damage = 0;
 
                     for (int c = 0; c < 8; ++c) {
                         const int32_t cx = i + (c & 1);
@@ -390,6 +481,7 @@ public:
                         corner_q[c] = q;
                         if (q < 0) {
                             mask |= static_cast<uint8_t>(1U << c);
+                            max_solid_damage = std::max(max_solid_damage, scratch.get_damage(cx, cy, cz));
                             if (q > best_solid_q) {
                                 best_solid_q = q;
                                 best_material = scratch.get_material(cx, cy, cz);
@@ -470,6 +562,7 @@ public:
                     };
                     cell.normal = n;
                     cell.material_id = best_material;
+                    cell.damage = max_solid_damage;
                 }
             }
         }
@@ -480,6 +573,11 @@ public:
                 cell.vertex_index = static_cast<uint32_t>(out.vertices.size());
                 out.vertices.push_back(cell.local_pos);
                 out.normals.push_back(cell.normal);
+                // Pack damage ratio in [0, 1] into colors.x (R) and hard-rock flag into colors.y (G)
+                const float dmg_ratio = static_cast<float>(cell.damage) / 255.0f;
+                const float is_hard_rock =
+                    (cell.material_id == MaterialHardness::kMaterialHardRock) ? 1.0f : 0.0f;
+                out.colors.push_back(Vec3f{dmg_ratio, is_hard_rock, 0.0f});
             }
             return cell.vertex_index;
         };

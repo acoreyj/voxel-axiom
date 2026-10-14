@@ -509,6 +509,7 @@ Because the Mesh worker already builds the de-indexed triangle soup (`Vector3` t
 * `void trigger_explosion(Vector3 position, float radius)`: Enqueues an asynchronous Edit transaction and returns immediately in less than `0.1 ms`. Never blocks.
 * `void save_world()`: Flushes all pending `PersistCompress` and `RegionFlush` jobs synchronously.
 * `void set_stream_focus(Vector3 position, Vector3 velocity)`: Updates the streaming center and motion bias vector.
+* `float get_surface_height(float x, float z)`: Top-most terrain surface height under the world column at (x, z); main thread only. Marches the resident TSDF column (edited terrain) and falls back to the procedural generator when the column is not streamed. Drives the demo pill companion's ground pinning.
 * `bool core_idle() const`: True when all worker lanes and dirty queues are empty.
 * `bool fully_committed() const`: True when `core_idle()` is true, the MPSC completion queue is empty, and `navigation_groups_synced()` is true.
 * `int get_effective_view_distance_chunks() const`: Returns the active Chebyshev radius currently supported by `resident_memory_budget_mb`.

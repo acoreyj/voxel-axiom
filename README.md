@@ -12,6 +12,7 @@ A high-performance, real-time destructible voxel engine with 3D cave generation 
 - **Multi-Threaded Worker Pool**: Striped chunk locks, MPSC completion queue, and dual-priority scheduling (`dirty_edit_chunks` for explosions vs. `dirty_stream_chunks` for streaming).
 - **Procedural 3D Cave Generation (optional)**: FastNoise SIMD uniform grid generation composed of 2D surface heightmaps and 3D dual-noise cave worms/swiss-cheese cavities. Set `generate_caves = false` on `VoxelTerrain3D` to skip the cave term entirely and stream cave-free terrain; the toggle is read at generation time, so it affects only chunks generated afterwards.
 - **3D Cave Navigation**: Dynamic integration with Godot's `NavigationServer3D`, asynchronous navigation mesh baking, and synchronized path queries for AI companions.
+- **World-Space Terrain Queries**: `VoxelTerrain3D.raycast_terrain()` and `get_surface_height()` answer against the resident TSDF field (edited terrain first, procedural generator fallback), so aiming, spawns, and patrols work with no physics-collision dependency. The demo's `VoxelAICompanion` carries a visible pill capsule that patrols a triangular route on the terrain surface.
 - **Crash-Safe 3D Region Persistence**: $8 \times 8 \times 8$ chunk region files (up to 512 chunks per region) with LZ4 byte-plane compression and background disk streaming.
 - **Triplanar Voxel Shading**: Custom triplanar shader blending rock, soil, grass, and cave interior textures with normal mapping and roughness.
 - **Built-in Performance Instrumentation**: Lock-free per-operation timing (`generate`, `mesh`, `commit`, `stream_focus`, `edit`, `navigation`) accumulated per frame and logged to the Godot **Output** panel. Toggle with the `instrumentation_enabled` property.
@@ -326,8 +327,11 @@ the Inspector:
 | `brush_spacing_factor` | `0.6` | Drag-brush step distance (`radius x factor`) |
 | `brush_interval` | `0.05` | Minimum seconds between drag-brush steps |
 
-Both operations are asynchronous CSG sphere edits on the native engine and never
-block the main thread. From GDScript:
+Aiming uses the engine's voxel-space raycast (`VoxelTerrain3D.raycast_terrain`,
+which marches the resident TSDF chunks), so tools hit the true terrain surface at
+any distance regardless of `collision_distance_chunks` gating. Both operations
+are asynchronous CSG sphere edits on the native engine and never block the main
+thread. From GDScript:
 
 ```gdscript
 $VoxelTerrain3D.trigger_explosion(Vector3(16, 70, 16), 8.5)  # carve
@@ -337,6 +341,28 @@ $VoxelTerrain3D.add_terrain(Vector3(16, 70, 16), 6.0)        # add
 `trigger_explosion` reports through `explosion_requested` / `explosion_completed`
 / `explosion_failed`; `add_terrain` mirrors those with `terrain_add_requested` /
 `terrain_add_completed` / `terrain_add_failed`.
+
+### Pill Companion (Demo)
+
+The demo's `VoxelAICompanion` node is not just a query facade: it carries a
+visible pill capsule driven by `ai_companion_patrol.gd`, which loops a
+triangular patrol route around the spawn area. Waypoint Y values are ignored —
+every frame the pill is pinned to `VoxelTerrain3D.get_surface_height(x, z)`, so
+it descends into fresh craters and rides over added terrain as you edit.
+
+| Export | Default | Purpose |
+| --- | --- | --- |
+| `patrol_points` | `[(16, 44), (44, 8), (-12, 8)]` | Patrol loop as world XZ points (Y is terrain-derived). |
+| `patrol_speed` | `6.0` | Metres per second along the route. |
+| `ground_offset` | `0.0` | Vertical offset added to the queried surface height. |
+| `yaw_turn_speed` | `8.0` | Facing turn rate toward the direction of travel. |
+| `terrain_path` | `^"../VoxelTerrain3D"` | Terrain node used for the height queries. |
+
+The height query itself is Godot-free and reusable from GDScript:
+
+```gdscript
+var y: float = $VoxelTerrain3D.get_surface_height(16.0, 16.0)  # top surface at (x, z)
+```
 
 ---
 
@@ -400,6 +426,7 @@ hosts redirect the output (tests capture it instead of printing).
 ├── project.godot                 # Godot engine project definition
 ├── run_all_tests.sh              # Standalone test runner with ASan/TSan
 ├── terrain_demo.gd               # Demo controller script (free-cam, terrain tools, nav queries)
+├── ai_companion_patrol.gd        # Pill companion patrol driver (surface height follow)
 ├── voxel_engine.gdextension      # GDExtension library definition file
 ├── voxel_terrain_demo.tscn       # Main 3D test scene (caves enabled)
 ├── voxel_terrain_no_caves_demo.tscn # Variant scene with `generate_caves = false`

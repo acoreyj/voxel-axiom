@@ -1,15 +1,20 @@
 shader_type spatial;
 render_mode specular_schlick_ggx, cull_back;
 
-// HLD v4.0 Section 8.2: World-Space Triplanar Cave & Surface Terrain Shader
+// HLD v4.0 Section 8.2 + Persistent Damage & 3-Hit Hard Rock Crack Visualization
 uniform vec3 top_grass_color : source_color = vec3(0.24, 0.48, 0.22);
 uniform vec3 cliff_rock_color : source_color = vec3(0.42, 0.39, 0.36);
 uniform vec3 deep_cave_color : source_color = vec3(0.22, 0.24, 0.29);
+uniform vec3 hard_rock_color : source_color = vec3(0.16, 0.18, 0.24);
+uniform vec3 crack_glow_stage1 : source_color = vec3(0.95, 0.48, 0.08);
+uniform vec3 crack_glow_stage2 : source_color = vec3(1.00, 0.18, 0.04);
 uniform float surface_height_threshold = 56.0;
 uniform float triplanar_scale = 0.25;
 
 varying vec3 v_world_pos;
 varying vec3 v_world_normal;
+varying float v_damage_ratio;
+varying float v_is_hard_rock;
 
 float hash31(vec3 p) {
     p = fract(p * 0.1031);
@@ -17,7 +22,6 @@ float hash31(vec3 p) {
     return fract((p.x + p.y) * p.z);
 }
 
-// Smooth trilinear value noise (eliminates blocky floor() checkerboard artifacts)
 float value_noise3(vec3 x) {
     vec3 i = floor(x);
     vec3 f = fract(x);
@@ -43,9 +47,18 @@ float triplanar_detail(vec3 wpos, vec3 wnorm) {
     return nx * blend.x + ny * blend.y + nz * blend.z;
 }
 
+// 3D fracture ridge pattern for progressive 1st-hit and 2nd-hit crack visualization
+float crack_pattern_3d(vec3 wpos) {
+    float n1 = abs(value_noise3(wpos * 0.85) - 0.5) * 2.0;
+    float n2 = abs(value_noise3(wpos * 2.10 + vec3(7.3, 2.9, 5.1)) - 0.5) * 2.0;
+    return min(n1, n2);
+}
+
 void vertex() {
     v_world_pos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
     v_world_normal = normalize((MODEL_NORMAL_MATRIX * NORMAL));
+    v_damage_ratio = COLOR.r;
+    v_is_hard_rock = COLOR.g;
 }
 
 void fragment() {
@@ -56,8 +69,30 @@ void fragment() {
     vec3 surface_tint = mix(cliff_rock_color, top_grass_color, smoothstep(0.55, 0.85, up_factor));
     vec3 base_color = mix(surface_tint, deep_cave_color, cave_depth_factor);
 
+    // Blend in dark basalt/obsidian tint for 3-hit Hard Rock formations
+    base_color = mix(base_color, hard_rock_color, clamp(v_is_hard_rock, 0.0, 1.0));
+
     float grain = (triplanar_detail(v_world_pos, n) - 0.5) * 0.12;
-    ALBEDO = clamp(base_color + vec3(grain), vec3(0.0), vec3(1.0));
-    ROUGHNESS = mix(0.88, 0.72, cave_depth_factor);
-    METALLIC = 0.04;
+    vec3 albedo = clamp(base_color + vec3(grain), vec3(0.0), vec3(1.0));
+    float rough = mix(mix(0.88, 0.72, cave_depth_factor), 0.42, clamp(v_is_hard_rock, 0.0, 1.0));
+    float metal = mix(0.04, 0.28, clamp(v_is_hard_rock, 0.0, 1.0));
+    vec3 emission = vec3(0.0);
+
+    // Progressive crack rendering when damaged (Hit 1: ~0.33, Hit 2: ~0.67)
+    if (v_damage_ratio > 0.02) {
+        float ridge = crack_pattern_3d(v_world_pos);
+        float crack_width = mix(0.08, 0.24, v_damage_ratio);
+        float crack_mask = 1.0 - smoothstep(0.0, crack_width, ridge);
+
+        // Darken fractured crevices and emit glowing stress lines that intensify from Hit 1 -> Hit 2
+        albedo = mix(albedo * (1.0 - 0.35 * v_damage_ratio), vec3(0.05, 0.03, 0.02), crack_mask);
+        vec3 glow_col = mix(crack_glow_stage1, crack_glow_stage2, clamp((v_damage_ratio - 0.30) * 2.5, 0.0, 1.0));
+        emission = glow_col * crack_mask * (1.5 * v_damage_ratio);
+        rough = mix(rough, 0.95, crack_mask);
+    }
+
+    ALBEDO = albedo;
+    ROUGHNESS = rough;
+    METALLIC = metal;
+    EMISSION = emission;
 }

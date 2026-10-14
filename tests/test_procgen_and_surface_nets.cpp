@@ -274,8 +274,11 @@ void test_procgen_caves_toggle() {
                     wx * 0.03f, wy * 0.03f, wz * 0.03f, gen_off.seed + 101U);
                 const float d_surf = (wy - h_2d) + overhang;
 
+                // The Hard Rock boulder is part of the terrain regardless of the caves
+                // toggle, so the disabled path is min(pure surface term, boulder SDF).
+                const float expected_d_off = std::min(d_surf, gen_off.hard_boulder_sdf(wx, wy, wz));
                 const float d_off = gen_off.evaluate_composite_density(wx, wy, wz);
-                REQUIRE(std::abs(d_off - d_surf) < 1e-3f);
+                REQUIRE(std::abs(d_off - expected_d_off) < 1e-3f);
 
                 const float d_on = gen_on.evaluate_composite_density(wx, wy, wz);
                 if (std::abs(d_on - d_off) > 1e-3f) {
@@ -349,6 +352,64 @@ void test_collision_subsample_stride() {
                 full.indices.size() / 3, full.collision_faces.size(), coarse.collision_faces.size());
 }
 
+// ============================================================================
+// 5. World-Space Surface Height Query (sample_top_surface_y)
+// ============================================================================
+void test_surface_height_query() {
+    ++g_tests_run;
+
+    MemoryLedger ledger;
+    ChunkStore store(ledger, /*world_height_chunks=*/8);
+    WorkerDensityGrid34 grid34(ledger);
+    CaveNoiseGenerator gen;
+    gen.surface_amplitude = 0.0f; // deterministic generator fallback height
+
+    // A flat world plane; gradient 1 keeps encode/decode exact.
+    auto plane_at = [](float level) {
+        return [level](float /*wx*/, float wy, float /*wz*/) -> float { return wy - level; };
+    };
+
+    // Resident columns (cx, cz in -1..1, all layers below the ceiling) so the
+    // vertical ray never crosses an unloaded gap.
+    for (int32_t cz = -1; cz <= 1; ++cz) {
+        for (int32_t cx = -1; cx <= 1; ++cx) {
+            for (int32_t cy = 0; cy <= 2; ++cy) {
+                gen.generate_chunk_from_density_fn(
+                    store, ChunkKey::from_coords(cx, cy, cz), grid34, plane_at(68.0f));
+            }
+        }
+    }
+
+    // 1. Resident TSDF: the query must land on the generated plane across the column.
+    for (const float wx : {2.0f, 16.0f, 30.0f}) {
+        for (const float wz : {2.0f, 16.0f, 30.0f}) {
+            const float y = voxel::sample_top_surface_y(store, gen, wx, wz);
+            REQUIRE(std::abs(y - 68.0f) <= 0.1f);
+        }
+    }
+
+    // 2. Store-first: re-generate the same chunks at a lower plane. The default
+    //    generator still models y ~ 68, so a y ~ 40 answer proves the resident
+    //    (edited) path wins over the analytic fallback.
+    for (int32_t cz = -1; cz <= 1; ++cz) {
+        for (int32_t cx = -1; cx <= 1; ++cx) {
+            for (int32_t cy = 0; cy <= 2; ++cy) {
+                gen.generate_chunk_from_density_fn(
+                    store, ChunkKey::from_coords(cx, cy, cz), grid34, plane_at(40.0f));
+            }
+        }
+    }
+    REQUIRE(std::abs(voxel::sample_top_surface_y(store, gen, 16.0f, 16.0f) - 40.0f) <= 0.1f);
+
+    // 3. Generator fallback: a column that was never streamed still answers within
+    //    the +-3 m overhang envelope of the 2D generator height.
+    const float far_y = voxel::sample_top_surface_y(store, gen, 5000.0f, 5000.0f);
+    REQUIRE(std::abs(far_y - 68.0f) <= 3.5f);
+
+    std::printf("[PASS] test_surface_height_query (resident plane 68 -> edited plane 40 -> fallback %.2f)\n",
+                far_y);
+}
+
 } // namespace
 
 int main() {
@@ -357,6 +418,7 @@ int main() {
     test_2x2x2_watertight_chunk_seams();
     test_procgen_caves_toggle();
     test_collision_subsample_stride();
+    test_surface_height_query();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",
                 g_tests_run, g_assertions_checked);
     return EXIT_SUCCESS;

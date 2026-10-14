@@ -1,4 +1,4 @@
-#include "edit_and_worker_pool.hpp"
+#include "procgen_and_surface_nets.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -21,14 +21,17 @@ using voxel::DualDirtyScheduler;
 using voxel::EditOperation;
 using voxel::EditTransaction;
 using voxel::LocalCoord;
+using voxel::MaterialHardness;
 using voxel::MemoryLedger;
 using voxel::MemoryPoolId;
 using voxel::NeighborhoodVersionStamp;
 using voxel::SphereCsgTerm;
+using voxel::SurfaceNetsMesher;
 using voxel::TsdfFormat;
 using voxel::Vec3f;
 using voxel::WorkerScratchWindow36;
 using voxel::execute_next_edit_phase;
+using voxel::gather_scratch_window_36;
 using voxel:: map_world_sample;
 
 int g_tests_run = 0;
@@ -212,7 +215,109 @@ void test_anti_crumb_kernel() {
 }
 
 // ============================================================================
-// 4. Multi-Threaded Worker Pool, Coalesced Blasts & Ordered Teardown (Section 5.3)
+// 4. Persistent Damage Thresholds: 3-Hit Hard Rock Boulder (Bananza-Style)
+// ============================================================================
+void test_persistent_damage_3_hit_hard_rock() {
+    ++g_tests_run;
+
+    MemoryLedger ledger;
+    ChunkStore store(ledger, /*world_height_chunks=*/8);
+    DualDirtyScheduler scheduler;
+    WorkerScratchWindow36 scratch(ledger);
+
+    // Create a chunk containing a Hard Rock (kMaterialHardRock = 2) boulder of radius 5.0
+    // centered at (16, 16, 16).
+    const ChunkKey ck = ChunkKey::from_coords(0, 0, 0);
+    ChunkSlot* slot = store.get_or_create_slot(ck);
+    {
+        std::unique_lock<std::shared_mutex> lock(slot->mutex);
+        slot->reset_to_uniform(
+            ChunkStorageForm::Empty, MaterialHardness::kMaterialHardRock, store.tsdf_pool(), store.material_pool());
+        slot->state = ChunkLifecycleState::Resident;
+        slot->version.store(1, std::memory_order_release);
+
+        for (int32_t z = 0; z < 32; ++z) {
+            for (int32_t y = 0; y < 32; ++y) {
+                for (int32_t x = 0; x < 32; ++x) {
+                    const float dx = static_cast<float>(x) - 16.0f;
+                    const float dy = static_cast<float>(y) - 16.0f;
+                    const float dz = static_cast<float>(z) - 16.0f;
+                    const float sdf = std::sqrt(dx * dx + dy * dy + dz * dz) - 5.0f;
+                    const int16_t q = TsdfFormat::encode(std::clamp(sdf, -2.0f, +2.0f), 2.0f);
+                    REQUIRE(slot->set_tsdf(LocalCoord{x, y, z}, q, store.tsdf_pool()));
+                }
+            }
+        }
+    }
+
+    const LocalCoord boulder_core{16, 16, 16};
+    REQUIRE(slot->get_tsdf(boulder_core) < 0);
+    REQUIRE(slot->get_damage(boulder_core) == 0U);
+    REQUIRE(!slot->has_damage_array()); // 0 bytes allocated before damage
+
+    // --- EXPLOSION 1 (radius = 9.5 covers the 5.0 boulder + both 2.0 delta bands) ---
+    {
+        EditTransaction tx1 = EditTransaction::create_from_spheres(
+            {SphereCsgTerm{Vec3f{16.0f, 16.0f, 16.0f}, /*radius=*/9.5f}}, 2.0f, 8);
+        while (!tx1.is_finished()) {
+            (void)execute_next_edit_phase(store, scheduler, tx1);
+        }
+    }
+    // After Hit 1: Hard Rock must STILL be solid (TSDF < 0), damage == 85, and mesh shows Stage 1 cracks!
+    REQUIRE(slot->has_damage_array());
+    REQUIRE(slot->get_damage(boulder_core) == 85U);
+    REQUIRE(slot->get_tsdf(boulder_core) < 0);
+    {
+        const auto stamp = gather_scratch_window_36(store, ck, scratch);
+        const auto mesh1 = SurfaceNetsMesher::mesh_chunk_from_scratch_36(ck, scratch, 1, stamp.captured_terrain_revision);
+        REQUIRE(!mesh1.vertices.empty());
+        REQUIRE(mesh1.colors.size() == mesh1.vertices.size());
+        // Verify vertices carry damage_ratio = 85 / 255 (~0.333) and is_hard_rock = 1.0
+        REQUIRE(std::abs(mesh1.colors.front().x - (85.0f / 255.0f)) < 1e-3f);
+        REQUIRE(std::abs(mesh1.colors.front().y - 1.0f) < 1e-3f);
+    }
+
+    // --- EXPLOSION 2 ---
+    {
+        EditTransaction tx2 = EditTransaction::create_from_spheres(
+            {SphereCsgTerm{Vec3f{16.0f, 16.0f, 16.0f}, /*radius=*/9.5f}}, 2.0f, 8);
+        while (!tx2.is_finished()) {
+            (void)execute_next_edit_phase(store, scheduler, tx2);
+        }
+    }
+    // After Hit 2: Hard Rock must STILL be solid (TSDF < 0), damage == 170, and mesh shows Stage 2 cracks!
+    REQUIRE(slot->get_damage(boulder_core) == 170U);
+    REQUIRE(slot->get_tsdf(boulder_core) < 0);
+    {
+        const auto stamp = gather_scratch_window_36(store, ck, scratch);
+        const auto mesh2 = SurfaceNetsMesher::mesh_chunk_from_scratch_36(ck, scratch, 1, stamp.captured_terrain_revision);
+        REQUIRE(!mesh2.vertices.empty());
+        REQUIRE(std::abs(mesh2.colors.front().x - (170.0f / 255.0f)) < 1e-3f);
+    }
+
+    // --- EXPLOSION 3 ---
+    {
+        EditTransaction tx3 = EditTransaction::create_from_spheres(
+            {SphereCsgTerm{Vec3f{16.0f, 16.0f, 16.0f}, /*radius=*/9.5f}}, 2.0f, 8);
+        while (!tx3.is_finished()) {
+            (void)execute_next_edit_phase(store, scheduler, tx3);
+        }
+    }
+    // After Hit 3: Cumulative damage reaches 255 >= 255 -> Hard Rock boulder SHATTERS to air!
+    REQUIRE(slot->get_tsdf(boulder_core) == TsdfFormat::kClampedAir);
+    REQUIRE(slot->form == ChunkStorageForm::Empty); // Auto-demoted to 0-byte Empty chunk!
+    REQUIRE(!slot->has_damage_array());             // Damage slab automatically returned to pool!
+    {
+        const auto stamp = gather_scratch_window_36(store, ck, scratch);
+        const auto mesh3 = SurfaceNetsMesher::mesh_chunk_from_scratch_36(ck, scratch, 1, stamp.captured_terrain_revision);
+        REQUIRE(mesh3.vertices.empty()); // Boulder completely destroyed (0 triangles left)
+    }
+
+    std::printf("[PASS] test_persistent_damage_3_hit_hard_rock (Hit 1: dmg=85 solid; Hit 2: dmg=170 solid; Hit 3: shattered!)\n");
+}
+
+// ============================================================================
+// 5. Multi-Threaded Worker Pool, Coalesced Blasts & Ordered Teardown (Section 5.3)
 // ============================================================================
 void test_worker_pool_concurrent_execution_and_teardown() {
     ++g_tests_run;
@@ -426,10 +531,11 @@ void test_fill_and_carve_do_not_coalesce() {
 } // namespace
 
 int main() {
-    std::printf("=== Running M0/M2 Step 4 Unit Test Suite: Phased R+delta CSG, Anti-Crumb & Worker Pool ===\n");
+    std::printf("=== Running M0/M2 Step 4 Unit Test Suite: Phased R+delta CSG, Hard-Rock Damage & Worker Pool ===\n");
     test_large_explosion_32_lock_cap_and_no_tearing();
     test_r_plus_delta_crater_wall_continuity();
     test_anti_crumb_kernel();
+    test_persistent_damage_3_hit_hard_rock();
     test_worker_pool_concurrent_execution_and_teardown();
     test_fill_add_terrain_union_semantics();
     test_fill_and_carve_do_not_coalesce();
