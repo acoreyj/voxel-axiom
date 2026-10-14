@@ -334,6 +334,7 @@ public:
 #endif
         groups_.clear();
         chunk_revisions_.clear();
+        pending_chunk_revisions_.clear();
         waiting_chunks_.clear();
         newly_committed_chunks_.clear();
         initialized_ = false;
@@ -365,6 +366,10 @@ public:
                                    uint64_t captured_terrain_revision,
                                    const std::vector<Vec3f>& /*faces*/) {
         chunk_revisions_[key] = captured_terrain_revision;
+        auto it_p = pending_chunk_revisions_.find(key);
+        if (it_p != pending_chunk_revisions_.end() && captured_terrain_revision >= it_p->second) {
+            pending_chunk_revisions_.erase(it_p);
+        }
         waiting_chunks_.insert(key);
 
         const Aabb3f chunk_box = chunk_aabb(key);
@@ -390,6 +395,7 @@ public:
 
     void note_chunk_unloaded(ChunkKey key) {
         chunk_revisions_.erase(key);
+        pending_chunk_revisions_.erase(key);
         waiting_chunks_.erase(key);
         const NavigationGroupKey owner_gk = NavigationGroupKey::from_chunk_key(key);
         auto it = groups_.find(owner_gk);
@@ -402,6 +408,9 @@ public:
         for (const NavigationGroupKey gk : tx.affected_nav_groups) {
             NavigationGroupState& g = get_or_create_group(gk);
             g.desired_terrain_revision = std::max(g.desired_terrain_revision, tx.terrain_revision);
+        }
+        for (const ChunkKey ck : tx.dirtied_chunks) {
+            pending_chunk_revisions_[ck] = std::max(pending_chunk_revisions_[ck], tx.terrain_revision);
         }
     }
 
@@ -417,10 +426,13 @@ public:
             }
 
             bool all_chunks_ready = true;
-            for (const auto& [ck, rev] : chunk_revisions_) {
-                if (NavigationGroupKey::from_chunk_key(ck) == gk && rev < g.desired_terrain_revision) {
-                    all_chunks_ready = false;
-                    break;
+            for (const auto& [ck, req_rev] : pending_chunk_revisions_) {
+                if (NavigationGroupKey::from_chunk_key(ck) == gk) {
+                    auto it = chunk_revisions_.find(ck);
+                    if (it == chunk_revisions_.end() || it->second < req_rev) {
+                        all_chunks_ready = false;
+                        break;
+                    }
                 }
             }
             if (!all_chunks_ready) {
@@ -627,6 +639,7 @@ private:
 
     std::unordered_map<NavigationGroupKey, NavigationGroupState, NavigationGroupKeyHash> groups_;
     std::unordered_map<ChunkKey, uint64_t, ChunkKeyHash> chunk_revisions_;
+    std::unordered_map<ChunkKey, uint64_t, ChunkKeyHash> pending_chunk_revisions_;
     std::unordered_set<ChunkKey, ChunkKeyHash> waiting_chunks_;
     std::vector<ChunkKey> newly_committed_chunks_;
 };

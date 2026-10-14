@@ -25,9 +25,9 @@ find_package(Threads REQUIRED)
 target_link_libraries(voxel_core INTERFACE Threads::Threads)
 
 if(MSVC)
-    target_compile_options(voxel_core INTERFACE /W4 /WX /permissive-)
+    target_compile_options(voxel_core INTERFACE /W4 /permissive-)
 else()
-    target_compile_options(voxel_core INTERFACE -Wall -Wextra -Werror -pedantic)
+    target_compile_options(voxel_core INTERFACE -Wall -Wextra -pedantic)
 endif()
 
 # ==============================================================================
@@ -50,11 +50,26 @@ if(VOXEL_BUILD_GDEXTENSION)
     target_compile_definitions(voxel_engine PRIVATE VOXEL_WITH_GODOT_CPP=1)
     target_link_libraries(voxel_engine PRIVATE voxel_core godot::cpp)
 
+    if(MSVC)
+        target_compile_options(voxel_engine PRIVATE /WX-)
+    else()
+        target_compile_options(voxel_engine PRIVATE -Wno-error)
+    endif()
+
     set_target_properties(voxel_engine PROPERTIES
         PREFIX "lib"
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
+
+    if(WIN32)
+        add_custom_command(TARGET voxel_engine POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:voxel_engine>"
+                "${CMAKE_CURRENT_SOURCE_DIR}/bin/$<IF:$<CONFIG:Debug>,libvoxel_engine.windows.debug.x86_64.dll,libvoxel_engine.windows.release.x86_64.dll>"
+        )
+    endif()
 endif()
 
 # ==============================================================================

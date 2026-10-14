@@ -17,6 +17,10 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
+
 namespace voxel {
 
 // ============================================================================
@@ -170,7 +174,11 @@ public:
             }
         }
         if (!raw) {
+#if defined(_WIN32)
+            raw = _aligned_malloc(BlockBytes, kPageAlignment);
+#else
             raw = std::aligned_alloc(kPageAlignment, BlockBytes);
+#endif
             if (!raw) {
                 ledger_.release(BlockBytes, MemoryPoolId::ChunkSlab);
                 return nullptr;
@@ -201,7 +209,11 @@ public:
             to_free.swap(free_list_);
         }
         for (void* p : to_free) {
+#if defined(_WIN32)
+            _aligned_free(p);
+#else
             std::free(p);
+#endif
         }
     }
 

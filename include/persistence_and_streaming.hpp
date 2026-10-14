@@ -503,7 +503,11 @@ private:
         std::array<std::optional<CompressedChunkBlob>, RegionKey::kChunksPerRegion>& out_blobs) const {
 
         const std::filesystem::path path = region_file_path(rk);
+#if defined(_WIN32)
+        FILE* fp = _wfopen(path.c_str(), L"rb");
+#else
         FILE* fp = std::fopen(path.c_str(), "rb");
+#endif
         if (!fp) {
             return false;
         }
@@ -620,7 +624,11 @@ private:
         const std::filesystem::path tmp_path = region_tmp_path(rk);
         const std::filesystem::path live_path = region_file_path(rk);
 
+#if defined(_WIN32)
+        FILE* fp = _wfopen(tmp_path.c_str(), L"wb");
+#else
         FILE* fp = std::fopen(tmp_path.c_str(), "wb");
+#endif
         if (!fp) {
             return false;
         }

@@ -97,7 +97,11 @@ void VoxelTerrain3D::_enter_tree() {
     core_engine = std::make_unique<CoreEngineBundle>(
         budget_bytes,
         static_cast<int32_t>(world_height_chunks),
+#if defined(VOXEL_WITH_GODOT_CPP)
+        std::string(save_directory_path.utf8().get_data()));
+#else
         std::string(save_directory_path.c_str()));
+#endif
     core_engine->worker_pool->start();
 
     voxel::ServerRid scenario_rid{2};

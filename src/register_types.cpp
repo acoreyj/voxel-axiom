@@ -36,7 +36,7 @@ GDExtensionBool GDE_EXPORT voxel_engine_init(
 #if defined(VOXEL_WITH_GODOT_CPP)
     godot::GDExtensionBinding::InitObject init_obj(p_get_proc_address, p_library, r_initialization);
     init_obj.register_initializer(initialize_voxel_module);
-    init_obj.register_uninitializer(uninitialize_voxel_module);
+    init_obj.register_terminator(uninitialize_voxel_module);
     init_obj.set_minimum_library_initialization_level(MODULE_INITIALIZATION_LEVEL_SCENE);
     return init_obj.init();
 #else

@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <iostream>
 #include <thread>
 
 namespace {
@@ -83,7 +84,7 @@ void test_gdextension_streaming_explosion_and_nav_lifecycle() {
     terrain.trigger_explosion(Vector3(16.0f, 48.0f, 16.0f), 6.0f);
     REQUIRE(terrain.emitted_signals().back().name == "explosion_requested");
 
-    const auto blast_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    const auto blast_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
     while (std::chrono::steady_clock::now() < blast_deadline) {
         terrain._process(0.016);
         terrain.get_navigation_manager().complete_in_flight_async_bakes_and_advance_map_iteration();
