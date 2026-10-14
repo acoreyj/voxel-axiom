@@ -1,6 +1,7 @@
 #pragma once
 
 #include "procgen_and_surface_nets.hpp"
+#include "stage_timings.hpp"
 
 #include <algorithm>
 #include <array>
@@ -45,7 +46,6 @@ struct RegionKey {
         };
     }
 
-    /// Returns the local chunk index in [0, 511] within the 8x8x8 region TOC.
     [[nodiscard]] static constexpr uint16_t local_toc_index(ChunkKey ck) noexcept {
         const uint32_t lx = static_cast<uint32_t>(ChunkKey::floor_mod(ck.x(), kRegionDim));
         const uint32_t ly = static_cast<uint32_t>(ChunkKey::floor_mod(ck.y(), kRegionDim));
@@ -68,7 +68,6 @@ struct RegionKeyHash {
 // 2. Byte-Plane Split + Fast Byte-Plane RLE/LZ Codec (Section 3.6)
 // ============================================================================
 struct BytePlaneCodec {
-    /// Splits 32,768 int16_t samples into a 32,768-byte low plane and a 32,768-byte high plane.
     static void split_int16_planes(const int16_t* src,
                                    uint8_t* out_low,
                                    uint8_t* out_high,
@@ -80,7 +79,6 @@ struct BytePlaneCodec {
         }
     }
 
-    /// Reconstructs 32,768 int16_t samples from their low-byte and high-byte planes.
     static void merge_int16_planes(const uint8_t* low,
                                    const uint8_t* high,
                                    int16_t* out_dst,
@@ -92,9 +90,6 @@ struct BytePlaneCodec {
         }
     }
 
-    /// Fast PackBits / LZ-RLE byte-plane compressor:
-    ///   - Control byte b in [0..127]: followed by (b + 1) literal bytes.
-    ///   - Control byte b in [128..255]: repeat the next single byte (b - 128 + 3) times (up to 130).
     [[nodiscard]] static std::vector<uint8_t> compress_plane(const uint8_t* src, std::size_t len) {
         std::vector<uint8_t> out;
         out.reserve(len / 2);
@@ -162,9 +157,9 @@ struct BytePlaneCodec {
 // ============================================================================
 enum class SerializedChunkForm : uint8_t {
     Untouched = 0,
-    Empty     = 1, // 0-byte payload (all kClampedAir)
-    Solid     = 2, // 0-byte payload (all kClampedSolid)
-    Dense     = 3  // Byte-plane split compressed payload
+    Empty     = 1,
+    Solid     = 2,
+    Dense     = 3
 };
 
 struct CompressedChunkBlob {
@@ -221,7 +216,6 @@ public:
     RegionSaveManager(const RegionSaveManager&) = delete;
     RegionSaveManager& operator=(const RegionSaveManager&) = delete;
 
-    /// Stage 1: `PersistCompress` (In-Memory Worker Job, ~50 us per chunk, Section 3.2 & 3.6).
     [[nodiscard]] bool persist_compress_chunk(ChunkStore& store, ChunkKey key) {
         ChunkSlot* slot = store.find_slot(key);
         if (!slot) {
@@ -304,7 +298,6 @@ public:
             }
         }
 
-        // Version-bracketed check (Section 3.2 Read Rule 5, Section 3.6):
         {
             std::shared_lock<std::shared_mutex> verify_lock(slot->mutex);
             const uint64_t version_after = slot->version.load(std::memory_order_acquire);
@@ -675,28 +668,30 @@ private:
 };
 
 // ============================================================================
-// 5. Continuous Chunk Streaming & Residency Manager (HLD v4.0 Section 3.3)
+// 5. Continuous Asynchronous Chunk Streaming Manager (HLD v4.0 Section 3.3)
 // ============================================================================
 class StreamingManager {
 public:
     StreamingManager(ChunkStore& store,
                      DualDirtyScheduler& dirty_scheduler,
                      RegionSaveManager& save_manager,
-                     CaveNoiseGenerator& procgen)
+                     CoreWorkerPool& worker_pool)
         : store_(store),
           dirty_scheduler_(dirty_scheduler),
           save_manager_(save_manager),
-          procgen_(procgen) {}
+          worker_pool_(worker_pool) {}
 
-    /// Updates the streaming focus position and velocity bias, loads/generates newly
-    /// desired chunks within Chebyshev radius `active_radius` (+ 1-chunk neighbor closure
-    /// for 36^3 mesh windows), schedules active chunks into `dirty_stream_chunks`, and
-    /// evicts out-of-range chunks (emitting `ChunkUnloaded` records).
+    /// Optional per-stage timing sink. Pass nullptr to disable (default).
+    void set_stage_timings(StageTimings* timings) noexcept { stage_timings_ = timings; }
+
+    /// Main-Thread focus update (< 0.05 ms cost):
+    /// Computes active Chebyshev neighborhood and 26-neighbor closure, requests background
+    /// generation on worker threads for missing chunks, and evicts distant chunks.
     std::vector<ChunkKey> update_stream_focus(Vec3f position,
                                               Vec3f velocity,
                                               int32_t active_radius_chunks,
-                                              int32_t prefetch_radius_chunks,
-                                              WorkerDensityGrid34& grid34) {
+                                              int32_t prefetch_radius_chunks) {
+        ScopedTimer timer(stage_timings_, Stage::StreamFocus);
         const ChunkKey focus_ck = ChunkKey::from_world_sample(
             static_cast<int32_t>(std::floor(position.x)),
             static_cast<int32_t>(std::floor(position.y)),
@@ -744,7 +739,6 @@ public:
                     } else if (vel_dot > 0.0f &&
                                store_.ledger().total_reserved_bytes() * 4ULL <
                                    store_.ledger().budget_bytes() * 3ULL) {
-                        // Velocity-biased prefetch admission when below 75% memory budget.
                         desired_residency_set.insert(ck);
                         candidates.push_back(CandidateChunk{
                             ck,
@@ -756,13 +750,12 @@ public:
             }
         }
 
-        // Sort nearest / velocity-aligned first.
         std::sort(candidates.begin(), candidates.end(),
                   [](const CandidateChunk& a, const CandidateChunk& b) {
                       return a.priority_score < b.priority_score;
                   });
 
-        // Step 1: Evict resident chunks that fell outside desired_residency_set (compressing dirty ones first).
+        // 1. Evict chunks that fell outside desired_residency_set.
         std::vector<ChunkKey> unloaded;
         std::vector<ChunkKey> to_evict;
         for (const ChunkKey rk : tracked_resident_) {
@@ -777,27 +770,24 @@ public:
             if (store_.evict_slot(ek)) {
                 tracked_resident_.erase(ek);
                 meshed_active_.erase(ek);
+                requested_chunks_.erase(ek);
                 unloaded.push_back(ek);
             }
         }
 
-        // Step 2: Ensure all closure chunks are loaded/generated before scheduling active meshes
-        // so every active chunk's 36^3 scratch gather sees its complete 26-neighbor shell!
+        // 2. Dispatch background generation / loading on worker threads without blocking main thread.
         for (const CandidateChunk& cand : candidates) {
-            if (tracked_resident_.find(cand.key) == tracked_resident_.end()) {
-                if (save_manager_.load_or_generate_chunk(store_, cand.key, procgen_, grid34)) {
-                    tracked_resident_.insert(cand.key);
+            ChunkSlot* slot = store_.find_slot(cand.key);
+            const bool is_resident = (slot != nullptr && slot->state == ChunkLifecycleState::Resident);
+            if (is_resident) {
+                tracked_resident_.insert(cand.key);
+                if (cand.in_active_set && meshed_active_.find(cand.key) == meshed_active_.end()) {
+                    meshed_active_.insert(cand.key);
+                    dirty_scheduler_.mark_stream_dirty(cand.key);
                 }
-            }
-        }
-
-        // Step 3: Enqueue newly active chunks into `dirty_stream_chunks`.
-        for (const CandidateChunk& cand : candidates) {
-            if (cand.in_active_set &&
-                tracked_resident_.find(cand.key) != tracked_resident_.end() &&
-                meshed_active_.find(cand.key) == meshed_active_.end()) {
-                meshed_active_.insert(cand.key);
-                dirty_scheduler_.mark_stream_dirty(cand.key);
+            } else if (requested_chunks_.find(cand.key) == requested_chunks_.end()) {
+                requested_chunks_.insert(cand.key);
+                worker_pool_.request_background_generate(cand.key, cand.in_active_set);
             }
         }
 
@@ -812,9 +802,11 @@ private:
     ChunkStore& store_;
     DualDirtyScheduler& dirty_scheduler_;
     RegionSaveManager& save_manager_;
-    CaveNoiseGenerator& procgen_;
+    CoreWorkerPool& worker_pool_;
+    StageTimings* stage_timings_ = nullptr;
     std::unordered_set<ChunkKey, ChunkKeyHash> tracked_resident_;
     std::unordered_set<ChunkKey, ChunkKeyHash> meshed_active_;
+    std::unordered_set<ChunkKey, ChunkKeyHash> requested_chunks_;
 };
 
 } // namespace voxel

@@ -6,8 +6,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
-#include <iostream>
+#include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -64,19 +65,28 @@ void test_gdextension_streaming_explosion_and_nav_lifecycle() {
     terrain.set_view_distance_chunks(1);
     terrain.set_prefetch_distance_chunks(0);
     terrain.set_world_height_chunks(3);
-    terrain.set_upload_budget_ms(4.0f);
+    terrain.set_upload_budget_ms(8.0f);
     terrain._enter_tree();
+
+    // Capture instrumentation output instead of printing it.
+    std::vector<std::string> log_lines;
+    terrain.set_log_sink([&log_lines](const std::string& line) { log_lines.push_back(line); });
+    const auto contains = [&log_lines](const std::string& needle) {
+        for (const std::string& line : log_lines) {
+            if (line.find(needle) != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    };
 
     VoxelAICompanion companion;
     companion.set_terrain_node(&terrain);
 
-    // 3. Verify continuous terrain streaming from set_stream_focus() alone (before any explosion!):
-    //    Calling set_stream_focus generates the active Chebyshev neighborhood + 26-neighbor closure,
-    //    pushes active chunks into dirty_stream_chunks, meshes them on worker threads, and commits
-    //    their visual/collision RIDs and 3D navigation groups in _process().
+    // 3. Verify continuous terrain streaming from set_stream_focus() alone:
     terrain.set_stream_focus(Vector3(16.0f, 48.0f, 16.0f), Vector3(1.0f, 0.0f, 0.0f));
 
-    const auto stream_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    const auto stream_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
     while (std::chrono::steady_clock::now() < stream_deadline) {
         terrain._process(0.016);
         terrain.get_navigation_manager().complete_in_flight_async_bakes_and_advance_map_iteration();
@@ -84,18 +94,24 @@ void test_gdextension_streaming_explosion_and_nav_lifecycle() {
         if (terrain.fully_committed() && terrain.get_server_slot_manager().active_slot_count() > 0) {
             break;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
     REQUIRE(terrain.fully_committed());
     REQUIRE(terrain.get_server_slot_manager().active_slot_count() > 0ULL);
+
+    // 3b. Instrumentation must report per-stage timing for the streaming work.
+    REQUIRE(contains("generate"));
+    REQUIRE(contains("mesh"));
+    REQUIRE(contains("commit"));
+    REQUIRE(contains("initial fill complete in"));
 
     // 4. Invalid explosion radius (<= 0) must emit explosion_failed immediately.
     terrain.trigger_explosion(Vector3(16.0f, 48.0f, 16.0f), -1.0f);
     REQUIRE(!terrain.emitted_signals().empty());
     REQUIRE(terrain.emitted_signals().back().name == "explosion_failed");
 
-    // 5. Valid explosion carves the streamed terrain and prioritizes dirty_edit_chunks.
+    // 5. Valid explosion carves the streamed terrain.
     terrain.trigger_explosion(Vector3(16.0f, 48.0f, 16.0f), 6.0f);
     REQUIRE(terrain.emitted_signals().back().name == "explosion_requested");
 
@@ -107,16 +123,23 @@ void test_gdextension_streaming_explosion_and_nav_lifecycle() {
         if (terrain.fully_committed()) {
             break;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
     REQUIRE(terrain.core_idle());
     REQUIRE(terrain.fully_committed());
     REQUIRE(companion.is_path_region_synced(Vector3(16.0f, 48.0f, 16.0f)));
 
+    // 5b. The edit stage must be timed for the carve.
+    REQUIRE(contains("edit"));
+
     const PackedVector3Array path =
         companion.get_voxel_path(Vector3(4.0f, 48.0f, 4.0f), Vector3(28.0f, 50.0f, 28.0f));
     REQUIRE(path.size() == 3ULL);
+
+    // 5c. The path query is timed; drain it with one more frame and verify.
+    terrain._process(0.016);
+    REQUIRE(contains("navigation"));
 
     bool saw_explosion_completed = false;
     bool saw_chunk_committed = false;

@@ -14,6 +14,7 @@ A high-performance, real-time destructible voxel engine with 3D cave generation 
 - **3D Cave Navigation**: Dynamic integration with Godot's `NavigationServer3D`, asynchronous navigation mesh baking, and synchronized path queries for AI companions.
 - **Crash-Safe 3D Region Persistence**: $8 \times 8 \times 8$ chunk region files (up to 512 chunks per region) with LZ4 byte-plane compression and background disk streaming.
 - **Triplanar Voxel Shading**: Custom triplanar shader blending rock, soil, grass, and cave interior textures with normal mapping and roughness.
+- **Built-in Performance Instrumentation**: Lock-free per-operation timing (`generate`, `mesh`, `commit`, `stream_focus`, `edit`, `navigation`) accumulated per frame and logged to the Godot **Output** panel. Toggle with the `instrumentation_enabled` property.
 
 ---
 
@@ -30,16 +31,25 @@ A high-performance, real-time destructible voxel engine with 3D cave generation 
 
 ## Building the C++ GDExtension
 
-Which **slot** Godot loads (`debug` or `release`) is chosen by the `godot-cpp`
-target you link against, *not* by the CMake build type. One build directory
-therefore targets one slot:
+Two independent choices decide what Godot runs:
 
-| Use case | `GODOTCPP_TARGET` | Artifact slot |
+- **Artifact filename** (`…debug…` vs `…release…`) follows the CMake build
+  configuration: `--config Release` writes the `release` slot file, `--config
+  Debug` the `debug` slot file.
+- **Which slot Godot loads** is decided at runtime by the `debug`/`release`
+  feature tag, resolved through `voxel_engine.gdextension`.
+
+`GODOTCPP_TARGET` is separate again: it selects the godot-cpp template the
+library links against. Use `template_release` for a genuine release extension;
+`template_debug` (the default) is right for editor development.
+
+| Use case | `GODOTCPP_TARGET` | CMake config |
 | --- | --- | --- |
-| Running / debugging in the Godot **editor** | `template_debug` (default) | `…debug…` |
-| Exporting a **release** game | `template_release` | `…release…` |
+| Running / debugging in the Godot **editor** | `template_debug` (default) | `Release` (optimized) or `Debug` |
+| Exporting a **release** game | `template_release` | `Release` |
 
-Build a *second* build directory if you need both.
+Different `GODOTCPP_TARGET` values still need separate configured build
+directories.
 
 ### 1. Clone `godot-cpp` (matching your Godot version)
 
@@ -111,8 +121,9 @@ The post-build step copies the library into `bin/` under the name
 | Linux | `bin/libvoxel_engine.linux.<debug\|release>.x86_64.so` |
 | macOS | `bin/libvoxel_engine.macos.<debug\|release>.dylib` |
 
-`<debug|release>` follows `GODOTCPP_TARGET`, so a `template_debug` build always
-lands in the `debug` slot even when compiled with `--config Release`.
+`<debug|release>` follows the CMake build configuration: `--config Release`
+writes the `release` file and `--config Debug` the `debug` file. The filename is
+independent of `GODOTCPP_TARGET`, which selects the godot-cpp template linked in.
 
 ---
 
@@ -127,7 +138,7 @@ The test suite can be built independently of Godot (`VOXEL_BUILD_TESTS=ON` is en
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DVOXEL_BUILD_TESTS=ON
 cmake --build build -j
 
-# Run all 8 test suites
+# Run all 9 test suites
 ctest --test-dir build --output-on-failure
 ```
 
@@ -151,7 +162,7 @@ ctest --test-dir build --output-on-failure
 
 ### Automated Bash Script (`run_all_tests.sh`)
 
-On Linux/macOS/WSL, you can run all 8 milestone test suites under both ASan and TSan in one pass:
+On Linux/macOS/WSL, you can run all 9 milestone test suites under both ASan and TSan in one pass:
 
 ```bash
 chmod +x run_all_tests.sh
@@ -181,9 +192,11 @@ Both demo scenes drive a `VoxelTerrain3D` node, whose key exported properties ar
 | `upload_budget_ms` | `float` | `2.0` | Per-frame main-thread commit budget for mesh/physics/nav uploads. |
 | `terrain_material` | `Material` | `null` | Material applied to all committed chunk surfaces. |
 | `generate_caves` | `bool` | `true` | When `false`, terrain is generated without the 3D cave term (cave-free). Only affects chunks generated after the change; already-resident chunks are untouched. |
+| `instrumentation_enabled` | `bool` | `true` | Logs per-frame operation timings to the Godot **Output** panel (see [Performance Instrumentation](#performance-instrumentation)). Set `false` to silence. |
 
 ```gdscript
 $VoxelTerrain3D.generate_caves = false
+$VoxelTerrain3D.instrumentation_enabled = false
 ```
 
 ### Controls
@@ -201,10 +214,47 @@ $VoxelTerrain3D.generate_caves = false
 
 ---
 
+## Performance Instrumentation
+
+Every engine operation is timed with a lock-free, per-stage accumulator and reported
+to the Godot **Output** panel as one summary line per frame that did work. Worker
+threads record; the main thread drains once per frame, so a single slow call stays
+visible instead of being hidden by an average.
+
+| Stage | What it measures |
+| --- | --- |
+| `generate` | Per-chunk procedural generation / disk load (worker lane 3) |
+| `mesh` | $36^3$ scratch gather + Surface Nets meshing (worker lane 2) |
+| `commit` | Main-thread mesh upload + collision + navigation submission |
+| `stream_focus` | `StreamingManager::update_stream_focus` |
+| `edit` | CSG explosion carve phase execution (worker lane 1) |
+| `navigation` | Navigation path / distance query (`VoxelAICompanion.get_voxel_path`) |
+
+Each active stage reports `xN total T ms max M ms avg A ms`:
+
+```text
+[voxel] generate x12 total 4.53ms max 0.62ms avg 0.38ms | mesh x8 total 9.10ms max 2.30ms avg 1.14ms | commit x8 total 1.20ms max 0.31ms avg 0.15ms
+[voxel] initial fill complete in 1840.2 ms
+```
+
+`initial fill complete in …` is logged once, when the first streaming fill reaches
+`fully_committed()`. Logging is on by default and toggled from GDScript:
+
+```gdscript
+$VoxelTerrain3D.instrumentation_enabled = false
+```
+
+The timing helper (`include/stage_timings.hpp`) is Godot-free, so the same
+accumulator is exercised by the unit tests; `VoxelTerrain3D.set_log_sink()` lets
+hosts redirect the output (tests capture it instead of printing).
+
+---
+
 ## Project Structure
 
 ```text
-├── bin/                          # Output directory for compiled GDExtension libraries
+├── bin/                          # Output directory for compiled GDExtension libraries (auto `.gdignore`)
+├── build/                        # CMake build tree (auto `.gdignore` keeps Godot from importing `.obj` files)
 ├── docs/                         # High-level architecture and design documents (v1 - v4)
 ├── include/                      # Pure C++20 voxel core engine (zero Godot dependencies)
 │   ├── chunk_key.hpp             # 64-bit packed chunk coordinates and spatial hashing
@@ -213,7 +263,8 @@ $VoxelTerrain3D.generate_caves = false
 │   ├── godot_wrapper_and_nav3d.hpp # 3D navigation mesh conversion and helper contracts
 │   ├── persistence_and_streaming.hpp # 8×8×8 region streaming and LZ4 compression
 │   ├── procgen_and_surface_nets.hpp  # Surface Nets mesher, FastNoise SIMD terrain/caves
-│   └── scratch_and_dirty.hpp     # 36³ thread-local scratch windows, dirty flags tracking
+│   ├── scratch_and_dirty.hpp     # 36³ thread-local scratch windows, dirty flags tracking
+│   └── stage_timings.hpp         # Lock-free per-operation timing accumulator (Godot-free)
 ├── src/                          # Godot 4 GDExtension bindings
 │   ├── register_types.cpp/.h     # GDExtension entrypoint and class registration
 │   ├── voxel_ai_companion.cpp/.h # VoxelAICompanion node (3D cave pathfinding)

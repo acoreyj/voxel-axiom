@@ -17,6 +17,7 @@ extends Node3D
 var _yaw: float = 0.0
 var _pitch: float = -0.25
 var _velocity: Vector3 = Vector3.ZERO
+var _last_stream_pos: Vector3 = Vector3(1e9, 1e9, 1e9)
 var _committed_chunk_count: int = 0
 var _fps_smoothed: float = 0.0
 var _commits_in_window: int = 0
@@ -30,8 +31,7 @@ func _ready() -> void:
 	terrain.explosion_failed.connect(_on_explosion_failed)
 	terrain.chunk_committed.connect(_on_chunk_committed)
 
-	# Prime initial streaming focus around the camera's starting world position.
-	terrain.set_stream_focus(camera.global_position, Vector3.ZERO)
+	_update_stream_focus(true)
 
 func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
@@ -70,9 +70,15 @@ func _process(delta: float) -> void:
 	_velocity = input_dir.normalized() * speed if input_dir.length_squared() > 0.0 else Vector3.ZERO
 	camera.global_position += _velocity * delta
 
-	# Update streaming center + velocity bias every frame (Section 3.3, 4.2)
-	terrain.set_stream_focus(camera.global_position, _velocity)
+	_update_stream_focus(false)
 	_update_hud(delta)
+
+func _update_stream_focus(force: bool) -> void:
+	var cur_pos := camera.global_position
+	# Only update streaming center when moving or crossed > 2.0 m threshold (Section 3.3, 4.2)
+	if force or _velocity.length_squared() > 0.01 or cur_pos.distance_squared_to(_last_stream_pos) >= 4.0:
+		_last_stream_pos = cur_pos
+		terrain.set_stream_focus(cur_pos, _velocity)
 
 func _update_hud(delta: float) -> void:
 	var fps := float(Engine.get_frames_per_second())
@@ -111,7 +117,6 @@ func _fire_raycast_explosion() -> void:
 	if not hit.is_empty():
 		terrain.trigger_explosion(hit.position, explosion_radius)
 	else:
-		# If looking into open cave air, detonate 24 m ahead of the camera
 		terrain.trigger_explosion(from - camera.global_transform.basis.z * 24.0, explosion_radius)
 
 func _query_companion_cave_path() -> void:

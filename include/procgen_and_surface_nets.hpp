@@ -169,32 +169,17 @@ struct CaveNoiseGenerator {
         return std::max(d_surf, d_cave);
     }
 
-    /// Populates the 34^3 ([-1..32]^3) uniform grid in a single pass, then computes
-    /// canonical 32^3 TSDF samples via in-memory central differences and regularized
-    /// gradient normalization max(||grad D||, 0.05) (HLD v4.0 Section 3.5.2).
-    template <typename DensityFn>
-    void generate_chunk_from_density_fn(
+    /// Pass 2 of chunk population: converts an already-filled 34^3 ([-1..32]^3) density
+    /// grid into the canonical 32^3 TSDF samples via in-memory central differences and
+    /// regularized gradient normalization max(||grad D||, 0.05), then publishes the slot
+    /// as Resident (HLD v4.0 Section 3.5.2). Shared by the generic density-fn path and the
+    /// cached composite-density path so both stay bit-identical.
+    void encode_chunk_from_density_grid(
         ChunkStore& store,
         ChunkKey chunk_key,
         WorkerDensityGrid34& grid34,
-        DensityFn&& density_fn,
         uint8_t base_material = 1) const {
 
-        const IVec3 chunk_min = chunk_key.min_world_sample();
-
-        // Pass 1: Single-pass 34^3 grid evaluation over local [-1..32]^3.
-        for (int32_t lz = -1; lz <= 32; ++lz) {
-            const float wz = static_cast<float>(chunk_min.z + lz) * voxel_scale;
-            for (int32_t ly = -1; ly <= 32; ++ly) {
-                const float wy = static_cast<float>(chunk_min.y + ly) * voxel_scale;
-                for (int32_t lx = -1; lx <= 32; ++lx) {
-                    const float wx = static_cast<float>(chunk_min.x + lx) * voxel_scale;
-                    grid34.set(lx, ly, lz, density_fn(wx, wy, wz));
-                }
-            }
-        }
-
-        // Pass 2: In-memory central differences over [0..31]^3 with epsilon_grad = 0.05 floor.
         ChunkSlot* slot = store.get_or_create_slot(chunk_key);
         std::unique_lock<std::shared_mutex> lock(slot->mutex);
         slot->reset_to_uniform(ChunkStorageForm::Solid, base_material, store.tsdf_pool(), store.material_pool());
@@ -227,14 +212,87 @@ struct CaveNoiseGenerator {
         slot->state = ChunkLifecycleState::Resident;
     }
 
+    /// Populates the 34^3 ([-1..32]^3) uniform grid in a single pass from an arbitrary
+    /// density function, then hands it to `encode_chunk_from_density_grid` for the
+    /// canonical 32^3 central-difference/TSDF pass (HLD v4.0 Section 3.5.2).
+    template <typename DensityFn>
+    void generate_chunk_from_density_fn(
+        ChunkStore& store,
+        ChunkKey chunk_key,
+        WorkerDensityGrid34& grid34,
+        DensityFn&& density_fn,
+        uint8_t base_material = 1) const {
+
+        const IVec3 chunk_min = chunk_key.min_world_sample();
+
+        // Pass 1: Single-pass 34^3 grid evaluation over local [-1..32]^3.
+        for (int32_t lz = -1; lz <= 32; ++lz) {
+            const float wz = static_cast<float>(chunk_min.z + lz) * voxel_scale;
+            for (int32_t ly = -1; ly <= 32; ++ly) {
+                const float wy = static_cast<float>(chunk_min.y + ly) * voxel_scale;
+                for (int32_t lx = -1; lx <= 32; ++lx) {
+                    const float wx = static_cast<float>(chunk_min.x + lx) * voxel_scale;
+                    grid34.set(lx, ly, lz, density_fn(wx, wy, wz));
+                }
+            }
+        }
+
+        // Pass 2: In-memory central differences over [0..31]^3 with epsilon_grad = 0.05 floor.
+        encode_chunk_from_density_grid(store, chunk_key, grid34, base_material);
+    }
+
+    /// Fast path for the built-in composite surface/cave generator.
+    /// Audit Finding F1: precomputes the 34x34 2D surface height field once per chunk
+    /// instead of re-evaluating it for all 34 Y-slices. This is an exact refactor of
+    /// `evaluate_composite_density` (F1a), so generated terrain is bit-identical — the
+    /// `caves_enabled` toggle is honoured exactly as before.
     void generate_chunk(ChunkStore& store, ChunkKey chunk_key, WorkerDensityGrid34& grid34) const {
-        generate_chunk_from_density_fn(
-            store,
-            chunk_key,
-            grid34,
-            [this](float wx, float wy, float wz) {
-                return evaluate_composite_density(wx, wy, wz);
-            });
+        const IVec3 chunk_min = chunk_key.min_world_sample();
+
+        float h_2d_cache[34][34];
+        for (int32_t lz = -1; lz <= 32; ++lz) {
+            const float wz = static_cast<float>(chunk_min.z + lz) * voxel_scale;
+            for (int32_t lx = -1; lx <= 32; ++lx) {
+                const float wx = static_cast<float>(chunk_min.x + lx) * voxel_scale;
+                h_2d_cache[lx + 1][lz + 1] =
+                    surface_base_height +
+                    surface_amplitude * smooth_noise_3d(wx * 0.012f, 0.0f, wz * 0.012f, seed);
+            }
+        }
+
+        for (int32_t lz = -1; lz <= 32; ++lz) {
+            const float wz = static_cast<float>(chunk_min.z + lz) * voxel_scale;
+            for (int32_t ly = -1; ly <= 32; ++ly) {
+                const float wy = static_cast<float>(chunk_min.y + ly) * voxel_scale;
+                const float bedrock_atten = std::clamp((wy - 4.0f) / 10.0f, 0.0f, 1.0f);
+
+                for (int32_t lx = -1; lx <= 32; ++lx) {
+                    const float wx = static_cast<float>(chunk_min.x + lx) * voxel_scale;
+                    const float h_2d = h_2d_cache[lx + 1][lz + 1];
+
+                    const float overhang = 3.0f * smooth_noise_3d(wx * 0.03f, wy * 0.03f, wz * 0.03f, seed + 101U);
+                    const float d_surf = (wy - h_2d) + overhang;
+
+                    // Cave generation is optional: when disabled, the terrain is the pure
+                    // 2D surface + overhang field with no 3D cavities carved into it.
+                    if (!caves_enabled) {
+                        grid34.set(lx, ly, lz, d_surf);
+                        continue;
+                    }
+
+                    const float roof_atten = std::clamp((h_2d - 6.0f - wy) / 10.0f, 0.0f, 1.0f);
+                    const float r_y = cave_radius * bedrock_atten * roof_atten;
+
+                    const float n_a = 20.0f * smooth_noise_3d(wx * 0.022f, wy * 0.028f, wz * 0.022f, seed + 202U);
+                    const float n_b = 20.0f * smooth_noise_3d(wx * 0.022f, wy * 0.028f, wz * 0.022f, seed + 303U);
+                    const float d_cave = r_y - std::sqrt(n_a * n_a + n_b * n_b);
+
+                    grid34.set(lx, ly, lz, std::max(d_surf, d_cave));
+                }
+            }
+        }
+
+        encode_chunk_from_density_grid(store, chunk_key, grid34);
     }
 
 private:

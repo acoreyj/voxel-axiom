@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <optional>
 #include <unordered_set>
@@ -312,7 +313,7 @@ struct SelectiveDirtyMask {
 };
 
 // ============================================================================
-// 3. Dual Dirty-Set Priority Scheduler (Sections 3.4, 7.1)
+// 3. Dual Dirty-Set Priority Scheduler (Sections 3.4, 7.1; Audit F3 O(1) drain)
 // ============================================================================
 
 enum class DirtyQueueLane : uint8_t {
@@ -326,9 +327,12 @@ struct PoppedDirtyChunk {
 };
 
 /// Deduplicated dual dirty-set scheduler (`dirty_edit_chunks` and `dirty_stream_chunks`).
-/// Guarantees `dirty_edit_chunks` always drains before `dirty_stream_chunks`, orders chunks
-/// nearest-first relative to the streaming focus chunk, and pauses `dirty_stream_chunks`
-/// admission when completion queue depth reaches `kSoftCompletionCap = 8` (Section 3.4).
+/// Guarantees `dirty_edit_chunks` always drains before `dirty_stream_chunks`, orders the
+/// edit lane nearest-first relative to the streaming focus chunk, drains the stream lane
+/// FIFO (Audit Finding F3: the O(n) nearest scan under `mutex_` was a quadratic worker
+/// serialization point, while nearest-first matters least on the stream lane), and pauses
+/// `dirty_stream_chunks` admission when completion queue depth reaches
+/// `kSoftCompletionCap = 8` (Section 3.4).
 class DualDirtyScheduler {
 public:
     static constexpr std::size_t kSoftCompletionCap = 8;
@@ -354,19 +358,26 @@ public:
     }
 
     /// Marks a chunk stream-dirty (ignored if already queued in high-priority `dirty_edit_chunks`).
+    /// Publishes into the FIFO `stream_queue_` only when newly inserted, keeping the pop O(1).
     void mark_stream_dirty(ChunkKey key) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (edit_set_.find(key) != edit_set_.end()) {
             return;
         }
-        stream_set_.insert(key);
+        if (stream_set_.insert(key).second) {
+            stream_queue_.push_back(key);
+        }
     }
 
     /// Pops the next chunk to mesh according to Section 3.4 priority and backpressure rules:
     ///   - If `completion_queue_depth >= 32` (hard cap), returns std::nullopt.
     ///   - Always pops nearest chunk from `dirty_edit_chunks` first.
     ///   - Only when `dirty_edit_chunks` is empty AND `completion_queue_depth < 8` (soft cap),
-    ///     pops nearest chunk from `dirty_stream_chunks`.
+    ///     pops the oldest chunk from `dirty_stream_chunks` (FIFO).
+    ///
+    /// Audit Finding F3: the stream lane drains from `stream_queue_` in O(1) per pop rather
+    /// than scanning the whole set under `mutex_`. Promotions to the edit lane erase from
+    /// `stream_set_`; the stale deque entry is skipped lazily when it reaches the front.
     [[nodiscard]] std::optional<PoppedDirtyChunk> try_pop_next_mesh_job(
         std::size_t completion_queue_depth) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -374,12 +385,17 @@ public:
             return std::nullopt;
         }
         if (!edit_set_.empty()) {
-            const ChunkKey best = pop_nearest_unlocked(edit_set_);
+            const ChunkKey best = pop_nearest_edit_unlocked();
             return PoppedDirtyChunk{best, DirtyQueueLane::EditDirty};
         }
-        if (completion_queue_depth < kSoftCompletionCap && !stream_set_.empty()) {
-            const ChunkKey best = pop_nearest_unlocked(stream_set_);
-            return PoppedDirtyChunk{best, DirtyQueueLane::StreamDirty};
+        if (completion_queue_depth < kSoftCompletionCap && !stream_queue_.empty()) {
+            while (!stream_queue_.empty()) {
+                const ChunkKey candidate = stream_queue_.front();
+                stream_queue_.pop_front();
+                if (stream_set_.erase(candidate) > 0) {
+                    return PoppedDirtyChunk{candidate, DirtyQueueLane::StreamDirty};
+                }
+            }
         }
         return std::nullopt;
     }
@@ -406,7 +422,7 @@ public:
 
 private:
     void insert_edit_dirty_unlocked(ChunkKey key) {
-        stream_set_.erase(key); // Promote if previously stream-dirty
+        stream_set_.erase(key); // Promote if previously stream-dirty (stale deque entry skipped lazily)
         edit_set_.insert(key);
     }
 
@@ -417,12 +433,12 @@ private:
         return dx * dx + dy * dy + dz * dz;
     }
 
-    [[nodiscard]] ChunkKey pop_nearest_unlocked(std::unordered_set<ChunkKey, ChunkKeyHash>& set) {
-        assert(!set.empty());
-        auto best_it = set.begin();
+    [[nodiscard]] ChunkKey pop_nearest_edit_unlocked() {
+        assert(!edit_set_.empty());
+        auto best_it = edit_set_.begin();
         int64_t best_dist = dist_sq_to_focus_unlocked(*best_it);
 
-        for (auto it = std::next(set.begin()); it != set.end(); ++it) {
+        for (auto it = std::next(edit_set_.begin()); it != edit_set_.end(); ++it) {
             const int64_t d = dist_sq_to_focus_unlocked(*it);
             if (d < best_dist || (d == best_dist && *it < *best_it)) {
                 best_dist = d;
@@ -430,7 +446,7 @@ private:
             }
         }
         const ChunkKey chosen = *best_it;
-        set.erase(best_it);
+        edit_set_.erase(best_it);
         return chosen;
     }
 
@@ -438,6 +454,7 @@ private:
     ChunkKey focus_ = ChunkKey::from_coords(0, 0, 0);
     std::unordered_set<ChunkKey, ChunkKeyHash> edit_set_;
     std::unordered_set<ChunkKey, ChunkKeyHash> stream_set_;
+    std::deque<ChunkKey> stream_queue_;
 };
 
 } // namespace voxel

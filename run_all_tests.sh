@@ -17,6 +17,7 @@ echo "=================================================================="
 SIMPLE_TESTS=(
     "test_chunk_key"
     "test_chunk_store"
+    "test_stage_timings"
     "test_scratch_and_dirty"
     "test_edit_and_worker_pool"
     "test_procgen_and_surface_nets"

@@ -1,12 +1,15 @@
 #include "voxel_terrain_3d.h"
 
 #include <chrono>
+#include <cstdio>
+#include <utility>
 
 #if defined(VOXEL_WITH_GODOT_CPP)
 #include <godot_cpp/classes/physics_server3d.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/classes/world3d.hpp>
+#include <godot_cpp/variant/utility_functions.hpp>
 #endif
 
 namespace godot {
@@ -43,6 +46,8 @@ void VoxelTerrain3D::_bind_methods() {
     ClassDB::bind_method(D_METHOD("set_terrain_material", "material"), &VoxelTerrain3D::set_terrain_material);
     ClassDB::bind_method(D_METHOD("get_generate_caves"), &VoxelTerrain3D::get_generate_caves);
     ClassDB::bind_method(D_METHOD("set_generate_caves", "enabled"), &VoxelTerrain3D::set_generate_caves);
+    ClassDB::bind_method(D_METHOD("get_instrumentation_enabled"), &VoxelTerrain3D::get_instrumentation_enabled);
+    ClassDB::bind_method(D_METHOD("set_instrumentation_enabled", "enabled"), &VoxelTerrain3D::set_instrumentation_enabled);
 
     ADD_PROPERTY(PropertyInfo(Variant::INT, "view_distance_chunks", PROPERTY_HINT_RANGE, "1,24,1"),
                  "set_view_distance_chunks", "get_view_distance_chunks");
@@ -56,6 +61,8 @@ void VoxelTerrain3D::_bind_methods() {
                  "set_terrain_material", "get_terrain_material");
     ADD_PROPERTY(PropertyInfo(Variant::BOOL, "generate_caves"),
                  "set_generate_caves", "get_generate_caves");
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "instrumentation_enabled"),
+                 "set_instrumentation_enabled", "get_instrumentation_enabled");
 
     ADD_SIGNAL(MethodInfo("explosion_requested",
         PropertyInfo(Variant::VECTOR3, "position"),
@@ -71,7 +78,13 @@ void VoxelTerrain3D::_bind_methods() {
 #endif
 }
 
-VoxelTerrain3D::VoxelTerrain3D() = default;
+VoxelTerrain3D::VoxelTerrain3D() {
+#if defined(VOXEL_WITH_GODOT_CPP)
+    log_sink_ = [](const std::string& p_line) {
+        UtilityFunctions::print(String("[voxel] ") + String(p_line.c_str()));
+    };
+#endif
+}
 
 VoxelTerrain3D::~VoxelTerrain3D() {
     if (core_engine) {
@@ -102,6 +115,31 @@ void VoxelTerrain3D::set_generate_caves(bool p_enabled) {
     }
 }
 
+void VoxelTerrain3D::set_instrumentation_enabled(bool p_enabled) {
+    instrumentation_enabled = p_enabled;
+    _apply_stage_timings();
+}
+
+void VoxelTerrain3D::_apply_stage_timings() {
+    voxel::StageTimings* const timings = instrumentation_enabled ? &stage_timings_ : nullptr;
+    if (core_engine) {
+        core_engine->worker_pool->set_stage_timings(timings);
+        core_engine->streaming_manager->set_stage_timings(timings);
+    }
+}
+
+void VoxelTerrain3D::_log(const std::string& p_message) const {
+    if (log_sink_) {
+        log_sink_(p_message);
+    }
+}
+
+void VoxelTerrain3D::record_navigation_query_us(uint64_t p_us) const {
+    if (instrumentation_enabled) {
+        stage_timings_.record(voxel::Stage::Navigation, p_us);
+    }
+}
+
 void VoxelTerrain3D::_enter_tree() {
     const std::size_t budget_bytes =
         static_cast<std::size_t>(resident_memory_budget_mb) * voxel::MemoryLedger::kMiB;
@@ -115,6 +153,10 @@ void VoxelTerrain3D::_enter_tree() {
 #endif
     core_engine->procgen.caves_enabled = generate_caves;
     core_engine->worker_pool->start();
+
+    startup_armed_ = false;
+    startup_reported_ = false;
+    _apply_stage_timings();
 
     voxel::ServerRid scenario_rid{2};
     voxel::ServerRid space_rid{3};
@@ -180,6 +222,11 @@ void VoxelTerrain3D::save_world() {
 }
 
 void VoxelTerrain3D::set_stream_focus(Vector3 p_position, Vector3 p_velocity) {
+    if (!startup_armed_) {
+        startup_armed_ = true;
+        startup_reported_ = false;
+        startup_begin_us_ = monotonic_ticks_usec();
+    }
     stream_focus_position = p_position;
     stream_focus_velocity = p_velocity;
     if (core_engine && core_engine->streaming_manager) {
@@ -188,8 +235,7 @@ void VoxelTerrain3D::set_stream_focus(Vector3 p_position, Vector3 p_velocity) {
                 voxel::Vec3f{p_position.x, p_position.y, p_position.z},
                 voxel::Vec3f{p_velocity.x, p_velocity.y, p_velocity.z},
                 get_effective_view_distance_chunks(),
-                prefetch_distance_chunks,
-                core_engine->stream_grid34);
+                prefetch_distance_chunks);
         for (const voxel::ChunkKey uk : unloaded) {
             server_slot_manager.free_chunk_slot(uk);
             navigation_manager.note_chunk_unloaded(uk);
@@ -228,6 +274,7 @@ void VoxelTerrain3D::_process(double /*delta*/) {
     const uint64_t frame_start_us = monotonic_ticks_usec();
     const uint64_t soft_budget_us = static_cast<uint64_t>(upload_budget_ms * 1000.0f);
     const uint64_t emergency_budget_us = soft_budget_us * 2ULL;
+    voxel::StageTimings* const timings = instrumentation_enabled ? &stage_timings_ : nullptr;
 
     navigation_manager.poll_server_synchronization();
 
@@ -239,13 +286,15 @@ void VoxelTerrain3D::_process(double /*delta*/) {
         }
 
         switch (done->kind) {
-            case voxel::CompletionKind::ChunkMesh:
+            case voxel::CompletionKind::ChunkMesh: {
+                voxel::ScopedTimer commit_timer(timings, voxel::Stage::Commit);
                 server_slot_manager.commit_chunk_mesh_and_collision(done->chunk_mesh);
                 navigation_manager.note_chunk_mesh_committed(
                     done->chunk_mesh.key,
                     done->chunk_mesh.captured_terrain_revision,
                     server_slot_manager.get_cached_nav_faces(done->chunk_mesh.key));
                 break;
+            }
 
             case voxel::CompletionKind::ChunkUnloaded:
                 server_slot_manager.free_chunk_slot(done->unloaded_key);
@@ -294,6 +343,24 @@ void VoxelTerrain3D::_process(double /*delta*/) {
         emitted_signals_.push_back(
             EmittedSignalRecord{"chunk_committed", {}, 0.0f, 0, {}, static_cast<int64_t>(key.raw)});
 #endif
+    }
+
+    if (timings == nullptr) {
+        return;
+    }
+
+    const std::string summary = voxel::format_stage_summaries(stage_timings_.drain_all());
+    if (!summary.empty()) {
+        _log(summary);
+    }
+
+    if (startup_armed_ && !startup_reported_ && fully_committed()) {
+        startup_reported_ = true;
+        const double elapsed_ms =
+            static_cast<double>(monotonic_ticks_usec() - startup_begin_us_) / 1000.0;
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "initial fill complete in %.1f ms", elapsed_ms);
+        _log(buf);
     }
 }
 

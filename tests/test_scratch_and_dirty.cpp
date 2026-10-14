@@ -252,7 +252,8 @@ void test_dual_dirty_scheduler_priority_and_caps() {
     // At completion_queue_depth == 8 (soft cap), stream-dirty chunks must be paused.
     REQUIRE(!scheduler.try_pop_next_mesh_job(/*completion_queue_depth=*/8).has_value());
 
-    // Once completion_queue_depth drops below 8 (e.g., 7), stream-dirty chunks drain nearest-first (x = 1..50).
+    // Once completion_queue_depth drops below 8 (e.g., 7), stream-dirty chunks drain FIFO in
+    // insertion order (Audit F3), which here is x = 1..50.
     auto first_stream = scheduler.try_pop_next_mesh_job(/*completion_queue_depth=*/7);
     REQUIRE(first_stream.has_value());
     REQUIRE(first_stream->lane == DirtyQueueLane::StreamDirty);
