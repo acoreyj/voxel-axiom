@@ -78,9 +78,9 @@ private:
 /// uniform grid evaluation when external FastNoise2 DLL is not linked in unit tests.
 struct CaveNoiseGenerator {
     uint32_t seed = 1337U;
-    float surface_base_height = 96.0f;
-    float surface_amplitude = 18.0f;
-    float cave_radius = 4.5f;
+    float surface_base_height = 68.0f;
+    float surface_amplitude = 14.0f;
+    float cave_radius = 4.2f;
     float voxel_scale = 1.0f;
     float truncation_delta = TsdfFormat::kDefaultTruncationDelta;
 
@@ -100,7 +100,6 @@ struct CaveNoiseGenerator {
                      static_cast<uint64_t>(static_cast<uint32_t>(iz)) * 0x165667B19E3779F9ULL ^
                      static_cast<uint64_t>(s) * 0x27D4EB2F165667C5ULL;
         h = ChunkKey::hash_raw(h);
-        // Map to [-1.0, +1.0]
         const float unit = static_cast<float>(h & 0xFFFFFFULL) / static_cast<float>(0x800000ULL);
         return unit - 1.0f;
     }
@@ -140,18 +139,20 @@ struct CaveNoiseGenerator {
     [[nodiscard]] float evaluate_composite_density(float wx, float wy, float wz) const noexcept {
         // 1. 2D surface height + 3D overhang term: D_surf(x,y,z) = (y - H_2D(x,z)) + N_3D_overhang(x,y,z)
         const float h_2d = surface_base_height +
-                           surface_amplitude * smooth_noise_3d(wx * 0.015f, 0.0f, wz * 0.015f, seed);
-        const float overhang = 4.0f * smooth_noise_3d(wx * 0.04f, wy * 0.04f, wz * 0.04f, seed + 101U);
+                           surface_amplitude * smooth_noise_3d(wx * 0.012f, 0.0f, wz * 0.012f, seed);
+        const float overhang = 3.0f * smooth_noise_3d(wx * 0.03f, wy * 0.03f, wz * 0.03f, seed + 101U);
         const float d_surf = (wy - h_2d) + overhang;
 
         // 2. 3D Dual-Noise Ridge Intersection Cave Density:
         //    D_cave(x,y,z) = r_cave(y) - sqrt(N_A(x,y,z)^2 + N_B(x,y,z)^2)
-        //    Attenuate r_cave(y) near y = 0 bedrock so caves never breach the bottom of the world.
-        const float bedrock_atten = std::clamp((wy - 4.0f) / 12.0f, 0.0f, 1.0f);
-        const float r_y = cave_radius * bedrock_atten;
+        //    Attenuate r_cave(y) near y = 0 bedrock so caves never breach the bottom of the world,
+        //    and taper near the surface crust so the hills stay intact rather than swiss-cheesed.
+        const float bedrock_atten = std::clamp((wy - 4.0f) / 10.0f, 0.0f, 1.0f);
+        const float roof_atten = std::clamp((h_2d - 6.0f - wy) / 10.0f, 0.0f, 1.0f);
+        const float r_y = cave_radius * bedrock_atten * roof_atten;
 
-        const float n_a = 18.0f * smooth_noise_3d(wx * 0.035f, wy * 0.035f, wz * 0.035f, seed + 202U);
-        const float n_b = 18.0f * smooth_noise_3d(wx * 0.035f, wy * 0.035f, wz * 0.035f, seed + 303U);
+        const float n_a = 20.0f * smooth_noise_3d(wx * 0.022f, wy * 0.028f, wz * 0.022f, seed + 202U);
+        const float n_b = 20.0f * smooth_noise_3d(wx * 0.022f, wy * 0.028f, wz * 0.022f, seed + 303U);
         const float d_cave = r_y - std::sqrt(n_a * n_a + n_b * n_b);
 
         // 3. Combined density: D(x,y,z) = max(D_surf(x,y,z), D_cave(x,y,z))
@@ -252,7 +253,8 @@ public:
     /// Meshes chunk `chunk_key` from its populated 36^3 (`-1..34`) scratch window:
     ///   1. Computes central-difference corner gradients over [0..33]^3 using [-1..34]^3.
     ///   2. Computes dual vertices for all active cells in [0..32]^3 (33^3 cells).
-    ///   3. Stitches quads for sign-changing interior edges owned by cells [0..31]^3.
+    ///   3. Stitches quads for sign-changing interior edges owned by cells [0..31]^3,
+    ///      using Godot 4 clockwise front-face winding so `cull_back` renders solid exteriors.
     ///   4. Emits indexed render arrays AND pre-flattened triangle soup for Physics/Navigation.
     [[nodiscard]] static ChunkMeshPayload mesh_chunk_from_scratch_36(
         ChunkKey chunk_key,
@@ -272,8 +274,6 @@ public:
         const float origin_y = static_cast<float>(chunk_min.y) * voxel_scale;
         const float origin_z = static_cast<float>(chunk_min.z) * voxel_scale;
 
-        // Helper to evaluate central-difference gradient at corner (cx, cy, cz) in [0..33]^3.
-        // Reads (cx +/- 1, cy +/- 1, cz +/- 1), which lies strictly within [-1..34]^3!
         auto corner_gradient = [&](int32_t cx, int32_t cy, int32_t cz) noexcept -> Vec3f {
             assert(cx >= 0 && cx <= 33 && cy >= 0 && cy <= 33 && cz >= 0 && cz <= 33);
             const float gx = static_cast<float>(scratch.get_tsdf(cx + 1, cy, cz)) -
@@ -292,8 +292,6 @@ public:
 
         std::vector<DualCellData> dual_grid(kCellGridDim * kCellGridDim * kCellGridDim);
 
-        // 12 cube edges as pairs of corner indices in [0..7], where corner bitmask is:
-        // bit 0 = +dx, bit 1 = +dy, bit 2 = +dz.
         static constexpr std::array<std::pair<int, int>, 12> kCubeEdges = {{
             {0, 1}, {2, 3}, {4, 5}, {6, 7}, // 4 edges along X
             {0, 2}, {1, 3}, {4, 6}, {5, 7}, // 4 edges along Y
@@ -324,16 +322,14 @@ public:
                         }
                     }
 
-                    // If all 8 corners have the same sign, the cell is inactive.
                     if (mask == 0U || mask == 0xFFU) {
                         continue;
                     }
 
-                    // Average zero-crossing points along all sign-changing edges of the cell.
                     float sum_x = 0.0f, sum_y = 0.0f, sum_z = 0.0f;
                     int crossings = 0;
 
-                    for (const auto [c0, c1] : kCubeEdges) {
+                    for (const auto& [c0, c1] : kCubeEdges) {
                         const bool s0 = ((mask >> c0) & 1U) != 0U;
                         const bool s1 = ((mask >> c1) & 1U) != 0U;
                         if (s0 == s1) {
@@ -363,11 +359,10 @@ public:
 
                     assert(crossings > 0);
                     const float inv_count = 1.0f / static_cast<float>(crossings);
-                    const float ux = sum_x * inv_count; // in [0, 1]
-                    const float uy = sum_y * inv_count; // in [0, 1]
-                    const float uz = sum_z * inv_count; // in [0, 1]
+                    const float ux = sum_x * inv_count;
+                    const float uy = sum_y * inv_count;
+                    const float uz = sum_z * inv_count;
 
-                    // Trilinearly interpolate the 8 corner gradients at (ux, uy, uz) for smooth normals.
                     Vec3f g[8];
                     for (int c = 0; c < 8; ++c) {
                         g[c] = corner_gradient(i + (c & 1), j + ((c >> 1) & 1), k + ((c >> 2) & 1));
@@ -404,8 +399,6 @@ public:
             }
         }
 
-        // Helper to lazily emit a dual cell's vertex into out.vertices/out.normals only when
-        // referenced by at least one owned quad in [0..31]^3.
         auto get_or_emit_vertex = [&](int32_t ci, int32_t cj, int32_t ck) -> uint32_t {
             DualCellData& cell = dual_grid[cell_flat_index(ci, cj, ck)];
             if (cell.vertex_index == kInvalidVertex) {
@@ -452,10 +445,10 @@ public:
         };
 
         // Step 2: Quad Stitching across owned interior edges for cells (i, j, k) in [0..31]^3.
-        // Each cell (i, j, k) in [0..31]^3 owns the 3 edges meeting at corner (i+1, j+1, k+1):
-        //   1. +X edge: (i, j+1, k+1) -> (i+1, j+1, k+1), shared by cells (i, j, k), (i, j+1, k), (i, j+1, k+1), (i, j, k+1)
-        //   2. +Y edge: (i+1, j, k+1) -> (i+1, j+1, k+1), shared by cells (i, j, k), (i, j, k+1), (i+1, j, k+1), (i+1, j, k)
-        //   3. +Z edge: (i+1, j+1, k) -> (i+1, j+1, k+1), shared by cells (i, j, k), (i+1, j, k), (i+1, j+1, k), (i, j+1, k)
+        // Note on Godot 4 Front-Face Winding:
+        // Godot's RenderingServer considers a triangle front-facing when its vertices are
+        // ordered clockwise when viewed from outside (against the outward normal +grad S).
+        // Therefore `flip_winding = !s_tip` winds front faces toward the air side (+grad S).
         for (int32_t k = 0; k < 32; ++k) {
             for (int32_t j = 0; j < 32; ++j) {
                 for (int32_t i = 0; i < 32; ++i) {
@@ -469,7 +462,7 @@ public:
                                       i, j + 1, k,
                                       i, j + 1, k + 1,
                                       i, j,     k + 1,
-                                      /*flip_winding=*/s_tip);
+                                      /*flip_winding=*/!s_tip);
                         }
                     }
 
@@ -481,7 +474,7 @@ public:
                                       i,     j, k + 1,
                                       i + 1, j, k + 1,
                                       i + 1, j, k,
-                                      /*flip_winding=*/s_tip);
+                                      /*flip_winding=*/!s_tip);
                         }
                     }
 
@@ -493,7 +486,7 @@ public:
                                       i + 1, j,     k,
                                       i + 1, j + 1, k,
                                       i,     j + 1, k,
-                                      /*flip_winding=*/s_tip);
+                                      /*flip_winding=*/!s_tip);
                         }
                     }
                 }
