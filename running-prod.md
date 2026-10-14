@@ -123,6 +123,31 @@ timestamp (Step 1) rather than by launching from the editor.
 
 ---
 
+## Fast iteration: `run-prod.ps1`
+
+F5 always runs through the editor's devel host with the `debug` feature tag, and
+Godot has no "run in release" editor mode. To iterate against a release run
+without re-exporting each time, use the launcher:
+
+```powershell
+.\run-prod.ps1                        # release template, live project folder
+.\run-prod.ps1 --resolution 1600x900  # extra args are forwarded verbatim
+```
+
+It finds the installed Windows **release** export template
+(`%APPDATA%\Godot\export_templates\<version>\windows_release_x86_64.exe`),
+preferring `-GodotVersion` (default `4.7.2.stable`) and falling back to the
+newest installed version, then runs it with `--path <project root>`. The template
+reads `res://` straight from source, so script/scene edits are picked up with no
+export step.
+
+This is closer to the shipped build than F5, but not identical to Step 3: the
+release tag disables engine `assert()`s and the `debug` branch of feature checks,
+so run it before shipping to catch bugs F5 hides. The GDExtension DLL is already
+the release binary in both slots, so the native engine cost is unchanged.
+
+---
+
 ## Which library Godot loads
 
 `voxel_engine.gdextension` maps both feature tags to the release DLL:

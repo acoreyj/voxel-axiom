@@ -1,7 +1,9 @@
 #include "voxel_terrain_3d.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <thread>
 #include <utility>
 
 #if defined(VOXEL_WITH_GODOT_CPP)
@@ -152,7 +154,12 @@ void VoxelTerrain3D::_enter_tree() {
         std::string(save_directory_path.c_str()));
 #endif
     core_engine->procgen.caves_enabled = generate_caves;
-    core_engine->worker_pool->start();
+
+    // Cap worker count to physical core budget (at most 6 workers) so SMT hyperthreads
+    // never starve Godot's main, render, physics, or NavigationServer threads.
+    const unsigned int hc = std::thread::hardware_concurrency();
+    const std::size_t num_workers = std::clamp<std::size_t>(hc / 2, 2ULL, 6ULL);
+    core_engine->worker_pool->start(num_workers);
 
     startup_armed_ = false;
     startup_reported_ = false;
@@ -171,6 +178,9 @@ void VoxelTerrain3D::_enter_tree() {
     if (terrain_material.is_valid()) {
         server_slot_manager.set_material_override(terrain_material->get_rid());
     }
+    // Disable automatic Recast rebaking on initial background streaming chunks so startup
+    // and flying never trigger 80M-voxel Recast stalls; rebake only on explosions/edits!
+    navigation_manager.set_bake_on_stream_enabled(false);
 #endif
 
     navigation_manager.initialize(nav_map_rid);
@@ -278,6 +288,8 @@ void VoxelTerrain3D::_process(double /*delta*/) {
 
     navigation_manager.poll_server_synchronization();
 
+    std::size_t non_empty_meshes_committed = 0;
+
     while (true) {
         std::optional<voxel::CompletionRecord> done =
             core_engine->worker_pool->try_pop_completion();
@@ -288,11 +300,15 @@ void VoxelTerrain3D::_process(double /*delta*/) {
         switch (done->kind) {
             case voxel::CompletionKind::ChunkMesh: {
                 voxel::ScopedTimer commit_timer(timings, voxel::Stage::Commit);
+                const bool has_geometry = !done->chunk_mesh.vertices.empty();
                 server_slot_manager.commit_chunk_mesh_and_collision(done->chunk_mesh);
                 navigation_manager.note_chunk_mesh_committed(
                     done->chunk_mesh.key,
                     done->chunk_mesh.captured_terrain_revision,
                     server_slot_manager.get_cached_nav_faces(done->chunk_mesh.key));
+                if (has_geometry) {
+                    ++non_empty_meshes_committed;
+                }
                 break;
             }
 
@@ -326,7 +342,10 @@ void VoxelTerrain3D::_process(double /*delta*/) {
         }
 
         const bool currently_over_cap = (remaining_depth >= 32ULL);
-        if (!currently_over_cap && elapsed_us >= soft_budget_us) {
+        // Cap non-empty PhysicsServer3D concave BVH commits to at most 2 per frame when not over cap
+        // so Godot's internal PhysicsServer3D sync phase never stalls the main loop!
+        if (!currently_over_cap &&
+            (elapsed_us >= soft_budget_us || non_empty_meshes_committed >= 2ULL)) {
             break;
         }
         if (elapsed_us >= emergency_budget_us) {
@@ -334,7 +353,10 @@ void VoxelTerrain3D::_process(double /*delta*/) {
         }
     }
 
-    navigation_manager.submit_ready_groups_to_server(server_slot_manager);
+    // Only submit navigation group bakes after initial streaming settles (core_idle)
+    if (core_idle()) {
+        navigation_manager.submit_ready_groups_to_server(server_slot_manager);
+    }
 
     for (const voxel::ChunkKey key : navigation_manager.drain_newly_committed_chunks()) {
 #if defined(VOXEL_WITH_GODOT_CPP)

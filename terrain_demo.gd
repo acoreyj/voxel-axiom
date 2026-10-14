@@ -17,7 +17,7 @@ extends Node3D
 var _yaw: float = 0.0
 var _pitch: float = -0.25
 var _velocity: Vector3 = Vector3.ZERO
-var _last_stream_pos: Vector3 = Vector3(1e9, 1e9, 1e9)
+var _last_focus_chunk: Vector3i = Vector3i(999999, 999999, 999999)
 var _committed_chunk_count: int = 0
 var _fps_smoothed: float = 0.0
 var _commits_in_window: int = 0
@@ -75,9 +75,14 @@ func _process(delta: float) -> void:
 
 func _update_stream_focus(force: bool) -> void:
 	var cur_pos := camera.global_position
-	# Only update streaming center when moving or crossed > 2.0 m threshold (Section 3.3, 4.2)
-	if force or _velocity.length_squared() > 0.01 or cur_pos.distance_squared_to(_last_stream_pos) >= 4.0:
-		_last_stream_pos = cur_pos
+	var cur_chunk := Vector3i(
+		int(floor(cur_pos.x / 32.0)),
+		int(floor(cur_pos.y / 32.0)),
+		int(floor(cur_pos.z / 32.0))
+	)
+	# Only call into C++ set_stream_focus when the camera crosses into a new 32^3 chunk!
+	if force or cur_chunk != _last_focus_chunk:
+		_last_focus_chunk = cur_chunk
 		terrain.set_stream_focus(cur_pos, _velocity)
 
 func _update_hud(delta: float) -> void:

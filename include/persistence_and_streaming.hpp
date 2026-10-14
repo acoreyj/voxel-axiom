@@ -697,6 +697,18 @@ public:
             static_cast<int32_t>(std::floor(position.y)),
             static_cast<int32_t>(std::floor(position.z)));
 
+        // Fast-path O(1) early exit when still within the same focus chunk and radii!
+        if (has_last_focus_ &&
+            focus_ck == last_focus_ck_ &&
+            active_radius_chunks == last_active_radius_ &&
+            prefetch_radius_chunks == last_prefetch_radius_) {
+            return {};
+        }
+        has_last_focus_ = true;
+        last_focus_ck_ = focus_ck;
+        last_active_radius_ = active_radius_chunks;
+        last_prefetch_radius_ = prefetch_radius_chunks;
+
         dirty_scheduler_.set_focus_chunk(focus_ck);
 
         const int32_t world_h = store_.world_height_chunks();
@@ -777,6 +789,13 @@ public:
 
         // 2. Dispatch background generation / loading on worker threads without blocking main thread.
         for (const CandidateChunk& cand : candidates) {
+            if (tracked_resident_.find(cand.key) != tracked_resident_.end()) {
+                if (cand.in_active_set && meshed_active_.find(cand.key) == meshed_active_.end()) {
+                    meshed_active_.insert(cand.key);
+                    dirty_scheduler_.mark_stream_dirty(cand.key);
+                }
+                continue;
+            }
             ChunkSlot* slot = store_.find_slot(cand.key);
             const bool is_resident = (slot != nullptr && slot->state == ChunkLifecycleState::Resident);
             if (is_resident) {
@@ -787,6 +806,9 @@ public:
                 }
             } else if (requested_chunks_.find(cand.key) == requested_chunks_.end()) {
                 requested_chunks_.insert(cand.key);
+                if (cand.in_active_set) {
+                    meshed_active_.insert(cand.key);
+                }
                 worker_pool_.request_background_generate(cand.key, cand.in_active_set);
             }
         }
@@ -804,6 +826,10 @@ private:
     RegionSaveManager& save_manager_;
     CoreWorkerPool& worker_pool_;
     StageTimings* stage_timings_ = nullptr;
+    bool has_last_focus_ = false;
+    ChunkKey last_focus_ck_{};
+    int32_t last_active_radius_ = -1;
+    int32_t last_prefetch_radius_ = -1;
     std::unordered_set<ChunkKey, ChunkKeyHash> tracked_resident_;
     std::unordered_set<ChunkKey, ChunkKeyHash> meshed_active_;
     std::unordered_set<ChunkKey, ChunkKeyHash> requested_chunks_;

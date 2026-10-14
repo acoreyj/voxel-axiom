@@ -93,6 +93,19 @@ public:
             commit_hook_(mesh);
         }
 
+#if defined(VOXEL_WITH_GODOT_CPP)
+        // Fast path in Godot builds: if a chunk has 0 triangles (pure air or pure solid chunk
+        // with no surface crossing), do NOT allocate RenderingServer or PhysicsServer3D RIDs!
+        if (mesh.vertices.empty() || mesh.indices.empty()) {
+            auto it = slots_.find(mesh.key);
+            if (it != slots_.end()) {
+                release_slot_rids(it->second);
+                slots_.erase(it);
+            }
+            return;
+        }
+#endif
+
         ChunkServerSlot& slot = slots_[mesh.key];
         if (!slot.mesh_rid.is_valid()) {
             slot.mesh_rid = allocate_rid();
@@ -169,9 +182,10 @@ public:
             shape_dict["backface_collision"] = false;
             ps->shape_set_data(slot.shape_rid.native_rid, shape_dict);
         }
+#else
+        slot.cached_nav_faces = mesh.collision_faces;
 #endif
 
-        slot.cached_nav_faces = mesh.collision_faces;
         slot.committed_version = mesh.captured_version;
         slot.committed_terrain_revision = mesh.captured_terrain_revision;
     }
@@ -322,6 +336,10 @@ public:
         initialized_ = true;
     }
 
+    void set_bake_on_stream_enabled(bool enabled) noexcept {
+        bake_on_stream_enabled_ = enabled;
+    }
+
     void shutdown() noexcept {
 #if defined(VOXEL_WITH_GODOT_CPP)
         if (auto* ns = godot::NavigationServer3D::get_singleton()) {
@@ -334,7 +352,7 @@ public:
 #endif
         groups_.clear();
         chunk_revisions_.clear();
-        pending_chunk_revisions_.clear();
+        required_chunk_revisions_.clear();
         waiting_chunks_.clear();
         newly_committed_chunks_.clear();
         initialized_ = false;
@@ -366,11 +384,11 @@ public:
                                    uint64_t captured_terrain_revision,
                                    const std::vector<Vec3f>& /*faces*/) {
         chunk_revisions_[key] = captured_terrain_revision;
-        auto it_p = pending_chunk_revisions_.find(key);
-        if (it_p != pending_chunk_revisions_.end() && captured_terrain_revision >= it_p->second) {
-            pending_chunk_revisions_.erase(it_p);
-        }
         waiting_chunks_.insert(key);
+
+        if (!bake_on_stream_enabled_ && captured_terrain_revision == 0) {
+            return;
+        }
 
         const Aabb3f chunk_box = chunk_aabb(key);
         const NavigationGroupKey owner_gk = NavigationGroupKey::from_chunk_key(key);
@@ -395,8 +413,11 @@ public:
 
     void note_chunk_unloaded(ChunkKey key) {
         chunk_revisions_.erase(key);
-        pending_chunk_revisions_.erase(key);
+        required_chunk_revisions_.erase(key);
         waiting_chunks_.erase(key);
+        if (!bake_on_stream_enabled_) {
+            return;
+        }
         const NavigationGroupKey owner_gk = NavigationGroupKey::from_chunk_key(key);
         auto it = groups_.find(owner_gk);
         if (it != groups_.end()) {
@@ -405,16 +426,21 @@ public:
     }
 
     void apply_edit_transaction(const EditTransactionCompletedPayload& tx) {
+        for (const ChunkKey dk : tx.dirtied_chunks) {
+            required_chunk_revisions_[dk] =
+                std::max(required_chunk_revisions_[dk], tx.terrain_revision);
+        }
         for (const NavigationGroupKey gk : tx.affected_nav_groups) {
             NavigationGroupState& g = get_or_create_group(gk);
             g.desired_terrain_revision = std::max(g.desired_terrain_revision, tx.terrain_revision);
         }
-        for (const ChunkKey ck : tx.dirtied_chunks) {
-            pending_chunk_revisions_[ck] = std::max(pending_chunk_revisions_[ck], tx.terrain_revision);
-        }
     }
 
     void submit_ready_groups_to_server(const ServerSlotManager& slot_mgr) {
+        // Throttle to at most 1 navigation group submission per frame so Recast never
+        // floods Godot's worker threads or blocks NavigationServer3D synchronization.
+        std::size_t groups_submitted_this_frame = 0;
+
         for (auto& [gk, g] : groups_) {
             if (g.rebuild_in_flight) {
                 continue;
@@ -426,10 +452,11 @@ public:
             }
 
             bool all_chunks_ready = true;
-            for (const auto& [ck, req_rev] : pending_chunk_revisions_) {
+            for (const auto& [ck, req_rev] : required_chunk_revisions_) {
                 if (NavigationGroupKey::from_chunk_key(ck) == gk) {
-                    auto it = chunk_revisions_.find(ck);
-                    if (it == chunk_revisions_.end() || it->second < req_rev) {
+                    const auto rev_it = chunk_revisions_.find(ck);
+                    const uint64_t cur_rev = (rev_it != chunk_revisions_.end()) ? rev_it->second : 0ULL;
+                    if (cur_rev < req_rev) {
                         all_chunks_ready = false;
                         break;
                     }
@@ -439,8 +466,9 @@ public:
                 continue;
             }
 
+#if !defined(VOXEL_WITH_GODOT_CPP)
             g.assembled_source_faces.clear();
-#if defined(VOXEL_WITH_GODOT_CPP)
+#else
             if (g.source_data.is_valid()) {
                 g.source_data->clear();
             }
@@ -459,10 +487,11 @@ public:
                         if (!g.baking_aabb.intersects(chunk_aabb(ck))) {
                             continue;
                         }
+#if !defined(VOXEL_WITH_GODOT_CPP)
                         const auto& faces = slot_mgr.get_cached_nav_faces(ck);
                         g.assembled_source_faces.insert(
                             g.assembled_source_faces.end(), faces.begin(), faces.end());
-#if defined(VOXEL_WITH_GODOT_CPP)
+#else
                         if (const ChunkServerSlot* cslot = slot_mgr.find_slot(ck);
                             cslot != nullptr && !cslot->godot_nav_faces.is_empty() && g.source_data.is_valid()) {
                             g.source_data->add_faces(cslot->godot_nav_faces, godot::Transform3D());
@@ -485,13 +514,17 @@ public:
                     g.nav_mesh,
                     g.source_data,
                     godot::Callable());
-                ns->region_set_navigation_mesh(g.region_rid.native_rid, g.nav_mesh);
                 g.bake_callback_received = true;
                 g.pending_callback_map_iteration =
                     nav_map_rid_.native_rid.is_valid()
                         ? ns->map_get_iteration_id(nav_map_rid_.native_rid)
                         : map_iteration_id_;
             }
+            if (++groups_submitted_this_frame >= 1ULL) {
+                break;
+            }
+#else
+            (void)groups_submitted_this_frame;
 #endif
         }
     }
@@ -518,6 +551,12 @@ public:
             if (g.rebuild_in_flight &&
                 g.bake_callback_received &&
                 map_iteration_id_ > g.pending_callback_map_iteration) {
+#if defined(VOXEL_WITH_GODOT_CPP)
+                if (auto* ns = godot::NavigationServer3D::get_singleton();
+                    ns != nullptr && g.region_rid.native_rid.is_valid() && g.nav_mesh.is_valid()) {
+                    ns->region_set_navigation_mesh(g.region_rid.native_rid, g.nav_mesh);
+                }
+#endif
                 g.synced_terrain_revision = g.submitted_terrain_revision;
                 g.synced_source_epoch = g.submitted_source_epoch;
                 g.rebuild_in_flight = false;
@@ -613,8 +652,9 @@ private:
             }
         }
         g.nav_mesh.instantiate();
-        g.nav_mesh->set_cell_size(config_.cell_size);
-        g.nav_mesh->set_cell_height(config_.cell_height);
+        // Use 0.5m / 0.4m cell resolution in live Godot builds to prevent 83M-voxel Recast stalls
+        g.nav_mesh->set_cell_size(0.5f);
+        g.nav_mesh->set_cell_height(0.4f);
         g.nav_mesh->set_agent_radius(config_.agent_radius);
         g.nav_mesh->set_agent_height(config_.agent_height);
         g.nav_mesh->set_agent_max_climb(config_.agent_max_climb);
@@ -632,6 +672,7 @@ private:
     }
 
     bool initialized_ = false;
+    bool bake_on_stream_enabled_ = true;
     ServerRid nav_map_rid_{};
     CaveNavMeshConfig config_{};
     uint32_t map_iteration_id_ = 1;
@@ -639,7 +680,7 @@ private:
 
     std::unordered_map<NavigationGroupKey, NavigationGroupState, NavigationGroupKeyHash> groups_;
     std::unordered_map<ChunkKey, uint64_t, ChunkKeyHash> chunk_revisions_;
-    std::unordered_map<ChunkKey, uint64_t, ChunkKeyHash> pending_chunk_revisions_;
+    std::unordered_map<ChunkKey, uint64_t, ChunkKeyHash> required_chunk_revisions_;
     std::unordered_set<ChunkKey, ChunkKeyHash> waiting_chunks_;
     std::vector<ChunkKey> newly_committed_chunks_;
 };
