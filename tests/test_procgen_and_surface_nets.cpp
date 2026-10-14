@@ -250,12 +250,56 @@ void test_2x2x2_watertight_chunk_seams() {
                 total_triangles, godot_cw_aligned_triangles, total_triangles);
 }
 
+// ============================================================================
+// 3. Optional Caves Toggle (caves_enabled)
+// ============================================================================
+void test_procgen_caves_toggle() {
+    ++g_tests_run;
+
+    CaveNoiseGenerator gen_on; // caves_enabled defaults to true
+    CaveNoiseGenerator gen_off;
+    gen_off.caves_enabled = false;
+
+    std::size_t differing_points = 0;
+    std::size_t samples = 0;
+
+    for (float wz = 0.0f; wz <= 64.0f; wz += 4.0f) {
+        for (float wx = 0.0f; wx <= 64.0f; wx += 4.0f) {
+            for (float wy = 16.0f; wy <= 72.0f; wy += 4.0f) {
+                // Recompute the pure surface term d_surf exactly as the generator does.
+                const float h_2d = gen_off.surface_base_height +
+                                   gen_off.surface_amplitude * CaveNoiseGenerator::smooth_noise_3d(
+                                       wx * 0.012f, 0.0f, wz * 0.012f, gen_off.seed);
+                const float overhang = 3.0f * CaveNoiseGenerator::smooth_noise_3d(
+                    wx * 0.03f, wy * 0.03f, wz * 0.03f, gen_off.seed + 101U);
+                const float d_surf = (wy - h_2d) + overhang;
+
+                const float d_off = gen_off.evaluate_composite_density(wx, wy, wz);
+                REQUIRE(std::abs(d_off - d_surf) < 1e-3f);
+
+                const float d_on = gen_on.evaluate_composite_density(wx, wy, wz);
+                if (std::abs(d_on - d_off) > 1e-3f) {
+                    ++differing_points;
+                }
+                ++samples;
+            }
+        }
+    }
+
+    REQUIRE(differing_points > 0ULL);
+
+    std::printf("[PASS] test_procgen_caves_toggle (%zu/%zu samples carved by cave term, "
+                "surface-only path exact when disabled)\n",
+                differing_points, samples);
+}
+
 } // namespace
 
 int main() {
     std::printf("=== Running M1 Step 5 Unit Test Suite: 34^3 Cave ProcGen & 36^3 Seamless Surface Nets ===\n");
     test_procgen_34_regularization_and_caves();
     test_2x2x2_watertight_chunk_seams();
+    test_procgen_caves_toggle();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",
                 g_tests_run, g_assertions_checked);
     return EXIT_SUCCESS;

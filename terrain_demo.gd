@@ -12,11 +12,16 @@ extends Node3D
 @onready var terrain: VoxelTerrain3D = $VoxelTerrain3D
 @onready var ai_companion: VoxelAICompanion = $VoxelAICompanion
 @onready var camera: Camera3D = $Camera3D
+@onready var stats_label: Label = $HUD/StatsLabel
 
 var _yaw: float = 0.0
 var _pitch: float = -0.25
 var _velocity: Vector3 = Vector3.ZERO
 var _committed_chunk_count: int = 0
+var _fps_smoothed: float = 0.0
+var _commits_in_window: int = 0
+var _commits_per_second: float = 0.0
+var _stats_accum: float = 0.0
 
 func _ready() -> void:
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
@@ -67,6 +72,35 @@ func _process(delta: float) -> void:
 
 	# Update streaming center + velocity bias every frame (Section 3.3, 4.2)
 	terrain.set_stream_focus(camera.global_position, _velocity)
+	_update_hud(delta)
+
+func _update_hud(delta: float) -> void:
+	var fps := float(Engine.get_frames_per_second())
+	_fps_smoothed = fps if _fps_smoothed <= 0.0 else lerpf(_fps_smoothed, fps, 0.1)
+
+	# Commit rate over a rolling half-second window (chunks remeshed/committed per second).
+	_stats_accum += delta
+	if _stats_accum >= 0.5:
+		_commits_per_second = float(_commits_in_window) / _stats_accum
+		_commits_in_window = 0
+		_stats_accum = 0.0
+
+	var streaming_state := "idle"
+	if not terrain.core_idle():
+		streaming_state = "core busy"
+	elif not terrain.fully_committed():
+		streaming_state = "committing"
+
+	stats_label.text = "FPS: %.0f  (%.2f ms)\nView dist: %d / %d chunks  (prefetch %d)\nCommitted: %d chunks  (%.0f/s)\nStreaming: %s" % [
+		_fps_smoothed,
+		1000.0 / max(_fps_smoothed, 1.0),
+		terrain.get_effective_view_distance_chunks(),
+		terrain.view_distance_chunks,
+		terrain.prefetch_distance_chunks,
+		_committed_chunk_count,
+		_commits_per_second,
+		streaming_state,
+	]
 
 func _fire_raycast_explosion() -> void:
 	var space_state := get_world_3d().direct_space_state
@@ -99,3 +133,4 @@ func _on_explosion_failed(reason: String) -> void:
 
 func _on_chunk_committed(_chunk_key: int) -> void:
 	_committed_chunk_count += 1
+	_commits_in_window += 1

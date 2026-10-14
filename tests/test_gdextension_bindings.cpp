@@ -31,6 +31,21 @@ int g_assertions_checked = 0;
         }                                                                             \
     } while (0)
 
+void test_generate_caves_flag_roundtrip() {
+    ++g_tests_run;
+
+    VoxelTerrain3D terrain;
+    REQUIRE(terrain.get_generate_caves() == true);
+
+    terrain.set_generate_caves(false);
+    REQUIRE(terrain.get_generate_caves() == false);
+
+    terrain.set_generate_caves(true);
+    REQUIRE(terrain.get_generate_caves() == true);
+
+    std::printf("[PASS] test_generate_caves_flag_roundtrip (default caves-on, set/get round-trips)\n");
+}
+
 void test_gdextension_streaming_explosion_and_nav_lifecycle() {
     ++g_tests_run;
 
@@ -128,6 +143,7 @@ void test_gdextension_streaming_explosion_and_nav_lifecycle() {
 
 int main() {
     std::printf("=== Running GDExtension End-to-End Streaming, Destruction & Nav3D Test Suite ===\n");
+    test_generate_caves_flag_roundtrip();
     test_gdextension_streaming_explosion_and_nav_lifecycle();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",
                 g_tests_run, g_assertions_checked);

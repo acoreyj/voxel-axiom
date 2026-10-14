@@ -83,6 +83,10 @@ struct CaveNoiseGenerator {
     float cave_radius = 4.2f;
     float voxel_scale = 1.0f;
     float truncation_delta = TsdfFormat::kDefaultTruncationDelta;
+    /// When false, `evaluate_composite_density` returns the surface term only and
+    /// skips the 3D dual-noise cave term entirely (cave-free terrain). Read once per
+    /// sample, so toggling it affects only chunks generated afterwards.
+    bool caves_enabled = true;
 
     static constexpr float kEpsilonGrad = 0.05f; // Regularization floor (Section 3.5.2)
 
@@ -142,6 +146,12 @@ struct CaveNoiseGenerator {
                            surface_amplitude * smooth_noise_3d(wx * 0.012f, 0.0f, wz * 0.012f, seed);
         const float overhang = 3.0f * smooth_noise_3d(wx * 0.03f, wy * 0.03f, wz * 0.03f, seed + 101U);
         const float d_surf = (wy - h_2d) + overhang;
+
+        // Cave generation is optional: when disabled, the terrain is the pure
+        // 2D surface + overhang field with no 3D cavities carved into it.
+        if (!caves_enabled) {
+            return d_surf;
+        }
 
         // 2. 3D Dual-Noise Ridge Intersection Cave Density:
         //    D_cave(x,y,z) = r_cave(y) - sqrt(N_A(x,y,z)^2 + N_B(x,y,z)^2)

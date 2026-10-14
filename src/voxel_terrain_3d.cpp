@@ -41,6 +41,8 @@ void VoxelTerrain3D::_bind_methods() {
     ClassDB::bind_method(D_METHOD("set_upload_budget_ms", "ms"), &VoxelTerrain3D::set_upload_budget_ms);
     ClassDB::bind_method(D_METHOD("get_terrain_material"), &VoxelTerrain3D::get_terrain_material);
     ClassDB::bind_method(D_METHOD("set_terrain_material", "material"), &VoxelTerrain3D::set_terrain_material);
+    ClassDB::bind_method(D_METHOD("get_generate_caves"), &VoxelTerrain3D::get_generate_caves);
+    ClassDB::bind_method(D_METHOD("set_generate_caves", "enabled"), &VoxelTerrain3D::set_generate_caves);
 
     ADD_PROPERTY(PropertyInfo(Variant::INT, "view_distance_chunks", PROPERTY_HINT_RANGE, "1,24,1"),
                  "set_view_distance_chunks", "get_view_distance_chunks");
@@ -52,6 +54,8 @@ void VoxelTerrain3D::_bind_methods() {
                  "set_upload_budget_ms", "get_upload_budget_ms");
     ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "terrain_material", PROPERTY_HINT_RESOURCE_TYPE, "Material"),
                  "set_terrain_material", "get_terrain_material");
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "generate_caves"),
+                 "set_generate_caves", "get_generate_caves");
 
     ADD_SIGNAL(MethodInfo("explosion_requested",
         PropertyInfo(Variant::VECTOR3, "position"),
@@ -91,6 +95,13 @@ void VoxelTerrain3D::set_resident_memory_budget_mb(int p_mb) {
     }
 }
 
+void VoxelTerrain3D::set_generate_caves(bool p_enabled) {
+    generate_caves = p_enabled;
+    if (core_engine) {
+        core_engine->procgen.caves_enabled = p_enabled;
+    }
+}
+
 void VoxelTerrain3D::_enter_tree() {
     const std::size_t budget_bytes =
         static_cast<std::size_t>(resident_memory_budget_mb) * voxel::MemoryLedger::kMiB;
@@ -102,6 +113,7 @@ void VoxelTerrain3D::_enter_tree() {
 #else
         std::string(save_directory_path.c_str()));
 #endif
+    core_engine->procgen.caves_enabled = generate_caves;
     core_engine->worker_pool->start();
 
     voxel::ServerRid scenario_rid{2};

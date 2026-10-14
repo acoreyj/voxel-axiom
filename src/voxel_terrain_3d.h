@@ -79,6 +79,9 @@ public:
     void set_save_on_exit(bool p_save) { save_on_exit = p_save; }
     [[nodiscard]] bool get_save_on_exit() const { return save_on_exit; }
 
+    void set_generate_caves(bool p_enabled);
+    [[nodiscard]] bool get_generate_caves() const { return generate_caves; }
+
 #if defined(VOXEL_WITH_GODOT_CPP)
     void set_terrain_material(const Ref<Material>& p_mat);
     [[nodiscard]] Ref<Material> get_terrain_material() const { return terrain_material; }
@@ -141,6 +144,7 @@ private:
     float upload_budget_ms = 2.0f;
     int world_height_chunks = 4;
     bool save_on_exit = true;
+    bool generate_caves = true;
 
 #if defined(VOXEL_WITH_GODOT_CPP)
     Ref<Material> terrain_material;
