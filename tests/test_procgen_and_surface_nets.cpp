@@ -293,6 +293,62 @@ void test_procgen_caves_toggle() {
                 differing_points, samples);
 }
 
+// ============================================================================
+// 4. Collision Subsample Stride (HLD v4.0 Section 4.4 escape hatch)
+// ============================================================================
+void test_collision_subsample_stride() {
+    ++g_tests_run;
+
+    MemoryLedger ledger;
+    ChunkStore store(ledger, /*world_height_chunks=*/8);
+    WorkerDensityGrid34 grid34(ledger);
+    WorkerScratchWindow36 scratch(ledger);
+    CaveNoiseGenerator gen;
+
+    // A bumpy isosurface through the centre chunk so both lattices see geometry.
+    auto bumpy_sdf = [](float wx, float wy, float wz) -> float {
+        const float r = std::sqrt((wx - 16.0f) * (wx - 16.0f) +
+                                  (wy - 16.0f) * (wy - 16.0f) +
+                                  (wz - 16.0f) * (wz - 16.0f));
+        return r - 10.0f + 1.5f * std::sin(wx * 0.5f) * std::cos(wz * 0.5f);
+    };
+
+    for (int32_t dz = -1; dz <= 1; ++dz) {
+        for (int32_t dy = -1; dy <= 1; ++dy) {
+            for (int32_t dx = -1; dx <= 1; ++dx) {
+                gen.generate_chunk_from_density_fn(
+                    store, ChunkKey::from_coords(dx, dy, dz), grid34, bumpy_sdf);
+            }
+        }
+    }
+
+    const ChunkKey ck = ChunkKey::from_coords(0, 0, 0);
+    const auto stamp = gather_scratch_window_36(store, ck, scratch);
+
+    const ChunkMeshPayload full = SurfaceNetsMesher::mesh_chunk_from_scratch_36(
+        ck, scratch, 1, stamp.captured_terrain_revision);
+    const ChunkMeshPayload coarse = SurfaceNetsMesher::mesh_chunk_from_scratch_36(
+        ck, scratch, 1, stamp.captured_terrain_revision, 1.0f,
+        TsdfFormat::kDefaultTruncationDelta, /*collision_stride=*/2);
+
+    // Visual mesh must be untouched by the collision stride.
+    REQUIRE(coarse.vertices.size() == full.vertices.size());
+    REQUIRE(coarse.normals.size() == full.normals.size());
+    REQUIRE(coarse.indices == full.indices);
+
+    // Stride 1 collision soup is exactly the render triangle soup.
+    REQUIRE(full.collision_faces.size() == full.indices.size());
+    REQUIRE(full.collision_faces.size() % 3 == 0);
+
+    // Stride 2 collision soup is non-empty, quad-based (multiple of 6) and smaller.
+    REQUIRE(!coarse.collision_faces.empty());
+    REQUIRE(coarse.collision_faces.size() % 6 == 0);
+    REQUIRE(coarse.collision_faces.size() < full.collision_faces.size());
+
+    std::printf("[PASS] test_collision_subsample_stride (visual %zu tris intact; collision %zu -> %zu verts at stride 2)\n",
+                full.indices.size() / 3, full.collision_faces.size(), coarse.collision_faces.size());
+}
+
 } // namespace
 
 int main() {
@@ -300,6 +356,7 @@ int main() {
     test_procgen_34_regularization_and_caves();
     test_2x2x2_watertight_chunk_seams();
     test_procgen_caves_toggle();
+    test_collision_subsample_stride();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",
                 g_tests_run, g_assertions_checked);
     return EXIT_SUCCESS;

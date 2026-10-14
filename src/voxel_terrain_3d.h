@@ -70,6 +70,19 @@ public:
     void set_prefetch_distance_chunks(int p_dist) { prefetch_distance_chunks = p_dist; }
     [[nodiscard]] int get_prefetch_distance_chunks() const { return prefetch_distance_chunks; }
 
+    /// Chebyshev radius (in chunks, measured from the streaming focus chunk) within
+    /// which chunks build a PhysicsServer3D concave collision body. Chunks beyond it
+    /// upload only their RenderingServer mesh. -1 disables the gate (every resident
+    /// chunk collides, the pre-toggle behaviour).
+    void set_collision_distance_chunks(int p_dist);
+    [[nodiscard]] int get_collision_distance_chunks() const { return collision_distance_chunks; }
+
+    /// Collision-only decimation (HLD v4.0 Section 4.4): 1 keeps full 32^3 collision,
+    /// 2 rebuilds the physics/navigation soup from a 16^3 stride-2 subsample (~4x fewer
+    /// physics triangles) while the visual mesh stays full resolution.
+    void set_collision_subsample_stride(int p_stride);
+    [[nodiscard]] int get_collision_subsample_stride() const { return collision_subsample_stride; }
+
     void set_resident_memory_budget_mb(int p_mb);
     [[nodiscard]] int get_resident_memory_budget_mb() const { return resident_memory_budget_mb; }
 
@@ -78,6 +91,9 @@ public:
 
     void set_world_height_chunks(int p_height) { world_height_chunks = p_height; }
     [[nodiscard]] int get_world_height_chunks() const { return world_height_chunks; }
+
+    void set_surface_base_height(float p_height);
+    [[nodiscard]] float get_surface_base_height() const { return surface_base_height; }
 
     void set_save_on_exit(bool p_save) { save_on_exit = p_save; }
     [[nodiscard]] bool get_save_on_exit() const { return save_on_exit; }
@@ -127,19 +143,24 @@ private:
         std::unique_ptr<voxel::CoreWorkerPool> worker_pool;
         std::unique_ptr<voxel::StreamingManager> streaming_manager;
 
-        CoreEngineBundle(std::size_t budget_bytes, int32_t height_chunks, const std::string& save_dir)
+        CoreEngineBundle(std::size_t budget_bytes, int32_t height_chunks,
+                         const std::string& save_dir, const int* collision_stride)
             : ledger(budget_bytes),
               store(ledger, height_chunks) {
             save_manager = std::make_unique<voxel::RegionSaveManager>(ledger, save_dir);
             worker_pool = std::make_unique<voxel::CoreWorkerPool>(
                 store,
                 dirty_scheduler,
-                [](const voxel::ChunkStore&,
+                // Reads the live collision_subsample_stride so a runtime toggle applies
+                // to chunks meshed afterwards (same read-at-mesh-time contract as caves).
+                [collision_stride](const voxel::ChunkStore&,
                    voxel::ChunkKey ck,
                    voxel::WorkerScratchWindow36& scratch,
                    const voxel::NeighborhoodVersionStamp& stamp) {
+                    const int32_t stride = (collision_stride != nullptr) ? *collision_stride : 1;
                     return voxel::SurfaceNetsMesher::mesh_chunk_from_scratch_36(
-                        ck, scratch, 1, stamp.captured_terrain_revision);
+                        ck, scratch, 1, stamp.captured_terrain_revision, 1.0f,
+                        voxel::TsdfFormat::kDefaultTruncationDelta, stride);
                 },
                 // Audit F10: thread-local WorkerDensityGrid34 preallocated per worker thread
                 // (0 heap allocations per chunk instead of constructing one per generate call).
@@ -160,9 +181,12 @@ private:
     String save_directory_path = "/tmp/voxel_world_saves";
     int view_distance_chunks = 2;
     int prefetch_distance_chunks = 1;
+    int collision_distance_chunks = -1;
+    int collision_subsample_stride = 1;
     int resident_memory_budget_mb = 512;
     float upload_budget_ms = 2.0f;
     int world_height_chunks = 4;
+    float surface_base_height = 68.0f;
     bool save_on_exit = true;
     bool generate_caves = true;
 
@@ -172,9 +196,18 @@ private:
 
     Vector3 stream_focus_position{};
     Vector3 stream_focus_velocity{};
+    bool collision_focus_valid_ = false;
+    voxel::ChunkKey last_collision_focus_ck_{};
 
     void _apply_stage_timings();
     void _log(const std::string& p_message) const;
+
+    /// True when `p_key` should own a physics collision body under the current
+    /// `collision_distance_chunks` (3D Chebyshev distance from the focus chunk).
+    [[nodiscard]] bool chunk_in_collision_range(voxel::ChunkKey p_key) const;
+    /// Re-evaluates collision gating for every resident slot (called when the focus
+    /// crosses a chunk boundary or `collision_distance_chunks` changes).
+    void _reconcile_collision_range();
 
     std::unique_ptr<CoreEngineBundle> core_engine;
     voxel::ServerSlotManager server_slot_manager;

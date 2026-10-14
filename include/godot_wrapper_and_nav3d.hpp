@@ -63,6 +63,10 @@ struct ChunkServerSlot {
 #endif
     uint64_t committed_version = 0;
     uint64_t committed_terrain_revision = 0;
+    /// True while this chunk owns a live PhysicsServer3D concave shape carrying its
+    /// triangles. Distant chunks are committed visual-only (collision_enabled == false)
+    /// under `collision_distance_chunks`; the shape RID still exists but holds no faces.
+    bool collision_enabled = false;
 };
 
 /// Manages per-chunk RenderingServer and PhysicsServer3D RIDs directly without
@@ -87,7 +91,10 @@ public:
         commit_hook_ = std::move(hook);
     }
 
-    void commit_chunk_mesh_and_collision(const ChunkMeshPayload& mesh) {
+    /// @param build_collision  When false, the chunk still uploads its visual mesh and
+    ///   caches its nav faces, but its physics shape is left empty so no concave BVH is
+    ///   built for it. Used to gate distant chunks under `collision_distance_chunks`.
+    void commit_chunk_mesh_and_collision(const ChunkMeshPayload& mesh, bool build_collision = true) {
         assert(initialized_);
         if (commit_hook_) {
             commit_hook_(mesh);
@@ -177,13 +184,19 @@ public:
                             mesh.collision_faces.data(),
                             mesh.collision_faces.size() * sizeof(Vec3f));
             }
+            // Distant chunks keep their cached faces (for navigation and later promotion)
+            // but receive an empty shape, so PhysicsServer3D never builds their concave BVH.
+            const bool faces_present = !mesh.collision_faces.empty();
+            slot.collision_enabled = build_collision && faces_present;
             godot::Dictionary shape_dict;
-            shape_dict["faces"] = slot.godot_nav_faces;
+            shape_dict["faces"] = slot.collision_enabled ? slot.godot_nav_faces
+                                                         : godot::PackedVector3Array();
             shape_dict["backface_collision"] = false;
             ps->shape_set_data(slot.shape_rid.native_rid, shape_dict);
         }
 #else
         slot.cached_nav_faces = mesh.collision_faces;
+        slot.collision_enabled = build_collision && !mesh.collision_faces.empty();
 #endif
 
         slot.committed_version = mesh.captured_version;
@@ -218,6 +231,45 @@ public:
     [[nodiscard]] const ChunkServerSlot* find_slot(ChunkKey key) const noexcept {
         auto it = slots_.find(key);
         return (it != slots_.end()) ? &it->second : nullptr;
+    }
+
+    /// Enables or disables a resident chunk's physics collision in place from its cached
+    /// nav faces, without re-uploading its visual mesh. Used when the streaming focus
+    /// moves a chunk into or out of `collision_distance_chunks`; no-op if the state
+    /// already matches. Disabling swaps in an empty shape (BVH freed); enabling rebuilds
+    /// it from the retained faces.
+    void set_chunk_collision_enabled(ChunkKey key, bool enabled) noexcept {
+        auto it = slots_.find(key);
+        if (it == slots_.end() || it->second.collision_enabled == enabled) {
+            return;
+        }
+        it->second.collision_enabled = enabled;
+#if defined(VOXEL_WITH_GODOT_CPP)
+        auto* ps = godot::PhysicsServer3D::get_singleton();
+        if (ps == nullptr || !it->second.shape_rid.native_rid.is_valid()) {
+            return;
+        }
+        godot::Dictionary shape_dict;
+        shape_dict["faces"] = enabled ? it->second.godot_nav_faces
+                                      : godot::PackedVector3Array();
+        shape_dict["backface_collision"] = false;
+        ps->shape_set_data(it->second.shape_rid.native_rid, shape_dict);
+#endif
+    }
+
+    [[nodiscard]] bool chunk_has_collision(ChunkKey key) const noexcept {
+        auto it = slots_.find(key);
+        return it != slots_.end() && it->second.collision_enabled;
+    }
+
+    /// Visits every resident chunk slot on the main thread. Used by
+    /// `VoxelTerrain3D::_reconcile_collision_range` to re-evaluate collision gating
+    /// after the streaming focus crosses a chunk boundary.
+    template <typename Fn>
+    void for_each_slot(Fn&& fn) {
+        for (auto& entry : slots_) {
+            fn(entry.first, entry.second);
+        }
     }
 
     [[nodiscard]] std::size_t active_slot_count() const noexcept { return slots_.size(); }

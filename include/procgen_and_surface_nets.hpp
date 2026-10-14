@@ -324,13 +324,20 @@ public:
     ///   3. Stitches quads for sign-changing interior edges owned by cells [0..31]^3,
     ///      using Godot 4 clockwise front-face winding so `cull_back` renders solid exteriors.
     ///   4. Emits indexed render arrays AND pre-flattened triangle soup for Physics/Navigation.
+    /// @param collision_stride  When > 1, the de-indexed physics/navigation triangle
+    ///   soup is rebuilt from a stride-N subsample of the same scratch window (HLD
+    ///   v4.0 Section 4.4 escape hatch), while the visual mesh stays full resolution.
+    ///   Stride 2 halves the collision lattice to 16^3 (~4x fewer physics triangles).
+    ///   Only 1 or 2 are seamless: the 36^3 window reaches just two voxels into the
+    ///   neighbouring chunk, so a larger stride would crack collision across seams.
     [[nodiscard]] static ChunkMeshPayload mesh_chunk_from_scratch_36(
         ChunkKey chunk_key,
         const WorkerScratchWindow36& scratch,
         uint64_t captured_version = 1,
         uint64_t captured_terrain_revision = 0,
         float voxel_scale = 1.0f,
-        float truncation_delta = TsdfFormat::kDefaultTruncationDelta) {
+        float truncation_delta = TsdfFormat::kDefaultTruncationDelta,
+        int32_t collision_stride = 1) {
 
         ChunkMeshPayload out{};
         out.key = chunk_key;
@@ -503,13 +510,17 @@ public:
             out.indices.push_back(static_cast<int32_t>(tri1_b));
             out.indices.push_back(static_cast<int32_t>(tri1_c));
 
-            out.collision_faces.push_back(out.vertices[tri0_a]);
-            out.collision_faces.push_back(out.vertices[tri0_b]);
-            out.collision_faces.push_back(out.vertices[tri0_c]);
+            // At stride 1 the collision soup is exactly the render triangle soup.
+            // A larger stride rebuilds it from a coarser lattice after stitching.
+            if (collision_stride <= 1) {
+                out.collision_faces.push_back(out.vertices[tri0_a]);
+                out.collision_faces.push_back(out.vertices[tri0_b]);
+                out.collision_faces.push_back(out.vertices[tri0_c]);
 
-            out.collision_faces.push_back(out.vertices[tri1_a]);
-            out.collision_faces.push_back(out.vertices[tri1_b]);
-            out.collision_faces.push_back(out.vertices[tri1_c]);
+                out.collision_faces.push_back(out.vertices[tri1_a]);
+                out.collision_faces.push_back(out.vertices[tri1_b]);
+                out.collision_faces.push_back(out.vertices[tri1_c]);
+            }
         };
 
         // Step 2: Quad Stitching across owned interior edges for cells (i, j, k) in [0..31]^3.
@@ -561,7 +572,196 @@ public:
             }
         }
 
+        if (collision_stride > 1) {
+            append_collision_soup_at_stride(
+                scratch, chunk_key, collision_stride, voxel_scale, truncation_delta,
+                out.collision_faces);
+        }
+
         return out;
+    }
+
+private:
+    /// HLD v4.0 Section 4.4 escape hatch: de-indexed triangle soup for physics and
+    /// navigation built from a stride-N subsample of the 36^3 scratch window. This
+    /// is the same Surface Nets stitching as the full-resolution pass, evaluated on
+    /// a coarse lattice whose cells span `stride` voxels on every axis, so adjacent
+    /// chunks still agree on the shared boundary samples (no collision seam crack).
+    /// Roughly stride^3 fewer triangles: 4x at stride 2, 16x at stride 4.
+    static void append_collision_soup_at_stride(
+        const WorkerScratchWindow36& scratch,
+        ChunkKey chunk_key,
+        int32_t stride,
+        float voxel_scale,
+        float truncation_delta,
+        std::vector<Vec3f>& out_soup) {
+
+        if (stride <= 1 || (ChunkKey::kChunkDim % stride) != 0) {
+            return;
+        }
+
+        const IVec3 chunk_min = chunk_key.min_world_sample();
+        const float origin_x = static_cast<float>(chunk_min.x) * voxel_scale;
+        const float origin_y = static_cast<float>(chunk_min.y) * voxel_scale;
+        const float origin_z = static_cast<float>(chunk_min.z) * voxel_scale;
+
+        const int32_t cells_per_axis = ChunkKey::kChunkDim / stride; // 16 at stride 2
+        const int32_t dual_dim = cells_per_axis + 1;
+
+        struct CoarseCell {
+            Vec3f pos{};
+        };
+        std::vector<CoarseCell> dual(
+            static_cast<std::size_t>(dual_dim) * dual_dim * dual_dim);
+
+        auto cell_index = [dual_dim](int32_t gi, int32_t gj, int32_t gk) noexcept -> std::size_t {
+            return static_cast<std::size_t>(gi + dual_dim * (gj + dual_dim * gk));
+        };
+
+        static constexpr std::array<std::pair<int, int>, 12> kCubeEdges = {{
+            {0, 1}, {2, 3}, {4, 5}, {6, 7},
+            {0, 2}, {1, 3}, {4, 6}, {5, 7},
+            {0, 4}, {1, 5}, {2, 6}, {3, 7}
+        }};
+
+        // Step 1: Position coarse dual vertices for lattice cells [0 .. cells_per_axis].
+        for (int32_t gk = 0; gk < dual_dim; ++gk) {
+            for (int32_t gj = 0; gj < dual_dim; ++gj) {
+                for (int32_t gi = 0; gi < dual_dim; ++gi) {
+                    const int32_t i = gi * stride;
+                    const int32_t j = gj * stride;
+                    const int32_t k = gk * stride;
+
+                    int16_t corner_q[8];
+                    uint8_t mask = 0;
+                    for (int c = 0; c < 8; ++c) {
+                        const int32_t cx = i + ((c & 1) ? stride : 0);
+                        const int32_t cy = j + (((c >> 1) & 1) ? stride : 0);
+                        const int32_t cz = k + (((c >> 2) & 1) ? stride : 0);
+                        const int16_t q = scratch.get_tsdf(cx, cy, cz);
+                        corner_q[c] = q;
+                        if (q < 0) {
+                            mask |= static_cast<uint8_t>(1U << c);
+                        }
+                    }
+
+                    if (mask == 0U || mask == 0xFFU) {
+                        continue;
+                    }
+
+                    float sum_x = 0.0f, sum_y = 0.0f, sum_z = 0.0f;
+                    int crossings = 0;
+                    for (const auto& [c0, c1] : kCubeEdges) {
+                        const bool s0 = ((mask >> c0) & 1U) != 0U;
+                        const bool s1 = ((mask >> c1) & 1U) != 0U;
+                        if (s0 == s1) {
+                            continue;
+                        }
+                        const float f0 = TsdfFormat::decode(corner_q[c0], truncation_delta);
+                        const float f1 = TsdfFormat::decode(corner_q[c1], truncation_delta);
+                        const float denom = f1 - f0;
+                        const float t = (std::abs(denom) > 1e-8f)
+                                            ? std::clamp(-f0 / denom, 0.0f, 1.0f)
+                                            : 0.5f;
+                        const float p0x = (c0 & 1) ? static_cast<float>(stride) : 0.0f;
+                        const float p0y = ((c0 >> 1) & 1) ? static_cast<float>(stride) : 0.0f;
+                        const float p0z = ((c0 >> 2) & 1) ? static_cast<float>(stride) : 0.0f;
+                        const float p1x = (c1 & 1) ? static_cast<float>(stride) : 0.0f;
+                        const float p1y = ((c1 >> 1) & 1) ? static_cast<float>(stride) : 0.0f;
+                        const float p1z = ((c1 >> 2) & 1) ? static_cast<float>(stride) : 0.0f;
+                        sum_x += p0x + t * (p1x - p0x);
+                        sum_y += p0y + t * (p1y - p0y);
+                        sum_z += p0z + t * (p1z - p0z);
+                        ++crossings;
+                    }
+                    if (crossings == 0) {
+                        continue;
+                    }
+                    const float inv = 1.0f / static_cast<float>(crossings);
+                    const float ux = sum_x * inv;
+                    const float uy = sum_y * inv;
+                    const float uz = sum_z * inv;
+
+                    dual[cell_index(gi, gj, gk)].pos = Vec3f{
+                        origin_x + (static_cast<float>(i) + ux) * voxel_scale,
+                        origin_y + (static_cast<float>(j) + uy) * voxel_scale,
+                        origin_z + (static_cast<float>(k) + uz) * voxel_scale
+                    };
+                }
+            }
+        }
+
+        auto cell_pos = [&](int32_t gi, int32_t gj, int32_t gk) -> const Vec3f& {
+            return dual[cell_index(gi, gj, gk)].pos;
+        };
+
+        auto emit_quad = [&](int32_t a0, int32_t a1, int32_t a2,
+                             int32_t b0, int32_t b1, int32_t b2,
+                             int32_t c0, int32_t c1, int32_t c2,
+                             int32_t d0, int32_t d1, int32_t d2,
+                             bool flip_winding) {
+            const Vec3f& v0 = cell_pos(a0, a1, a2);
+            const Vec3f& v1 = cell_pos(b0, b1, b2);
+            const Vec3f& v2 = cell_pos(c0, c1, c2);
+            const Vec3f& v3 = cell_pos(d0, d1, d2);
+
+            const Vec3f& t0b = flip_winding ? v2 : v1;
+            const Vec3f& t0c = flip_winding ? v1 : v2;
+            const Vec3f& t1b = flip_winding ? v3 : v2;
+            const Vec3f& t1c = flip_winding ? v2 : v3;
+
+            out_soup.push_back(v0);  out_soup.push_back(t0b); out_soup.push_back(t0c);
+            out_soup.push_back(v0);  out_soup.push_back(t1b); out_soup.push_back(t1c);
+        };
+
+        // Step 2: Stitch quads across owned coarse interior edges (cells [0 .. cells_per_axis-1]).
+        for (int32_t gk = 0; gk < cells_per_axis; ++gk) {
+            for (int32_t gj = 0; gj < cells_per_axis; ++gj) {
+                for (int32_t gi = 0; gi < cells_per_axis; ++gi) {
+                    const int32_t i = gi * stride;
+                    const int32_t j = gj * stride;
+                    const int32_t k = gk * stride;
+
+                    const bool s_tip = (scratch.get_tsdf(i + stride, j + stride, k + stride) < 0);
+
+                    // +X edge: (i, j+stride, k+stride) -> (i+stride, j+stride, k+stride)
+                    {
+                        const bool s_tail = (scratch.get_tsdf(i, j + stride, k + stride) < 0);
+                        if (s_tail != s_tip) {
+                            emit_quad(gi, gj,     gk,
+                                      gi, gj + 1, gk,
+                                      gi, gj + 1, gk + 1,
+                                      gi, gj,     gk + 1,
+                                      /*flip_winding=*/!s_tip);
+                        }
+                    }
+
+                    // +Y edge: (i+stride, j, k+stride) -> (i+stride, j+stride, k+stride)
+                    {
+                        const bool s_tail = (scratch.get_tsdf(i + stride, j, k + stride) < 0);
+                        if (s_tail != s_tip) {
+                            emit_quad(gi,     gj, gk,
+                                      gi,     gj, gk + 1,
+                                      gi + 1, gj, gk + 1,
+                                      gi + 1, gj, gk,
+                                      /*flip_winding=*/!s_tip);
+                        }
+                    }
+
+                    // +Z edge: (i+stride, j+stride, k) -> (i+stride, j+stride, k+stride)
+                    {
+                        const bool s_tail = (scratch.get_tsdf(i + stride, j + stride, k) < 0);
+                        if (s_tail != s_tip) {
+                            emit_quad(gi,     gj,     gk,
+                                      gi + 1, gj,     gk,
+                                      gi + 1, gj + 1, gk,
+                                      gi,     gj + 1, gk,
+                                      /*flip_winding=*/!s_tip);
+                        }
+                    }
+                }
+            }
+        }
     }
 };
 

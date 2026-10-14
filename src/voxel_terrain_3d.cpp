@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <thread>
 #include <utility>
 
@@ -40,12 +42,20 @@ void VoxelTerrain3D::_bind_methods() {
     ClassDB::bind_method(D_METHOD("set_view_distance_chunks", "distance"), &VoxelTerrain3D::set_view_distance_chunks);
     ClassDB::bind_method(D_METHOD("get_prefetch_distance_chunks"), &VoxelTerrain3D::get_prefetch_distance_chunks);
     ClassDB::bind_method(D_METHOD("set_prefetch_distance_chunks", "distance"), &VoxelTerrain3D::set_prefetch_distance_chunks);
+    ClassDB::bind_method(D_METHOD("get_collision_distance_chunks"), &VoxelTerrain3D::get_collision_distance_chunks);
+    ClassDB::bind_method(D_METHOD("set_collision_distance_chunks", "distance"), &VoxelTerrain3D::set_collision_distance_chunks);
+    ClassDB::bind_method(D_METHOD("get_collision_subsample_stride"), &VoxelTerrain3D::get_collision_subsample_stride);
+    ClassDB::bind_method(D_METHOD("set_collision_subsample_stride", "stride"), &VoxelTerrain3D::set_collision_subsample_stride);
     ClassDB::bind_method(D_METHOD("get_resident_memory_budget_mb"), &VoxelTerrain3D::get_resident_memory_budget_mb);
     ClassDB::bind_method(D_METHOD("set_resident_memory_budget_mb", "mb"), &VoxelTerrain3D::set_resident_memory_budget_mb);
     ClassDB::bind_method(D_METHOD("get_upload_budget_ms"), &VoxelTerrain3D::get_upload_budget_ms);
     ClassDB::bind_method(D_METHOD("set_upload_budget_ms", "ms"), &VoxelTerrain3D::set_upload_budget_ms);
     ClassDB::bind_method(D_METHOD("get_terrain_material"), &VoxelTerrain3D::get_terrain_material);
     ClassDB::bind_method(D_METHOD("set_terrain_material", "material"), &VoxelTerrain3D::set_terrain_material);
+    ClassDB::bind_method(D_METHOD("get_world_height_chunks"), &VoxelTerrain3D::get_world_height_chunks);
+    ClassDB::bind_method(D_METHOD("set_world_height_chunks", "height"), &VoxelTerrain3D::set_world_height_chunks);
+    ClassDB::bind_method(D_METHOD("get_surface_base_height"), &VoxelTerrain3D::get_surface_base_height);
+    ClassDB::bind_method(D_METHOD("set_surface_base_height", "height"), &VoxelTerrain3D::set_surface_base_height);
     ClassDB::bind_method(D_METHOD("get_generate_caves"), &VoxelTerrain3D::get_generate_caves);
     ClassDB::bind_method(D_METHOD("set_generate_caves", "enabled"), &VoxelTerrain3D::set_generate_caves);
     ClassDB::bind_method(D_METHOD("get_instrumentation_enabled"), &VoxelTerrain3D::get_instrumentation_enabled);
@@ -55,10 +65,18 @@ void VoxelTerrain3D::_bind_methods() {
                  "set_view_distance_chunks", "get_view_distance_chunks");
     ADD_PROPERTY(PropertyInfo(Variant::INT, "prefetch_distance_chunks", PROPERTY_HINT_RANGE, "0,8,1"),
                  "set_prefetch_distance_chunks", "get_prefetch_distance_chunks");
+    ADD_PROPERTY(PropertyInfo(Variant::INT, "collision_distance_chunks", PROPERTY_HINT_RANGE, "-1,24,1"),
+                 "set_collision_distance_chunks", "get_collision_distance_chunks");
+    ADD_PROPERTY(PropertyInfo(Variant::INT, "collision_subsample_stride", PROPERTY_HINT_RANGE, "1,2,1"),
+                 "set_collision_subsample_stride", "get_collision_subsample_stride");
     ADD_PROPERTY(PropertyInfo(Variant::INT, "resident_memory_budget_mb", PROPERTY_HINT_RANGE, "128,4096,64"),
                  "set_resident_memory_budget_mb", "get_resident_memory_budget_mb");
     ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "upload_budget_ms", PROPERTY_HINT_RANGE, "0.5,16.0,0.5"),
                  "set_upload_budget_ms", "get_upload_budget_ms");
+    ADD_PROPERTY(PropertyInfo(Variant::INT, "world_height_chunks", PROPERTY_HINT_RANGE, "1,12,1"),
+                 "set_world_height_chunks", "get_world_height_chunks");
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_base_height", PROPERTY_HINT_RANGE, "16.0,256.0,1.0"),
+                 "set_surface_base_height", "get_surface_base_height");
     ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "terrain_material", PROPERTY_HINT_RESOURCE_TYPE, "Material"),
                  "set_terrain_material", "get_terrain_material");
     ADD_PROPERTY(PropertyInfo(Variant::BOOL, "generate_caves"),
@@ -110,11 +128,58 @@ void VoxelTerrain3D::set_resident_memory_budget_mb(int p_mb) {
     }
 }
 
+void VoxelTerrain3D::set_surface_base_height(float p_height) {
+    surface_base_height = p_height;
+    if (core_engine) {
+        core_engine->procgen.surface_base_height = p_height;
+    }
+}
+
 void VoxelTerrain3D::set_generate_caves(bool p_enabled) {
     generate_caves = p_enabled;
     if (core_engine) {
         core_engine->procgen.caves_enabled = p_enabled;
     }
+}
+
+void VoxelTerrain3D::set_collision_distance_chunks(int p_dist) {
+    collision_distance_chunks = p_dist;
+    collision_focus_valid_ = false; // force a re-evaluation on the next focus update
+    if (core_engine) {
+        _reconcile_collision_range();
+    }
+}
+
+void VoxelTerrain3D::set_collision_subsample_stride(int p_stride) {
+    // The 36^3 window reaches only two voxels into the neighbour chunk, so stride > 2
+    // would crack collision across chunk seams; clamp to the seamless values (1 or 2).
+    collision_subsample_stride = (p_stride >= 2) ? 2 : 1;
+}
+
+bool VoxelTerrain3D::chunk_in_collision_range(voxel::ChunkKey p_key) const {
+    if (collision_distance_chunks < 0) {
+        return true;
+    }
+    const voxel::ChunkKey focus = voxel::ChunkKey::from_world_sample(
+        static_cast<int32_t>(std::floor(stream_focus_position.x)),
+        static_cast<int32_t>(std::floor(stream_focus_position.y)),
+        static_cast<int32_t>(std::floor(stream_focus_position.z)));
+    const int32_t dx = std::abs(p_key.x() - focus.x());
+    const int32_t dy = std::abs(p_key.y() - focus.y());
+    const int32_t dz = std::abs(p_key.z() - focus.z());
+    return std::max({dx, dy, dz}) <= collision_distance_chunks;
+}
+
+void VoxelTerrain3D::_reconcile_collision_range() {
+    server_slot_manager.for_each_slot([this](voxel::ChunkKey key, voxel::ChunkServerSlot& slot) {
+        const bool in_range = chunk_in_collision_range(key);
+#if defined(VOXEL_WITH_GODOT_CPP)
+        const bool has_faces = !slot.godot_nav_faces.is_empty();
+#else
+        const bool has_faces = !slot.cached_nav_faces.empty();
+#endif
+        server_slot_manager.set_chunk_collision_enabled(key, in_range && has_faces);
+    });
 }
 
 void VoxelTerrain3D::set_instrumentation_enabled(bool p_enabled) {
@@ -149,11 +214,13 @@ void VoxelTerrain3D::_enter_tree() {
         budget_bytes,
         static_cast<int32_t>(world_height_chunks),
 #if defined(VOXEL_WITH_GODOT_CPP)
-        std::string(save_directory_path.utf8().get_data()));
+        std::string(save_directory_path.utf8().get_data()),
 #else
-        std::string(save_directory_path.c_str()));
+        std::string(save_directory_path.c_str()),
 #endif
+        &collision_subsample_stride);
     core_engine->procgen.caves_enabled = generate_caves;
+    core_engine->procgen.surface_base_height = surface_base_height;
 
     // Cap worker count to physical core budget (at most 6 workers) so SMT hyperthreads
     // never starve Godot's main, render, physics, or NavigationServer threads.
@@ -251,6 +318,19 @@ void VoxelTerrain3D::set_stream_focus(Vector3 p_position, Vector3 p_velocity) {
             navigation_manager.note_chunk_unloaded(uk);
         }
     }
+
+    // Collision gating follows the focus chunk: only re-evaluate when it crosses a
+    // chunk boundary (or after a runtime change to collision_distance_chunks).
+    const voxel::ChunkKey focus_ck = voxel::ChunkKey::from_world_sample(
+        static_cast<int32_t>(std::floor(p_position.x)),
+        static_cast<int32_t>(std::floor(p_position.y)),
+        static_cast<int32_t>(std::floor(p_position.z)));
+    if (collision_distance_chunks >= 0 &&
+        (!collision_focus_valid_ || focus_ck != last_collision_focus_ck_)) {
+        collision_focus_valid_ = true;
+        last_collision_focus_ck_ = focus_ck;
+        _reconcile_collision_range();
+    }
 }
 
 bool VoxelTerrain3D::core_idle() const {
@@ -301,7 +381,8 @@ void VoxelTerrain3D::_process(double /*delta*/) {
             case voxel::CompletionKind::ChunkMesh: {
                 voxel::ScopedTimer commit_timer(timings, voxel::Stage::Commit);
                 const bool has_geometry = !done->chunk_mesh.vertices.empty();
-                server_slot_manager.commit_chunk_mesh_and_collision(done->chunk_mesh);
+                server_slot_manager.commit_chunk_mesh_and_collision(
+                    done->chunk_mesh, chunk_in_collision_range(done->chunk_mesh.key));
                 navigation_manager.note_chunk_mesh_committed(
                     done->chunk_mesh.key,
                     done->chunk_mesh.captured_terrain_revision,

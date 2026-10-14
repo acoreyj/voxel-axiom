@@ -47,6 +47,45 @@ void test_generate_caves_flag_roundtrip() {
     std::printf("[PASS] test_generate_caves_flag_roundtrip (default caves-on, set/get round-trips)\n");
 }
 
+void test_collision_toggles_roundtrip() {
+    ++g_tests_run;
+
+    VoxelTerrain3D terrain;
+    REQUIRE(terrain.get_collision_distance_chunks() == -1);
+    REQUIRE(terrain.get_collision_subsample_stride() == 1);
+
+    terrain.set_collision_distance_chunks(3);
+    REQUIRE(terrain.get_collision_distance_chunks() == 3);
+    terrain.set_collision_distance_chunks(-1);
+    REQUIRE(terrain.get_collision_distance_chunks() == -1);
+
+    terrain.set_collision_subsample_stride(2);
+    REQUIRE(terrain.get_collision_subsample_stride() == 2);
+    // Clamped to the seamless values (1 or 2) so collision never cracks at chunk seams.
+    terrain.set_collision_subsample_stride(4);
+    REQUIRE(terrain.get_collision_subsample_stride() == 2);
+    terrain.set_collision_subsample_stride(1);
+    REQUIRE(terrain.get_collision_subsample_stride() == 1);
+
+    std::printf("[PASS] test_collision_toggles_roundtrip (collision_distance_chunks + collision_subsample_stride bind/round-trip)\n");
+}
+
+void test_terrain_depth_slider_roundtrip() {
+    ++g_tests_run;
+
+    VoxelTerrain3D terrain;
+    REQUIRE(terrain.get_world_height_chunks() == 4);
+    REQUIRE(terrain.get_surface_base_height() == 68.0f);
+
+    terrain.set_world_height_chunks(6);
+    REQUIRE(terrain.get_world_height_chunks() == 6);
+
+    terrain.set_surface_base_height(132.0f);
+    REQUIRE(terrain.get_surface_base_height() == 132.0f);
+
+    std::printf("[PASS] test_terrain_depth_slider_roundtrip (world_height_chunks + surface_base_height set/get)\n");
+}
+
 void test_gdextension_streaming_explosion_and_nav_lifecycle() {
     ++g_tests_run;
 
@@ -167,6 +206,8 @@ void test_gdextension_streaming_explosion_and_nav_lifecycle() {
 int main() {
     std::printf("=== Running GDExtension End-to-End Streaming, Destruction & Nav3D Test Suite ===\n");
     test_generate_caves_flag_roundtrip();
+    test_collision_toggles_roundtrip();
+    test_terrain_depth_slider_roundtrip();
     test_gdextension_streaming_explosion_and_nav_lifecycle();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",
                 g_tests_run, g_assertions_checked);

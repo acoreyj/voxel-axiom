@@ -282,6 +282,44 @@ void test_sloped_cave_vertical_boundary_halo_gathering() {
     std::printf("[PASS] test_sloped_cave_vertical_boundary_halo_gathering (3D P_y padding stitches gy=0 & gy=1)\n");
 }
 
+// ============================================================================
+// 4. Collision Distance Gating on the Server Slot Manager (Section 4.4)
+// ============================================================================
+void test_collision_distance_gating_on_slot_manager() {
+    ++g_tests_run;
+
+    ServerSlotManager slot_mgr;
+    slot_mgr.initialize(ServerRid{1}, ServerRid{2});
+
+    ChunkMeshPayload far_mesh{};
+    far_mesh.key = ChunkKey::from_coords(5, 0, 5);
+    far_mesh.captured_version = 1;
+    far_mesh.collision_faces = {
+        Vec3f{0.0f, 0.0f, 0.0f}, Vec3f{1.0f, 0.0f, 0.0f}, Vec3f{0.0f, 0.0f, 1.0f}};
+    // Committed visual-only: the shape carries no faces, but nav faces are retained.
+    slot_mgr.commit_chunk_mesh_and_collision(far_mesh, /*build_collision=*/false);
+    REQUIRE(slot_mgr.find_slot(far_mesh.key) != nullptr);
+    REQUIRE(!slot_mgr.chunk_has_collision(far_mesh.key));
+    REQUIRE(slot_mgr.get_cached_nav_faces(far_mesh.key).size() == 3ULL);
+
+    // Promoting it into range rebuilds collision from the retained faces.
+    slot_mgr.set_chunk_collision_enabled(far_mesh.key, true);
+    REQUIRE(slot_mgr.chunk_has_collision(far_mesh.key));
+    // Demoting it back out of range clears collision in place.
+    slot_mgr.set_chunk_collision_enabled(far_mesh.key, false);
+    REQUIRE(!slot_mgr.chunk_has_collision(far_mesh.key));
+
+    // A chunk committed in range builds collision immediately.
+    ChunkMeshPayload near_mesh{};
+    near_mesh.key = ChunkKey::from_coords(0, 0, 0);
+    near_mesh.captured_version = 1;
+    near_mesh.collision_faces = far_mesh.collision_faces;
+    slot_mgr.commit_chunk_mesh_and_collision(near_mesh);
+    REQUIRE(slot_mgr.chunk_has_collision(near_mesh.key));
+
+    std::printf("[PASS] test_collision_distance_gating_on_slot_manager (visual-only commit, enable/disable, faces retained)\n");
+}
+
 } // namespace
 
 int main() {
@@ -289,6 +327,7 @@ int main() {
     test_bounded_frame_time_under_32_entry_backpressure();
     test_3d_cave_navigation_vertical_isolation();
     test_sloped_cave_vertical_boundary_halo_gathering();
+    test_collision_distance_gating_on_slot_manager();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",
                 g_tests_run, g_assertions_checked);
     return EXIT_SUCCESS;

@@ -188,6 +188,10 @@ Both demo scenes drive a `VoxelTerrain3D` node, whose key exported properties ar
 | --- | --- | --- | --- |
 | `view_distance_chunks` | `int` | `2` | Active streaming radius in chunks (auto-shrunk by 2 under memory pressure). |
 | `prefetch_distance_chunks` | `int` | `1` | Extra Chebyshev ring streamed ahead of the active radius. |
+| `world_height_chunks` | `int` | `4` | Vertical chunk ceiling, in 32 m chunks. Sets the top of the world; streaming only populates layer indices `0 … world_height_chunks-1`. Baked in when the node starts, so set it before running. |
+| `surface_base_height` | `float` | `68.0` | Average terrain surface height above the `y = 0` bedrock, in meters. Controls how much rock sits under the surface (and how many cave layers fit). |
+| `collision_distance_chunks` | `int` | `-1` | 3D Chebyshev radius (in chunks, from the focus chunk) within which chunks build a `PhysicsServer3D` collision body. Distant chunks upload only their visual mesh. `-1` disables the gate. |
+| `collision_subsample_stride` | `int` | `1` | Collision-only decimation (HLD §4.4). `2` rebuilds the physics/navigation triangle soup from a `16³` stride-2 subsample (~4× fewer physics triangles) while the `32³` visual mesh stays full-resolution and watertight. Clamped to `1`/`2`. |
 | `resident_memory_budget_mb` | `int` | `512` | Memory ledger budget for resident chunk data. |
 | `upload_budget_ms` | `float` | `2.0` | Per-frame main-thread commit budget for mesh/physics/nav uploads. |
 | `terrain_material` | `Material` | `null` | Material applied to all committed chunk surfaces. |
@@ -198,6 +202,96 @@ Both demo scenes drive a `VoxelTerrain3D` node, whose key exported properties ar
 $VoxelTerrain3D.generate_caves = false
 $VoxelTerrain3D.instrumentation_enabled = false
 ```
+
+### Terrain Depth
+
+Underground depth is the distance between the `y = 0` bedrock and the average
+surface height (`surface_base_height`), bounded above by the world ceiling
+(`world_height_chunks`). Both are range sliders on `VoxelTerrain3D`, editable in
+the Godot **Inspector** or from GDScript:
+
+```gdscript
+$VoxelTerrain3D.world_height_chunks = 6      # 6 x 32 m = 192 m ceiling
+$VoxelTerrain3D.surface_base_height = 132.0  # ~132 m of underground rock
+```
+
+**What each one does**
+
+- **`world_height_chunks`** — the vertical ceiling in 32 m chunks, so the top of
+  the world is `world_height_chunks * 32` m. The streaming manager only populates
+  chunk layers `0 … world_height_chunks-1`; anything above simply does not exist.
+  It is baked into the chunk store when the node enters the tree, so **set it in
+  the Inspector (or before adding the node) — changing it at runtime has no
+  effect until the node restarts.**
+- **`surface_base_height`** — the average surface height above bedrock, in meters,
+  and the main depth dial. It is forwarded to the generator at startup and on
+  every change, so lowering it thins the rock and raising it deepens the world.
+  Like `generate_caves`, it is read per sample, so **only chunks generated after
+  the change adopt the new height.**
+
+**Picking a value.** Keep `surface_base_height + surface_amplitude` at least 20 m
+below `world_height_chunks * 32` so hilltops never clip the ceiling. The
+`world_height_chunks` slider runs `1 … 12` and `surface_base_height` `16 … 256` m.
+Common profiles (from [`docs/terrain depth.md`](docs/terrain%20depth.md)):
+
+| Profile | `world_height_chunks` | `surface_base_height` | Underground depth |
+| --- | --- | --- | --- |
+| Shallow (fastest) | `2` (64 m) | `36.0` | ~36 m, 1 cave layer |
+| Default | `4` (128 m) | `68.0` | ~68 m, 2 cave layers |
+| Deep caverns | `6` (192 m) | `132.0` | ~132 m, 4 cave layers |
+| Abyssal | `8` (256 m) | `196.0` | ~196 m, 6 cave layers |
+
+**Two values track depth by hand.** They are not sliders on `VoxelTerrain3D`:
+
+- `surface_height_threshold` in `voxel_triplanar.gdshader` — set it to roughly
+  `surface_base_height - 12.0` so cave walls darken to rock below the surface.
+- The demo `Camera3D` initial `Y` (in `voxel_terrain_demo.tscn`) — set it to about
+  `surface_base_height + 16.0` so the camera spawns above the new surface.
+
+### Collision & Triangle Count
+
+Two properties shrink the per-chunk physics footprint for lower-end PCs. Both are
+range sliders on `VoxelTerrain3D`, editable in the Godot **Inspector** or from
+GDScript:
+
+```gdscript
+$VoxelTerrain3D.collision_distance_chunks = 3   # physics only within 3 chunks (96 m)
+$VoxelTerrain3D.collision_subsample_stride = 2  # 16^3 collision soup (~4x fewer tris)
+```
+
+**What each one does**
+
+- **`collision_distance_chunks`** — the 3D Chebyshev distance (in chunks, from the
+  streaming focus chunk) within which a chunk builds a `PhysicsServer3D` concave
+  collision body. Beyond it, a chunk uploads only its visual `RenderingServer` mesh:
+  the shape RID still exists but is empty, so no concave BVH is built for it.
+  `-1` disables the gate (every resident chunk collides — the default). Setting it
+  re-evaluates collision for all resident chunks immediately, and as the player
+  crosses chunk boundaries chunks leaving the radius have their collision cleared
+  in place while chunks entering it are rebuilt from the cached faces. It gates
+  physics only: explosions are voxel CSG edits, not physics raycasts, so carving
+  still works at any distance.
+- **`collision_subsample_stride`** — collision-only decimation (HLD §4.4). `1`
+  (default) builds the physics/navigation triangle soup at full `32³` resolution.
+  `2` rebuilds it from a `16³` stride-2 subsample of the same `36³` window, about
+  `4×` fewer physics triangles per chunk, while the `32³` visual mesh stays
+  full-resolution and watertight (no LOD seams). The navigation source geometry
+  shares this soup, so navmeshes are also coarser at stride 2. It is read at mesh
+  time, so **only chunks meshed after the change adopt it** (same contract as
+  `generate_caves`). Values are clamped to `1` or `2`: the `36³` window reaches two
+  voxels into the neighbour, so a larger stride would crack collision across chunk
+  seams.
+
+**Suggested presets** (pairing the streaming radii with the collision toggles):
+
+| Preset | `view_distance_chunks` | `prefetch_distance_chunks` | `collision_distance_chunks` | `collision_subsample_stride` | `upload_budget_ms` |
+| --- | --- | --- | --- | --- | --- |
+| Low / integrated GPU | `3` | `0` | `2` | `2` | `1.0` |
+| Medium | `4` | `1` | `2` | `2` | `1.5` |
+| High | `6` | `2` | `3` | `1` | `2.0` |
+
+The shipped `voxel_terrain_demo.tscn` uses `collision_distance_chunks = 3` and
+`collision_subsample_stride = 2`.
 
 ### Controls
 
