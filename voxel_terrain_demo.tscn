@@ -36,6 +36,7 @@ shadow_enabled = true
 [node name="VoxelTerrain3D" type="VoxelTerrain3D" parent="." unique_id=1732306372]
 view_distance_chunks = 6
 prefetch_distance_chunks = 2
+collision_distance_chunks = 0
 world_height_chunks = 6
 terrain_material = SubResource("ShaderMaterial_Terrain")
 

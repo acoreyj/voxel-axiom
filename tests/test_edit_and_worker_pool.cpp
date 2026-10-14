@@ -18,6 +18,7 @@ using voxel::ChunkStore;
 using voxel::CompletionKind;
 using voxel::CoreWorkerPool;
 using voxel::DualDirtyScheduler;
+using voxel::EditOperation;
 using voxel::EditTransaction;
 using voxel::LocalCoord;
 using voxel::MemoryLedger;
@@ -294,6 +295,134 @@ void test_worker_pool_concurrent_execution_and_teardown() {
                 edit_completions, mesh_completions);
 }
 
+// ============================================================================
+// 5. Add-Terrain (Fill) CSG Union Semantics
+// ============================================================================
+void test_fill_add_terrain_union_semantics() {
+    ++g_tests_run;
+
+    MemoryLedger ledger;
+    ChunkStore store(ledger, /*world_height_chunks=*/8);
+    DualDirtyScheduler scheduler;
+
+    const Vec3f center{16.0f, 16.0f, 16.0f};
+    const float radius = 10.0f;
+    const float delta = 2.0f;
+
+    EditTransaction tx = EditTransaction::create_from_spheres(
+        {SphereCsgTerm{center, radius}}, delta, /*world_height_chunks=*/8, EditOperation::Fill);
+    REQUIRE(tx.operation == EditOperation::Fill);
+
+    while (!tx.is_finished()) {
+        (void)execute_next_edit_phase(store, scheduler, tx);
+    }
+
+    const ChunkSlot* slot = store.find_slot(ChunkKey::from_coords(0, 0, 0));
+    REQUIRE(slot != nullptr);
+
+    // Deep inside the added sphere the sample must be solid (fill, not carve).
+    REQUIRE(slot->get_tsdf(LocalCoord{16, 16, 16}) == TsdfFormat::kClampedSolid);
+    REQUIRE(slot->get_tsdf(LocalCoord{12, 16, 16}) < 0);
+
+    // Air-side shell in [R, R+delta): smooth positive TSDF matching ||p-c|| - R.
+    std::size_t shell_samples_verified = 0;
+    for (int32_t pz = 0; pz < 32; ++pz) {
+        for (int32_t py = 0; py < 32; ++py) {
+            for (int32_t px = 0; px < 32; ++px) {
+                const float dx = static_cast<float>(px) - center.x;
+                const float dy = static_cast<float>(py) - center.y;
+                const float dz = static_cast<float>(pz) - center.z;
+                const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+                if (dist >= radius && dist < radius + delta) {
+                    const int16_t actual_q = slot->get_tsdf(LocalCoord{px, py, pz});
+                    const int16_t expected_q = TsdfFormat::encode(dist - radius, delta);
+                    REQUIRE(actual_q == expected_q);
+                    ++shell_samples_verified;
+                } else if (dist >= radius + delta + 1.0f) {
+                    // Beyond the influence window the chunk must remain untouched air.
+                    REQUIRE(slot->get_tsdf(LocalCoord{px, py, pz}) == TsdfFormat::kClampedAir);
+                }
+            }
+        }
+    }
+    REQUIRE(shell_samples_verified > 500ULL);
+
+    // Adding inside deep solid material is a no-op: no revision bump, no dirty chunks.
+    MemoryLedger solid_ledger;
+    ChunkStore solid_store(solid_ledger, /*world_height_chunks=*/8);
+    DualDirtyScheduler solid_scheduler;
+    const ChunkKey ck = ChunkKey::from_coords(0, 0, 0);
+    ChunkSlot* solid_slot = solid_store.get_or_create_slot(ck);
+    {
+        std::unique_lock<std::shared_mutex> lock(solid_slot->mutex);
+        solid_slot->reset_to_uniform(ChunkStorageForm::Solid, 1, solid_store.tsdf_pool(),
+                                     solid_store.material_pool());
+        solid_slot->state = ChunkLifecycleState::Resident;
+        solid_slot->version.store(1, std::memory_order_release);
+    }
+
+    EditTransaction noop_tx = EditTransaction::create_from_spheres(
+        {SphereCsgTerm{Vec3f{16.0f, 16.0f, 16.0f}, 4.0f}}, delta,
+        /*world_height_chunks=*/8, EditOperation::Fill);
+    while (!noop_tx.is_finished()) {
+        (void)execute_next_edit_phase(solid_store, solid_scheduler, noop_tx);
+    }
+    REQUIRE(solid_store.terrain_revision() == 0ULL);
+    REQUIRE(solid_scheduler.edit_dirty_count() == 0ULL);
+
+    std::printf("[PASS] test_fill_add_terrain_union_semantics (%zu shell samples verified, no-op inside solid)\n",
+                shell_samples_verified);
+}
+
+// ============================================================================
+// 6. Fill and Carve Transactions Stay Distinct Through the Worker Pool
+// ============================================================================
+void test_fill_and_carve_do_not_coalesce() {
+    ++g_tests_run;
+
+    MemoryLedger ledger;
+    ChunkStore store(ledger, /*world_height_chunks=*/8);
+    DualDirtyScheduler scheduler;
+
+    CoreWorkerPool pool(store, scheduler);
+    pool.start(/*num_workers=*/2);
+
+    REQUIRE(pool.enqueue_explosion(Vec3f{16.0f, 16.0f, 16.0f}, 4.0f));
+    REQUIRE(pool.enqueue_fill_spheres(Vec3f{48.0f, 16.0f, 16.0f}, 4.0f));
+
+    std::size_t carve_completions = 0;
+    std::size_t fill_completions = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        while (auto rec = pool.try_pop_completion()) {
+            if (rec->kind == CompletionKind::EditTransactionCompleted) {
+                if (rec->edit_transaction.operation == EditOperation::Fill) {
+                    ++fill_completions;
+                    REQUIRE(rec->edit_transaction.radius == 4.0f);
+                    REQUIRE(rec->edit_transaction.position.x == 48.0f);
+                } else {
+                    ++carve_completions;
+                }
+            }
+        }
+        if (pool.core_idle() && pool.completion_queue_depth() == 0 &&
+            carve_completions >= 1ULL && fill_completions >= 1ULL) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    REQUIRE(carve_completions == 1ULL);
+    REQUIRE(fill_completions == 1ULL);
+
+    pool.shutdown(/*save=*/false);
+    REQUIRE(ledger.total_reserved_bytes() == 0ULL);
+
+    std::printf("[PASS] test_fill_and_carve_do_not_coalesce (1 carve + 1 fill transaction, 0 B leaked)\n");
+}
+
 } // namespace
 
 int main() {
@@ -302,6 +431,8 @@ int main() {
     test_r_plus_delta_crater_wall_continuity();
     test_anti_crumb_kernel();
     test_worker_pool_concurrent_execution_and_teardown();
+    test_fill_add_terrain_union_semantics();
+    test_fill_and_carve_do_not_coalesce();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",
                 g_tests_run, g_assertions_checked);
     return EXIT_SUCCESS;

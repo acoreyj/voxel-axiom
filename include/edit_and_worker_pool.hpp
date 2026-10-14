@@ -62,6 +62,11 @@ struct SphereCsgTerm {
     float radius = 0.0f;
 };
 
+enum class EditOperation : uint8_t {
+    Carve = 0,
+    Fill = 1
+};
+
 /// Builds a phased explosion EditTransaction with expanded R + delta influence bounds,
 /// partitioned into phases of at most 32 canonical chunks (Sections 3.2, 3.5.1).
 struct EditTransaction {
@@ -69,6 +74,7 @@ struct EditTransaction {
     static constexpr std::size_t kMaxPhaseChunks = ChunkStore::kMaxEditPhaseCoreChunks; // 32
 
     std::vector<SphereCsgTerm> spheres;
+    EditOperation operation = EditOperation::Carve;
     float truncation_delta = TsdfFormat::kDefaultTruncationDelta;
 
     IVec3 sample_min{};
@@ -84,10 +90,12 @@ struct EditTransaction {
     [[nodiscard]] static EditTransaction create_from_spheres(
         std::vector<SphereCsgTerm> terms,
         float delta = TsdfFormat::kDefaultTruncationDelta,
-        int32_t world_height_chunks = 8) {
+        int32_t world_height_chunks = 8,
+        EditOperation operation = EditOperation::Carve) {
         assert(!terms.empty() && terms.size() <= kMaxCoalescedSpheres);
         EditTransaction tx;
         tx.spheres = std::move(terms);
+        tx.operation = operation;
         tx.truncation_delta = delta;
 
         int32_t min_x = INT32_MAX, min_y = INT32_MAX, min_z = INT32_MAX;
@@ -175,6 +183,7 @@ struct ChunkMeshPayload {
 struct EditTransactionCompletedPayload {
     Vec3f position{};
     float radius = 0.0f;
+    EditOperation operation = EditOperation::Carve;
     uint64_t terrain_revision = 0;
     std::size_t total_affected_chunks = 0;
     std::vector<ChunkKey> dirtied_chunks;
@@ -189,26 +198,66 @@ struct CompletionRecord {
 };
 
 // ============================================================================
-// 4. Phased CSG Executor & 3x3x3 Anti-Crumb Kernel (Section 3.5.1)
+// 4. 26-Neighbor Closure Readiness Check & Phased CSG Executor
 // ============================================================================
+
+[[nodiscard]] inline bool are_all_in_bounds_neighbors_resident(
+    const ChunkStore& store,
+    ChunkKey center) noexcept {
+    const int32_t world_h = store.world_height_chunks();
+    for (int32_t dz = -1; dz <= 1; ++dz) {
+        for (int32_t dy = -1; dy <= 1; ++dy) {
+            const int32_t ny = center.y() + dy;
+            if (ny < 0 || ny >= world_h) {
+                continue;
+            }
+            for (int32_t dx = -1; dx <= 1; ++dx) {
+                const ChunkKey nk = center.offset(dx, dy, dz);
+                const ChunkSlot* slot = store.find_slot(nk);
+                if (!slot || slot->state != ChunkLifecycleState::Resident) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
     ChunkStore& store,
     DualDirtyScheduler& dirty_scheduler,
-    EditTransaction& tx) {
+    EditTransaction& tx,
+    const std::function<void(ChunkStore&, ChunkKey)>& generate_fn = {}) {
 
     assert(!tx.is_finished());
     const std::size_t phase_idx = tx.next_phase_index++;
     const std::vector<ChunkKey>& phase_keys = tx.phases[phase_idx];
+    const bool additive = (tx.operation == EditOperation::Fill);
 
     if (!phase_keys.empty()) {
+        const ChunkStorageForm seed_form = (tx.operation == EditOperation::Fill)
+                                               ? ChunkStorageForm::Empty
+                                               : ChunkStorageForm::Solid;
         for (const ChunkKey ck : phase_keys) {
             ChunkSlot* slot = store.get_or_create_slot(ck);
-            std::unique_lock<std::shared_mutex> init_lock(slot->mutex);
-            if (slot->state == ChunkLifecycleState::Absent ||
-                slot->state == ChunkLifecycleState::Requested) {
-                slot->reset_to_uniform(ChunkStorageForm::Solid, 1, store.tsdf_pool(), store.material_pool());
-                slot->version.store(1, std::memory_order_release);
-                slot->state = ChunkLifecycleState::Resident;
+            bool needs_init = false;
+            {
+                std::shared_lock<std::shared_mutex> read_lock(slot->mutex);
+                needs_init = (slot->state == ChunkLifecycleState::Absent ||
+                              slot->state == ChunkLifecycleState::Requested);
+            }
+            if (needs_init) {
+                if (generate_fn) {
+                    generate_fn(store, ck);
+                } else {
+                    std::unique_lock<std::shared_mutex> init_lock(slot->mutex);
+                    if (slot->state == ChunkLifecycleState::Absent ||
+                        slot->state == ChunkLifecycleState::Requested) {
+                        slot->reset_to_uniform(seed_form, 1, store.tsdf_pool(), store.material_pool());
+                        slot->version.store(1, std::memory_order_release);
+                        slot->state = ChunkLifecycleState::Resident;
+                    }
+                }
             }
         }
 
@@ -219,7 +268,7 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
         const float delta = tx.truncation_delta;
 
         for (ChunkSlot* slot : phase_lock.slots()) {
-            if (slot->form == ChunkStorageForm::Empty) {
+            if (!additive && slot->form == ChunkStorageForm::Empty) {
                 continue;
             }
 
@@ -252,10 +301,13 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                         }
 
                         if (d_blast > -delta) {
-                            const int16_t q_blast = TsdfFormat::encode(d_blast, delta);
+                            const int16_t q_blast = additive
+                                                        ? TsdfFormat::encode(-d_blast, delta)
+                                                        : TsdfFormat::encode(d_blast, delta);
                             const LocalCoord lc{lx, ly, lz};
                             const int16_t q_cur = slot->get_tsdf(lc);
-                            const int16_t q_new = std::max(q_cur, q_blast);
+                            const int16_t q_new = additive ? std::min(q_cur, q_blast)
+                                                           : std::max(q_cur, q_blast);
 
                             if (q_new != q_cur) {
                                 bool changed = false;
@@ -284,50 +336,52 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
         return std::nullopt;
     }
 
-    for (auto& [ck, dirty_mask] : tx.modified_chunk_masks) {
-        ChunkSlot* slot = store.find_slot(ck);
-        if (!slot) {
-            continue;
-        }
-        std::unique_lock<std::shared_mutex> lock(slot->mutex);
-        if (slot->form != ChunkStorageForm::Dense) {
-            continue;
-        }
+    if (!additive) {
+        for (auto& [ck, dirty_mask] : tx.modified_chunk_masks) {
+            ChunkSlot* slot = store.find_slot(ck);
+            if (!slot) {
+                continue;
+            }
+            std::unique_lock<std::shared_mutex> lock(slot->mutex);
+            if (slot->form != ChunkStorageForm::Dense) {
+                continue;
+            }
 
-        std::vector<LocalCoord> crumbs_to_prune;
-        for (int32_t lz = 0; lz < 32; ++lz) {
-            for (int32_t ly = 0; ly < 32; ++ly) {
-                for (int32_t lx = 0; lx < 32; ++lx) {
-                    const LocalCoord lc{lx, ly, lz};
-                    const int16_t q = slot->get_tsdf(lc);
-                    if (q > TsdfFormat::kClampedSolid && q < 0) {
-                        auto sample_at = [&](int32_t nx, int32_t ny, int32_t nz) -> int16_t {
-                            if (nx >= 0 && nx < 32 && ny >= 0 && ny < 32 && nz >= 0 && nz < 32) {
-                                return slot->get_tsdf(LocalCoord{nx, ny, nz});
+            std::vector<LocalCoord> crumbs_to_prune;
+            for (int32_t lz = 0; lz < 32; ++lz) {
+                for (int32_t ly = 0; ly < 32; ++ly) {
+                    for (int32_t lx = 0; lx < 32; ++lx) {
+                        const LocalCoord lc{lx, ly, lz};
+                        const int16_t q = slot->get_tsdf(lc);
+                        if (q > TsdfFormat::kClampedSolid && q < 0) {
+                            auto sample_at = [&](int32_t nx, int32_t ny, int32_t nz) -> int16_t {
+                                if (nx >= 0 && nx < 32 && ny >= 0 && ny < 32 && nz >= 0 && nz < 32) {
+                                    return slot->get_tsdf(LocalCoord{nx, ny, nz});
+                                }
+                                return -1;
+                            };
+
+                            if (sample_at(lx - 1, ly, lz) >= 0 &&
+                                sample_at(lx + 1, ly, lz) >= 0 &&
+                                sample_at(lx, ly - 1, lz) >= 0 &&
+                                sample_at(lx, ly + 1, lz) >= 0 &&
+                                sample_at(lx, ly, lz - 1) >= 0 &&
+                                sample_at(lx, ly, lz + 1) >= 0) {
+                                crumbs_to_prune.push_back(lc);
                             }
-                            return -1;
-                        };
-
-                        if (sample_at(lx - 1, ly, lz) >= 0 &&
-                            sample_at(lx + 1, ly, lz) >= 0 &&
-                            sample_at(lx, ly - 1, lz) >= 0 &&
-                            sample_at(lx, ly + 1, lz) >= 0 &&
-                            sample_at(lx, ly, lz - 1) >= 0 &&
-                            sample_at(lx, ly, lz + 1) >= 0) {
-                            crumbs_to_prune.push_back(lc);
                         }
                     }
                 }
             }
-        }
 
-        if (!crumbs_to_prune.empty()) {
-            for (const LocalCoord& lc : crumbs_to_prune) {
-                (void)slot->set_tsdf(lc, TsdfFormat::kClampedAir, store.tsdf_pool());
-                dirty_mask.record_mutated_sample(lc);
+            if (!crumbs_to_prune.empty()) {
+                for (const LocalCoord& lc : crumbs_to_prune) {
+                    (void)slot->set_tsdf(lc, TsdfFormat::kClampedAir, store.tsdf_pool());
+                    dirty_mask.record_mutated_sample(lc);
+                }
+                slot->try_demote_if_uniform(store.tsdf_pool(), store.material_pool());
+                slot->version.fetch_add(1, std::memory_order_release);
             }
-            slot->try_demote_if_uniform(store.tsdf_pool(), store.material_pool());
-            slot->version.fetch_add(1, std::memory_order_release);
         }
     }
 
@@ -347,6 +401,26 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
         }
         deduplicated_dirty.assign(unique_dirty.begin(), unique_dirty.end());
         std::sort(deduplicated_dirty.begin(), deduplicated_dirty.end());
+
+        if (generate_fn) {
+            const int32_t world_h = store.world_height_chunks();
+            for (const ChunkKey dk : deduplicated_dirty) {
+                for (int32_t dz = -1; dz <= 1; ++dz) {
+                    for (int32_t dy = -1; dy <= 1; ++dy) {
+                        const int32_t ny = dk.y() + dy;
+                        if (ny < 0 || ny >= world_h) continue;
+                        for (int32_t dx = -1; dx <= 1; ++dx) {
+                            const ChunkKey nk = dk.offset(dx, dy, dz);
+                            const ChunkSlot* nslot = store.find_slot(nk);
+                            if (!nslot || nslot->state != ChunkLifecycleState::Resident) {
+                                generate_fn(store, nk);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         dirty_scheduler.publish_edit_transaction_dirty_batch(deduplicated_dirty);
     }
 
@@ -355,6 +429,7 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
         payload.position = tx.spheres.front().center;
         payload.radius = tx.spheres.front().radius;
     }
+    payload.operation = tx.operation;
     payload.terrain_revision = new_revision;
     payload.total_affected_chunks = tx.modified_chunk_masks.size();
     payload.dirtied_chunks = std::move(deduplicated_dirty);
@@ -364,7 +439,7 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
 }
 
 // ============================================================================
-// 5. Core Worker Pool with Background Generate & Load Lanes (Sections 3.4, 5.3)
+// 5. Core Worker Pool with 26-Neighbor Closure Gating (Sections 3.3, 3.4, 5.3)
 // ============================================================================
 class CoreWorkerPool {
 public:
@@ -423,10 +498,12 @@ public:
         }
     }
 
-    /// Enqueues background procedural generation for chunk `key` without blocking main thread.
     void request_background_generate(ChunkKey key, bool in_active_set) {
         {
             std::lock_guard<std::mutex> lock(generate_mutex_);
+            if (in_active_set) {
+                awaiting_closure_mesh_set_.insert(key);
+            }
             if (pending_generate_set_.find(key) == pending_generate_set_.end()) {
                 pending_generate_set_.insert(key);
                 generate_queue_.push_back(GenerateRequest{key, in_active_set});
@@ -435,39 +512,21 @@ public:
         cv_.notify_one();
     }
 
-    [[nodiscard]] bool enqueue_explosion(Vec3f position, float radius) {
-        if (radius <= 0.0f ||
-            !running_.load(std::memory_order_acquire) ||
-            shutting_down_.load(std::memory_order_acquire)) {
-            return false;
+    void register_awaiting_closure_mesh(ChunkKey key) {
+        if (are_all_in_bounds_neighbors_resident(store_, key)) {
+            dirty_scheduler_.mark_stream_dirty(key);
+            return;
         }
+        std::lock_guard<std::mutex> lock(generate_mutex_);
+        awaiting_closure_mesh_set_.insert(key);
+    }
 
-        {
-            std::lock_guard<std::mutex> lock(queue_mutex_);
-            if (shutting_down_.load(std::memory_order_relaxed)) {
-                return false;
-            }
-            if (!edit_queue_.empty() &&
-                edit_queue_.back().next_phase_index == 0 &&
-                edit_queue_.back().spheres.size() < EditTransaction::kMaxCoalescedSpheres) {
-                std::vector<SphereCsgTerm> combined = edit_queue_.back().spheres;
-                combined.push_back(SphereCsgTerm{position, radius});
-                edit_queue_.back() = EditTransaction::create_from_spheres(
-                    std::move(combined),
-                    TsdfFormat::kDefaultTruncationDelta,
-                    store_.world_height_chunks());
-            } else {
-                if (edit_queue_.size() >= kMaxPendingEditTransactions) {
-                    return false;
-                }
-                edit_queue_.push_back(EditTransaction::create_from_spheres(
-                    {SphereCsgTerm{position, radius}},
-                    TsdfFormat::kDefaultTruncationDelta,
-                    store_.world_height_chunks()));
-            }
-        }
-        cv_.notify_all();
-        return true;
+    [[nodiscard]] bool enqueue_explosion(Vec3f position, float radius) {
+        return enqueue_sphere_transaction(EditOperation::Carve, position, radius);
+    }
+
+    [[nodiscard]] bool enqueue_fill_spheres(Vec3f position, float radius) {
+        return enqueue_sphere_transaction(EditOperation::Fill, position, radius);
     }
 
     [[nodiscard]] std::optional<CompletionRecord> try_pop_completion() {
@@ -538,6 +597,7 @@ public:
             std::lock_guard<std::mutex> lock(generate_mutex_);
             generate_queue_.clear();
             pending_generate_set_.clear();
+            awaiting_closure_mesh_set_.clear();
         }
 
         store_.clear_all();
@@ -551,6 +611,46 @@ private:
         ChunkKey key{};
         bool in_active_set = false;
     };
+
+    [[nodiscard]] bool enqueue_sphere_transaction(EditOperation operation, Vec3f position, float radius) {
+        if (radius <= 0.0f ||
+            !running_.load(std::memory_order_acquire) ||
+            shutting_down_.load(std::memory_order_acquire)) {
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            if (shutting_down_.load(std::memory_order_relaxed)) {
+                return false;
+            }
+            const bool can_coalesce =
+                !edit_queue_.empty() &&
+                edit_queue_.back().next_phase_index == 0 &&
+                edit_queue_.back().operation == operation &&
+                edit_queue_.back().spheres.size() < EditTransaction::kMaxCoalescedSpheres;
+            if (can_coalesce) {
+                std::vector<SphereCsgTerm> combined = edit_queue_.back().spheres;
+                combined.push_back(SphereCsgTerm{position, radius});
+                edit_queue_.back() = EditTransaction::create_from_spheres(
+                    std::move(combined),
+                    TsdfFormat::kDefaultTruncationDelta,
+                    store_.world_height_chunks(),
+                    operation);
+            } else {
+                if (edit_queue_.size() >= kMaxPendingEditTransactions) {
+                    return false;
+                }
+                edit_queue_.push_back(EditTransaction::create_from_spheres(
+                    {SphereCsgTerm{position, radius}},
+                    TsdfFormat::kDefaultTruncationDelta,
+                    store_.world_height_chunks(),
+                    operation));
+            }
+        }
+        cv_.notify_all();
+        return true;
+    }
 
     void push_completion(CompletionRecord rec) {
         if (rec.kind == CompletionKind::ChunkMesh) {
@@ -566,6 +666,32 @@ private:
         std::lock_guard<std::mutex> lock(completion_mutex_);
         completion_queue_.push_back(std::move(rec));
         completion_depth_.store(completion_queue_.size(), std::memory_order_release);
+    }
+
+    void promote_ready_neighbors_to_stream_dirty(ChunkKey generated_key) {
+        std::vector<ChunkKey> newly_ready;
+        {
+            std::lock_guard<std::mutex> lock(generate_mutex_);
+            if (awaiting_closure_mesh_set_.empty()) {
+                return;
+            }
+            for (int32_t dz = -1; dz <= 1; ++dz) {
+                for (int32_t dy = -1; dy <= 1; ++dy) {
+                    for (int32_t dx = -1; dx <= 1; ++dx) {
+                        const ChunkKey candidate = generated_key.offset(dx, dy, dz);
+                        auto it = awaiting_closure_mesh_set_.find(candidate);
+                        if (it != awaiting_closure_mesh_set_.end() &&
+                            are_all_in_bounds_neighbors_resident(store_, candidate)) {
+                            newly_ready.push_back(candidate);
+                            awaiting_closure_mesh_set_.erase(it);
+                        }
+                    }
+                }
+            }
+        }
+        for (const ChunkKey rk : newly_ready) {
+            dirty_scheduler_.mark_stream_dirty(rk);
+        }
     }
 
     void worker_loop() {
@@ -596,7 +722,7 @@ private:
                     std::optional<EditTransactionCompletedPayload> completed_payload;
                     {
                         ScopedTimer timer(stage_timings_, Stage::Edit);
-                        completed_payload = execute_next_edit_phase(store_, dirty_scheduler_, tx);
+                        completed_payload = execute_next_edit_phase(store_, dirty_scheduler_, tx, generate_fn_);
                     }
                     ++consecutive_edit_phases;
 
@@ -621,7 +747,7 @@ private:
                 break;
             }
 
-            // Lane 2: Mesh Jobs (Edit-Dirty first, then Stream-Dirty if depth < 8)
+            // Lane 2: Mesh Jobs (Edit-Dirty first, then closure-complete Stream-Dirty if depth < 8)
             if (!ran_work) {
                 auto maybe_mesh = dirty_scheduler_.try_pop_next_mesh_job(
                     completion_depth_.load(std::memory_order_acquire));
@@ -662,7 +788,7 @@ private:
                 }
             }
 
-            // Lane 3: Background Procedural Generation & Disk Loading (Lowest Priority, Asynchronous)
+            // Lane 3: Background Procedural Generation & Disk Loading (with 26-neighbor closure gate)
             if (!ran_work && generate_fn_) {
                 std::optional<GenerateRequest> gen_req;
                 {
@@ -679,9 +805,7 @@ private:
                         ScopedTimer timer(stage_timings_, Stage::Generate);
                         generate_fn_(store_, gen_req->key);
                     }
-                    if (gen_req->in_active_set) {
-                        dirty_scheduler_.mark_stream_dirty(gen_req->key);
-                    }
+                    promote_ready_neighbors_to_stream_dirty(gen_req->key);
                     active_workers_.fetch_sub(1, std::memory_order_acq_rel);
                     cv_.notify_all();
                     ran_work = true;
@@ -716,6 +840,7 @@ private:
     mutable std::mutex generate_mutex_;
     std::deque<GenerateRequest> generate_queue_;
     std::unordered_set<ChunkKey, ChunkKeyHash> pending_generate_set_;
+    std::unordered_set<ChunkKey, ChunkKeyHash> awaiting_closure_mesh_set_;
 
     mutable std::mutex completion_mutex_;
     std::deque<CompletionRecord> completion_queue_;

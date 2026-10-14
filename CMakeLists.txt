@@ -117,6 +117,7 @@ if(VOXEL_BUILD_TESTS)
     add_voxel_test(test_scratch_and_dirty        tests/test_scratch_and_dirty.cpp)
     add_voxel_test(test_edit_and_worker_pool     tests/test_edit_and_worker_pool.cpp)
     add_voxel_test(test_procgen_and_surface_nets tests/test_procgen_and_surface_nets.cpp)
+    add_voxel_test(test_terrain_raycast          tests/test_terrain_raycast.cpp)
     add_voxel_test(test_persistence_and_streaming tests/test_persistence_and_streaming.cpp)
     add_voxel_test(test_integration_m3_m4        tests/test_integration_m3_m4.cpp)
     add_voxel_test(test_gdextension_bindings

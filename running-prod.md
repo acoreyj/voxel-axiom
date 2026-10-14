@@ -71,6 +71,9 @@ The timestamp on the `…release…` file must be from this build. `GODOTCPP_TAR
 selects the godot-cpp template linked in; `template_release` is what makes this
 a genuine release extension rather than a release-compiled debug one.
 
+`run-prod.ps1` performs this check-and-build automatically before every launch
+(see [Fast iteration](#fast-iteration-run-prodps1)).
+
 ---
 
 ## Step 2 — Install the export templates
@@ -130,21 +133,30 @@ Godot has no "run in release" editor mode. To iterate against a release run
 without re-exporting each time, use the launcher:
 
 ```powershell
-.\run-prod.ps1                        # release template, live project folder
+.\run-prod.ps1                        # rebuild if stale, then run
 .\run-prod.ps1 --resolution 1600x900  # extra args are forwarded verbatim
+.\run-prod.ps1 -SkipBuild             # launch whatever is in bin/
+.\run-prod.ps1 -ForceBuild            # rebuild even when bin/ looks fresh
 ```
 
-It finds the installed Windows **release** export template
-(`%APPDATA%\Godot\export_templates\<version>\windows_release_x86_64.exe`),
-preferring `-GodotVersion` (default `4.7.2.stable`) and falling back to the
-newest installed version, then runs it with `--path <project root>`. The template
-reads `res://` straight from source, so script/scene edits are picked up with no
-export step.
+**It rebuilds first.** If `include/`, `src/` or `CMakeLists.txt` are newer than
+`bin/libvoxel_engine.windows.release.x86_64.dll` (or the DLL is missing), it
+configures `build-release` when necessary and rebuilds it, then copies the fresh
+artifact into `bin/`. The loaded engine always matches the sources.
 
-This is closer to the shipped build than F5, but not identical to Step 3: the
-release tag disables engine `assert()`s and the `debug` branch of feature checks,
-so run it before shipping to catch bugs F5 hides. The GDExtension DLL is already
-the release binary in both slots, so the native engine cost is unchanged.
+**Then it launches**, preferring the installed Windows **release** export
+template (`%APPDATA%\Godot\export_templates\<version>\windows_release_x86_64.exe`,
+`-GodotVersion` default `4.7.2.stable`, else the newest installed version). Official
+templates are compiled with `disable_path_overrides=yes` and reject `--path`, so on
+stock installs the launcher detects that and falls back to the installed editor
+binary with `--path` (`-EditorExe` overrides discovery). The template reads
+`res://` straight from source, so script/scene edits are picked up with no export
+step.
+
+A run through the template is closer to the shipped build than F5 (the release tag
+disables engine `assert()`s and the `debug` branch of feature checks); a true
+release run remains a full export (Step 3). The GDExtension DLL is already the
+release binary in both slots, so the native engine cost is unchanged.
 
 ---
 

@@ -193,6 +193,37 @@ void test_gdextension_streaming_explosion_and_nav_lifecycle() {
     REQUIRE(saw_explosion_completed);
     REQUIRE(saw_chunk_committed);
 
+    // 5d. Invalid add-terrain radius (<= 0) must emit terrain_add_failed immediately.
+    terrain.add_terrain(Vector3(16.0f, 48.0f, 16.0f), -1.0f);
+    REQUIRE(terrain.emitted_signals().back().name == "terrain_add_failed");
+
+    // 5e. Valid add-terrain fills the previously carved crater back in.
+    terrain.add_terrain(Vector3(16.0f, 48.0f, 16.0f), 6.0f);
+    REQUIRE(terrain.emitted_signals().back().name == "terrain_add_requested");
+
+    const auto fill_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (std::chrono::steady_clock::now() < fill_deadline) {
+        terrain._process(0.016);
+        terrain.get_navigation_manager().complete_in_flight_async_bakes_and_advance_map_iteration();
+        terrain._process(0.016);
+        if (terrain.fully_committed()) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    REQUIRE(terrain.core_idle());
+    REQUIRE(terrain.fully_committed());
+
+    bool saw_terrain_add_completed = false;
+    for (const auto& sig : terrain.emitted_signals()) {
+        if (sig.name == "terrain_add_completed") {
+            saw_terrain_add_completed = true;
+            REQUIRE(sig.affected_chunks > 0);
+        }
+    }
+    REQUIRE(saw_terrain_add_completed);
+
     // 6. Ordered teardown via _exit_tree().
     terrain._exit_tree();
     uninitialize_voxel_module(MODULE_INITIALIZATION_LEVEL_SCENE);

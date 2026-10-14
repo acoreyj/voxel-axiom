@@ -787,22 +787,16 @@ public:
             }
         }
 
-        // 2. Dispatch background generation / loading on worker threads without blocking main thread.
+        // 2. Dispatch background generation / loading on worker threads and gate active meshing
+        //    on 26-neighbor closure residency so no chunk ever meshes against Absent neighbors!
         for (const CandidateChunk& cand : candidates) {
-            if (tracked_resident_.find(cand.key) != tracked_resident_.end()) {
-                if (cand.in_active_set && meshed_active_.find(cand.key) == meshed_active_.end()) {
-                    meshed_active_.insert(cand.key);
-                    dirty_scheduler_.mark_stream_dirty(cand.key);
-                }
-                continue;
-            }
             ChunkSlot* slot = store_.find_slot(cand.key);
             const bool is_resident = (slot != nullptr && slot->state == ChunkLifecycleState::Resident);
             if (is_resident) {
                 tracked_resident_.insert(cand.key);
                 if (cand.in_active_set && meshed_active_.find(cand.key) == meshed_active_.end()) {
                     meshed_active_.insert(cand.key);
-                    dirty_scheduler_.mark_stream_dirty(cand.key);
+                    worker_pool_.register_awaiting_closure_mesh(cand.key);
                 }
             } else if (requested_chunks_.find(cand.key) == requested_chunks_.end()) {
                 requested_chunks_.insert(cand.key);
@@ -810,6 +804,10 @@ public:
                     meshed_active_.insert(cand.key);
                 }
                 worker_pool_.request_background_generate(cand.key, cand.in_active_set);
+            } else if (cand.in_active_set && meshed_active_.find(cand.key) == meshed_active_.end()) {
+                // Previously requested as a closure/prefetch shell chunk, now promoted into active set!
+                meshed_active_.insert(cand.key);
+                worker_pool_.register_awaiting_closure_mesh(cand.key);
             }
         }
 

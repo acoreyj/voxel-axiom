@@ -54,6 +54,7 @@ public:
 
     // Core GDScript-exposed API (Section 4.2)
     void trigger_explosion(Vector3 p_position, float p_radius);
+    void add_terrain(Vector3 p_position, float p_radius);
     void save_world();
     void set_stream_focus(Vector3 p_position, Vector3 p_velocity);
     [[nodiscard]] bool core_idle() const;

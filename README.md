@@ -302,9 +302,41 @@ The shipped `voxel_terrain_demo.tscn` uses `collision_distance_chunks = 3` and
 | **Ctrl / Q** | Fly downward |
 | **Shift** (Hold) | Sprint speed boost ($3\times$) |
 | **Mouse Motion** | Look around (first-person pitch/yaw) |
-| **Left Click** | Fire real-time CSG sphere crater explosion |
+| **1 … 5** | Select terrain tool: Add terrain / Explode / Large explode / Paint terrain / Paint delete |
+| **Left Click** | Apply the active tool at the crosshair (hit point, or 24 m ahead when aiming at the sky) |
+| **Left Click** (Hold) | Tools 4 and 5 stream terrain additions / deletions along the drag path |
 | **Right Click** | Query 3D cave navigation path for AI companion |
 | **Escape** | Toggle mouse capture |
+
+### Terrain Tools
+
+Keys `1 … 5` select the active tool (shown in the HUD). `1` adds a sphere of new
+terrain, `2` and `3` carve a crater at two radii, and `4` / `5` are
+hold-and-drag brushes that continuously add or remove terrain along the sweep.
+Each tool's radius is an exported knob on the demo controller, tunable live in
+the Inspector:
+
+| Export | Default | Used by |
+| --- | --- | --- |
+| `add_radius` | `6.0` | Tool 1 (Add terrain) |
+| `explosion_radius` | `8.5` | Tool 2 (Explode) |
+| `large_explosion_radius` | `18.0` | Tool 3 (Large explode) |
+| `paint_radius` | `3.5` | Tool 4 (Paint terrain, drag-add) |
+| `paint_delete_radius` | `3.5` | Tool 5 (Paint delete, drag-erase) |
+| `brush_spacing_factor` | `0.6` | Drag-brush step distance (`radius x factor`) |
+| `brush_interval` | `0.05` | Minimum seconds between drag-brush steps |
+
+Both operations are asynchronous CSG sphere edits on the native engine and never
+block the main thread. From GDScript:
+
+```gdscript
+$VoxelTerrain3D.trigger_explosion(Vector3(16, 70, 16), 8.5)  # carve
+$VoxelTerrain3D.add_terrain(Vector3(16, 70, 16), 6.0)        # add
+```
+
+`trigger_explosion` reports through `explosion_requested` / `explosion_completed`
+/ `explosion_failed`; `add_terrain` mirrors those with `terrain_add_requested` /
+`terrain_add_completed` / `terrain_add_failed`.
 
 ---
 
@@ -321,7 +353,7 @@ visible instead of being hidden by an average.
 | `mesh` | $36^3$ scratch gather + Surface Nets meshing (worker lane 2) |
 | `commit` | Main-thread mesh upload + collision + navigation submission |
 | `stream_focus` | `StreamingManager::update_stream_focus` |
-| `edit` | CSG explosion carve phase execution (worker lane 1) |
+| `edit` | CSG sphere edit phase execution (carve / add, worker lane 1) |
 | `navigation` | Navigation path / distance query (`VoxelAICompanion.get_voxel_path`) |
 
 Each active stage reports `xN total T ms max M ms avg A ms`:
@@ -367,7 +399,7 @@ hosts redirect the output (tests capture it instead of printing).
 ├── CMakeLists.txt                # Root CMake build configuration
 ├── project.godot                 # Godot engine project definition
 ├── run_all_tests.sh              # Standalone test runner with ASan/TSan
-├── terrain_demo.gd               # Demo controller script (free-cam, explosion, nav queries)
+├── terrain_demo.gd               # Demo controller script (free-cam, terrain tools, nav queries)
 ├── voxel_engine.gdextension      # GDExtension library definition file
 ├── voxel_terrain_demo.tscn       # Main 3D test scene (caves enabled)
 ├── voxel_terrain_no_caves_demo.tscn # Variant scene with `generate_caves = false`

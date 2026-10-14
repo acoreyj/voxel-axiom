@@ -33,6 +33,7 @@ uint64_t monotonic_ticks_usec() noexcept {
 void VoxelTerrain3D::_bind_methods() {
 #if defined(VOXEL_WITH_GODOT_CPP)
     ClassDB::bind_method(D_METHOD("trigger_explosion", "position", "radius"), &VoxelTerrain3D::trigger_explosion);
+    ClassDB::bind_method(D_METHOD("add_terrain", "position", "radius"), &VoxelTerrain3D::add_terrain);
     ClassDB::bind_method(D_METHOD("save_world"), &VoxelTerrain3D::save_world);
     ClassDB::bind_method(D_METHOD("set_stream_focus", "position", "velocity"), &VoxelTerrain3D::set_stream_focus);
     ClassDB::bind_method(D_METHOD("core_idle"), &VoxelTerrain3D::core_idle);
@@ -92,6 +93,15 @@ void VoxelTerrain3D::_bind_methods() {
         PropertyInfo(Variant::FLOAT, "radius"),
         PropertyInfo(Variant::INT, "affected_chunks")));
     ADD_SIGNAL(MethodInfo("explosion_failed",
+        PropertyInfo(Variant::STRING, "reason")));
+    ADD_SIGNAL(MethodInfo("terrain_add_requested",
+        PropertyInfo(Variant::VECTOR3, "position"),
+        PropertyInfo(Variant::FLOAT, "radius")));
+    ADD_SIGNAL(MethodInfo("terrain_add_completed",
+        PropertyInfo(Variant::VECTOR3, "position"),
+        PropertyInfo(Variant::FLOAT, "radius"),
+        PropertyInfo(Variant::INT, "affected_chunks")));
+    ADD_SIGNAL(MethodInfo("terrain_add_failed",
         PropertyInfo(Variant::STRING, "reason")));
     ADD_SIGNAL(MethodInfo("chunk_committed",
         PropertyInfo(Variant::INT, "chunk_key")));
@@ -292,6 +302,35 @@ void VoxelTerrain3D::trigger_explosion(Vector3 p_position, float p_radius) {
     }
 }
 
+void VoxelTerrain3D::add_terrain(Vector3 p_position, float p_radius) {
+    if (!core_engine || p_radius <= 0.0f) {
+        const std::string reason = "engine not ready or radius is non-positive";
+#if defined(VOXEL_WITH_GODOT_CPP)
+        emit_signal("terrain_add_failed", String(reason.c_str()));
+#else
+        emitted_signals_.push_back(EmittedSignalRecord{"terrain_add_failed", {}, 0.0f, 0, reason, 0});
+#endif
+        return;
+    }
+
+    const voxel::Vec3f native_pos{p_position.x, p_position.y, p_position.z};
+    if (core_engine->worker_pool->enqueue_fill_spheres(native_pos, p_radius)) {
+#if defined(VOXEL_WITH_GODOT_CPP)
+        emit_signal("terrain_add_requested", p_position, p_radius);
+#else
+        emitted_signals_.push_back(
+            EmittedSignalRecord{"terrain_add_requested", p_position, p_radius, 0, {}, 0});
+#endif
+    } else {
+        const std::string reason = "edit queue full, engine shutting down, or out of bounds";
+#if defined(VOXEL_WITH_GODOT_CPP)
+        emit_signal("terrain_add_failed", String(reason.c_str()));
+#else
+        emitted_signals_.push_back(EmittedSignalRecord{"terrain_add_failed", {}, 0.0f, 0, reason, 0});
+#endif
+    }
+}
+
 void VoxelTerrain3D::save_world() {
     if (core_engine && core_engine->save_manager) {
         core_engine->save_manager->flush_all_dirty_regions();
@@ -405,11 +444,15 @@ void VoxelTerrain3D::_process(double /*delta*/) {
                                   done->edit_transaction.position.z);
                 const int affected =
                     static_cast<int>(done->edit_transaction.total_affected_chunks);
+                const bool is_fill =
+                    (done->edit_transaction.operation == voxel::EditOperation::Fill);
 #if defined(VOXEL_WITH_GODOT_CPP)
-                emit_signal("explosion_completed", pos, done->edit_transaction.radius, affected);
+                emit_signal(is_fill ? "terrain_add_completed" : "explosion_completed",
+                            pos, done->edit_transaction.radius, affected);
 #else
                 emitted_signals_.push_back(EmittedSignalRecord{
-                    "explosion_completed", pos, done->edit_transaction.radius, affected, {}, 0});
+                    is_fill ? "terrain_add_completed" : "explosion_completed",
+                    pos, done->edit_transaction.radius, affected, {}, 0});
 #endif
                 break;
             }
