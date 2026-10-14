@@ -62,12 +62,22 @@ if(VOXEL_BUILD_GDEXTENSION)
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
 
+    # The library Godot loads is chosen by the `debug`/`release` feature tag, not
+    # the CMake config: the editor and debug runs always use the `debug` slot.
+    # Name the artifact after the godot-cpp target so it lands in the slot that
+    # will actually be loaded.
+    if(GODOTCPP_TARGET STREQUAL "template_debug")
+        set(VOXEL_LIB_SUFFIX "debug")
+    else()
+        set(VOXEL_LIB_SUFFIX "release")
+    endif()
+
     if(WIN32)
         add_custom_command(TARGET voxel_engine POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_SOURCE_DIR}/bin"
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "$<TARGET_FILE:voxel_engine>"
-                "${CMAKE_CURRENT_SOURCE_DIR}/bin/$<IF:$<CONFIG:Debug>,libvoxel_engine.windows.debug.x86_64.dll,libvoxel_engine.windows.release.x86_64.dll>"
+                "${CMAKE_CURRENT_SOURCE_DIR}/bin/libvoxel_engine.windows.${VOXEL_LIB_SUFFIX}.x86_64.dll"
         )
     endif()
 endif()
