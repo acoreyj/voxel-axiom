@@ -262,6 +262,29 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
             }
         }
 
+        auto eval_carve_spheres = [&](float px, float py, float pz, int* out_interior_hits) noexcept -> float {
+            float d_blast = -1e30f;
+            int hits = 0;
+            for (const SphereCsgTerm& s : tx.spheres) {
+                if (s.is_fill) continue;
+                const float dx = px - s.center.x;
+                const float dy = py - s.center.y;
+                const float dz = pz - s.center.z;
+                const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+                const float d = s.radius - dist;
+                d_blast = std::max(d_blast, d);
+                // Strictly count hits inside the sphere radius R (d >= 0.0f) for damage,
+                // NEVER in the outer (-delta, 0) TSDF wall smoothing band.
+                if (d >= 0.0f) {
+                    ++hits;
+                }
+            }
+            if (out_interior_hits) {
+                *out_interior_hits = hits;
+            }
+            return d_blast;
+        };
+
         for (ChunkSlot* slot : phase_lock.slots()) {
             if (slot->form == ChunkStorageForm::Empty && !has_any_fill) {
                 continue;
@@ -279,6 +302,15 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
             bool chunk_modified = false;
             SelectiveDirtyMask local_dirty_mask{};
 
+            // Per-voxel mask of hard-rock samples in this chunk that reached break_threshold (255)
+            // on this transaction. Using a per-voxel mask instead of a sphere-wide boolean ensures
+            // that when a 3rd click partially overlaps a 2-hit region, ONLY the 3-hit intersection
+            // carves to air while the 1-hit and 2-hit parts of the 3rd click stay solid.
+            std::array<uint8_t, TsdfFormat::kChunkSamples> hard_rock_carved{};
+            bool any_hard_rock_carved = false;
+
+            // Pass 1: Apply fills, carve soft terrain immediately, and accumulate per-voxel hard-rock
+            // damage strictly inside d >= 0.0f (radius R).
             for (int32_t lz = lz0; lz <= lz1; ++lz) {
                 const float pz = static_cast<float>(chunk_min.z + lz);
                 for (int32_t ly = ly0; ly <= ly1; ++ly) {
@@ -323,7 +355,6 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                             if (d_fill_min <= 0.0f) {
                                 (void)slot->set_material(lc, chosen_fill_mat, store.material_pool());
                             }
-                            // Fill path MUST reset any stale damage so re-placed dirt never inherits cracks
                             if (slot->clear_damage(lc)) {
                                 chunk_modified = true;
                                 local_dirty_mask.record_mutated_sample(lc);
@@ -331,22 +362,8 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                         }
 
                         // 2. Handle Carve / Blast terms
-                        float d_blast = -1e30f;
                         int spheres_hitting_interior = 0;
-                        for (const SphereCsgTerm& s : tx.spheres) {
-                            if (s.is_fill) continue;
-                            const float dx = px - s.center.x;
-                            const float dy = py - s.center.y;
-                            const float dz = pz - s.center.z;
-                            const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
-                            const float d = s.radius - dist;
-                            d_blast = std::max(d_blast, d);
-                            // Only count hits inside the actual blast radius (d >= 0) for damage,
-                            // NOT the outer (-delta, 0) TSDF wall smoothing band.
-                            if (d >= 0.0f) {
-                                ++spheres_hitting_interior;
-                            }
-                        }
+                        const float d_blast = eval_carve_spheres(px, py, pz, &spheres_hitting_interior);
 
                         if (d_blast > -delta) {
                             const int16_t q_cur = slot->get_tsdf(lc);
@@ -380,41 +397,187 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                             }
 
                             // Multi-hit Hard Rock (kMaterialHardRock):
-                            const uint8_t threshold = MaterialHardness::break_threshold(mat_id);
-                            uint8_t total_dmg = slot->get_damage(lc);
+                            // Only samples inside the actual sphere radius (d >= 0.0f) accumulate damage.
                             if (spheres_hitting_interior > 0) {
+                                const uint8_t threshold = MaterialHardness::break_threshold(mat_id);
                                 const uint32_t added_dmg = std::min<uint32_t>(
                                     255U,
                                     static_cast<uint32_t>(spheres_hitting_interior) *
                                         static_cast<uint32_t>(MaterialHardness::kDamagePerExplosionHit));
                                 bool dmg_changed = false;
-                                total_dmg = slot->add_damage(
+                                const uint8_t total_dmg = slot->add_damage(
                                     lc, static_cast<uint8_t>(added_dmg), store.material_pool(), &dmg_changed);
                                 if (dmg_changed) {
                                     chunk_modified = true;
                                     local_dirty_mask.record_mutated_sample(lc);
                                 }
-                            }
 
-                            // Once cumulative damage reaches the hard-rock break threshold (Hit 3: 255 >= 255),
-                            // carve the TSDF across the R + delta band AND clear damage on the carved/skin sample.
-                            if (total_dmg >= threshold) {
-                                const int16_t q_blast = TsdfFormat::encode(d_blast, delta);
-                                const int16_t q_new = std::max(q_cur, q_blast);
-
-                                if (q_new != q_cur) {
-                                    bool changed = false;
-                                    if (slot->set_tsdf(lc, q_new, store.tsdf_pool(), &changed) && changed) {
+                                // Strictly per-voxel break check: ONLY voxels whose own cumulative damage
+                                // reaches 255 break. Voxels in the same click that only have 85 (1 hit) or
+                                // 170 (2 hits) stay solid!
+                                if (total_dmg >= threshold) {
+                                    hard_rock_carved[lc.to_linear_index()] = 1U;
+                                    any_hard_rock_carved = true;
+                                    if (slot->clear_damage(lc)) {
                                         chunk_modified = true;
                                         local_dirty_mask.record_mutated_sample(lc);
                                     }
-                                }
-                                if (slot->clear_damage(lc)) {
-                                    chunk_modified = true;
-                                    local_dirty_mask.record_mutated_sample(lc);
+                                    if (q_cur >= 0) {
+                                        const int16_t q_blast = TsdfFormat::encode(d_blast, delta);
+                                        const int16_t q_new = std::max(q_cur, q_blast);
+                                        if (q_new != q_cur) {
+                                            bool changed = false;
+                                            if (slot->set_tsdf(lc, q_new, store.tsdf_pool(), &changed) && changed) {
+                                                chunk_modified = true;
+                                                local_dirty_mask.record_mutated_sample(lc);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
+                    }
+                }
+            }
+
+            // Pass 2: If any hard-rock voxels broke on this hit, update the TSDF for the carved subset
+            // and smooth the negative TSDF wall gradient on surviving solid neighbors within delta.
+            if (any_hard_rock_carved) {
+                struct PendingTsdfUpdate {
+                    LocalCoord lc;
+                    int16_t q_new;
+                    bool clear_underground_damage;
+                };
+                std::vector<PendingTsdfUpdate> updates;
+                updates.reserve(512);
+
+                const int32_t search_r = static_cast<int32_t>(std::ceil(delta)) + 1;
+
+                for (int32_t lz = lz0; lz <= lz1; ++lz) {
+                    const float pz = static_cast<float>(chunk_min.z + lz);
+                    for (int32_t ly = ly0; ly <= ly1; ++ly) {
+                        const float py = static_cast<float>(chunk_min.y + ly);
+                        for (int32_t lx = lx0; lx <= lx1; ++lx) {
+                            const float px = static_cast<float>(chunk_min.x + lx);
+                            const LocalCoord lc{lx, ly, lz};
+                            const uint32_t lin = lc.to_linear_index();
+
+                            const uint8_t mat_id = slot->get_material(lc);
+                            if (!MaterialHardness::supports_persistent_damage(mat_id)) {
+                                continue;
+                            }
+
+                            const int16_t q_cur = slot->get_tsdf(lc);
+                            const float d_blast = eval_carve_spheres(px, py, pz, nullptr);
+                            if (d_blast <= -delta) {
+                                continue;
+                            }
+
+                            if (hard_rock_carved[lin] != 0U) {
+                                if (q_cur >= 0) {
+                                    continue;
+                                }
+                                // Carved hard-rock voxel (becomes air): if an uncarved 1-hit/2-hit solid voxel
+                                // inside the sphere is adjacent to this voxel, taper the positive air TSDF toward
+                                // the boundary between the 3-hit carved pocket and the surviving solid rock.
+                                float min_dist_sq_to_interior_solid = 1e30f;
+                                for (int32_t dz = -search_r; dz <= search_r; ++dz) {
+                                    const int32_t nz = lz + dz;
+                                    if (nz < 0 || nz >= 32) continue;
+                                    for (int32_t dy = -search_r; dy <= search_r; ++dy) {
+                                        const int32_t ny = ly + dy;
+                                        if (ny < 0 || ny >= 32) continue;
+                                        for (int32_t dx = -search_r; dx <= search_r; ++dx) {
+                                            const int32_t nx = lx + dx;
+                                            if (nx < 0 || nx >= 32) continue;
+                                            const LocalCoord n_lc{nx, ny, nz};
+                                            const uint32_t n_lin = n_lc.to_linear_index();
+                                            if (hard_rock_carved[n_lin] == 0U && slot->get_tsdf(n_lc) < 0) {
+                                                const float npx = static_cast<float>(chunk_min.x + nx);
+                                                const float npy = static_cast<float>(chunk_min.y + ny);
+                                                const float npz = static_cast<float>(chunk_min.z + nz);
+                                                int n_hits = 0;
+                                                (void)eval_carve_spheres(npx, npy, npz, &n_hits);
+                                                if (n_hits > 0) {
+                                                    const float d2 = static_cast<float>(dx * dx + dy * dy + dz * dz);
+                                                    min_dist_sq_to_interior_solid =
+                                                        std::min(min_dist_sq_to_interior_solid, d2);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                float d_carve = d_blast;
+                                if (min_dist_sq_to_interior_solid < 1e20f) {
+                                    const float dist_to_solid = std::sqrt(min_dist_sq_to_interior_solid);
+                                    d_carve = std::min(d_blast, std::max(0.05f, dist_to_solid - 0.5f));
+                                }
+                                const int16_t q_blast =
+                                    std::max<int16_t>(1, TsdfFormat::encode(d_carve, delta));
+                                const int16_t q_new = std::max(q_cur, q_blast);
+                                if (q_new != q_cur) {
+                                    updates.push_back(PendingTsdfUpdate{lc, q_new, false});
+                                }
+                            } else if (q_cur < 0) {
+                                // Surviving solid hard-rock voxel (either outside the sphere in (-delta, 0),
+                                // or inside the sphere with only 1 or 2 hits): check distance to the nearest
+                                // newly carved hard-rock voxel.
+                                float min_dist_sq_to_carved = 1e30f;
+                                for (int32_t dz = -search_r; dz <= search_r; ++dz) {
+                                    const int32_t nz = lz + dz;
+                                    if (nz < 0 || nz >= 32) continue;
+                                    for (int32_t dy = -search_r; dy <= search_r; ++dy) {
+                                        const int32_t ny = ly + dy;
+                                        if (ny < 0 || ny >= 32) continue;
+                                        for (int32_t dx = -search_r; dx <= search_r; ++dx) {
+                                            const int32_t nx = lx + dx;
+                                            if (nx < 0 || nx >= 32) continue;
+                                            const LocalCoord n_lc{nx, ny, nz};
+                                            if (hard_rock_carved[n_lc.to_linear_index()] != 0U &&
+                                                slot->get_tsdf(n_lc) < 0) {
+                                                const float d2 = static_cast<float>(dx * dx + dy * dy + dz * dz);
+                                                min_dist_sq_to_carved = std::min(min_dist_sq_to_carved, d2);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if (min_dist_sq_to_carved <= (delta + 0.5f) * (delta + 0.5f)) {
+                                    const float dist_to_carved = std::sqrt(min_dist_sq_to_carved);
+                                    const float d_grid_wall = -std::max(0.05f, dist_to_carved - 0.5f);
+                                    const float d_wall =
+                                        (d_blast < 0.0f) ? d_blast : d_grid_wall;
+                                    // Strictly negative (<= -1) so surviving 1-hit/2-hit rock NEVER turns into air!
+                                    const int16_t q_wall =
+                                        std::min<int16_t>(-1, TsdfFormat::encode(d_wall, delta));
+                                    const int16_t q_new = std::max(q_cur, q_wall);
+                                    // If this voxel was deep underground (kClampedSolid) before the carve and is
+                                    // now exposed as the new crater floor, clear any underground damage so the
+                                    // rock underneath a 3-hit crater starts fresh at 0 hits; surface rock
+                                    // (q_cur > kClampedSolid) keeps its 1-hit and 2-hit cracks!
+                                    const bool was_deep_underground = (q_cur == TsdfFormat::kClampedSolid);
+                                    if (q_new != q_cur || was_deep_underground) {
+                                        updates.push_back(
+                                            PendingTsdfUpdate{lc, q_new, was_deep_underground});
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                for (const PendingTsdfUpdate& u : updates) {
+                    if (u.q_new != slot->get_tsdf(u.lc)) {
+                        bool changed = false;
+                        if (slot->set_tsdf(u.lc, u.q_new, store.tsdf_pool(), &changed) && changed) {
+                            chunk_modified = true;
+                            local_dirty_mask.record_mutated_sample(u.lc);
+                        }
+                    }
+                    if (u.clear_underground_damage && slot->clear_damage(u.lc)) {
+                        chunk_modified = true;
+                        local_dirty_mask.record_mutated_sample(u.lc);
                     }
                 }
             }

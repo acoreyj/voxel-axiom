@@ -297,7 +297,161 @@ void test_persistent_damage_3_hit_hard_rock() {
 }
 
 // ============================================================================
-// 4b. Regression Test: Soil Never Accumulates Cracks, Boundary Never Bleeds,
+// 4b. Regression Test: Hitting Partial Crater in Hard Rock 3x at Exact Same Spot
+//     Leaves 0 Residual Damage on the Newly Carved Concave Crater Wall/Rim
+// ============================================================================
+void test_hard_rock_partial_crater_clears_wall_damage_after_3_hits() {
+    ++g_tests_run;
+
+    MemoryLedger ledger;
+    ChunkStore store(ledger, /*world_height_chunks=*/8);
+    DualDirtyScheduler scheduler;
+    WorkerScratchWindow36 scratch(ledger);
+
+    const ChunkKey ck = ChunkKey::from_coords(0, 0, 0);
+    ChunkSlot* slot = store.get_or_create_slot(ck);
+    {
+        std::unique_lock<std::shared_mutex> lock(slot->mutex);
+        slot->reset_to_uniform(
+            ChunkStorageForm::Solid, MaterialHardness::kMaterialHardRock, store.tsdf_pool(), store.material_pool());
+        slot->state = ChunkLifecycleState::Resident;
+        slot->version.store(1, std::memory_order_release);
+    }
+
+    // Fire 3 explosions of radius 6.0 at the EXACT same spot (16, 16, 16) inside solid Hard Rock
+    const Vec3f blast_pos{16.0f, 16.0f, 16.0f};
+    const float blast_r = 6.0f;
+    for (int hit = 1; hit <= 3; ++hit) {
+        EditTransaction tx = EditTransaction::create_from_spheres(
+            {SphereCsgTerm{blast_pos, blast_r}}, 2.0f, 8);
+        while (!tx.is_finished()) {
+            (void)execute_next_edit_phase(store, scheduler, tx);
+        }
+    }
+
+    // After Hit 3 at the exact same spot:
+    // 1. Center (16, 16, 16) is carved to air (q > 0)
+    REQUIRE(slot->get_tsdf(LocalCoord{16, 16, 16}) > 0);
+    // 2. Concave crater wall in [R, R+delta) (e.g. x=23, dist=7.0 in [6.0, 8.0)) has smooth negative TSDF
+    //    AND 0 residual damage (damage slab is completely freed!)
+    const int16_t wall_q = slot->get_tsdf(LocalCoord{23, 16, 16});
+    REQUIRE(wall_q == TsdfFormat::encode(6.0f - 7.0f, 2.0f));
+    REQUIRE(!slot->has_damage_array());
+
+    // 3. Every vertex on the newly carved concave hard-rock crater wall has 0.0 damage_ratio!
+    const auto stamp = gather_scratch_window_36(store, ck, scratch);
+    const auto mesh = SurfaceNetsMesher::mesh_chunk_from_scratch_36(ck, scratch, 1, stamp.captured_terrain_revision);
+    REQUIRE(!mesh.vertices.empty());
+    for (const Vec3f& col : mesh.colors) {
+        REQUIRE(col.x == 0.0f);
+        REQUIRE(col.y == 1.0f);
+    }
+
+    std::printf("[PASS] test_hard_rock_partial_crater_clears_wall_damage_after_3_hits (0 residual cracks on crater bowl)\n");
+}
+
+// ============================================================================
+// 4c. Regression Test: 3 Offset Clicks with Partial Overlap ONLY Carve the 3-Hit
+//     Intersection (Never Blow Up the 1-Hit or 2-Hit Areas of the 3rd Click!)
+// ============================================================================
+void test_offset_overlapping_clicks_only_carve_3_hit_intersection() {
+    ++g_tests_run;
+
+    MemoryLedger ledger;
+    ChunkStore store(ledger, /*world_height_chunks=*/8);
+    DualDirtyScheduler scheduler;
+
+    const ChunkKey ck = ChunkKey::from_coords(0, 0, 0);
+    ChunkSlot* slot = store.get_or_create_slot(ck);
+    {
+        std::unique_lock<std::shared_mutex> lock(slot->mutex);
+        slot->reset_to_uniform(
+            ChunkStorageForm::Solid, MaterialHardness::kMaterialHardRock, store.tsdf_pool(), store.material_pool());
+        slot->state = ChunkLifecycleState::Resident;
+        slot->version.store(1, std::memory_order_release);
+
+        // Flat hard-rock surface at y = 16
+        for (int32_t z = 0; z < 32; ++z) {
+            for (int32_t y = 0; y < 32; ++y) {
+                for (int32_t x = 0; x < 32; ++x) {
+                    const float sdf = static_cast<float>(y) - 16.2f;
+                    const int16_t q = TsdfFormat::encode(std::clamp(sdf, -2.0f, +2.0f), 2.0f);
+                    REQUIRE(slot->set_tsdf(LocalCoord{x, y, z}, q, store.tsdf_pool()));
+                }
+            }
+        }
+    }
+
+    auto fire = [&](Vec3f c, float r) {
+        EditTransaction tx = EditTransaction::create_from_spheres({SphereCsgTerm{c, r}}, 2.0f, 8);
+        while (!tx.is_finished()) {
+            (void)execute_next_edit_phase(store, scheduler, tx);
+        }
+    };
+
+    const float R = 5.0f;
+    const Vec3f c1{10.0f, 16.0f, 16.0f};
+    const Vec3f c2{14.0f, 16.0f, 16.0f};
+    const Vec3f c3{18.0f, 16.0f, 16.0f};
+
+    // Click 1 at x=10 and Click 2 at x=14 create a 2-hit overlap in x=[9..15]
+    fire(c1, R);
+    fire(c2, R);
+
+    // Verify no voxels broke after 2 clicks, and x=13..15 has 2 hits (170) while x=17 has 1 hit (85)
+    REQUIRE(slot->get_tsdf(LocalCoord{14, 15, 16}) < 0);
+    REQUIRE(slot->get_damage(LocalCoord{14, 15, 16}) == 170U);
+    REQUIRE(slot->get_damage(LocalCoord{17, 15, 16}) == 85U);
+    REQUIRE(slot->get_damage(LocalCoord{21, 15, 16}) == 0U);
+
+    // Click 3 at x=18 (radius 5.0 spans x=[13..23]):
+    // - x=14, y=15, z=16 is inside c1 (dist=4.12<=5), c2 (dist=1.0<=5), AND c3 (dist=4.12<=5) -> 3 hits -> MUST CARVE!
+    // - x=17, y=15, z=16 is inside c2 and c3 ONLY (2 hits total) -> MUST NOT CARVE (stays solid with damage=170)!
+    // - x=21, y=15, z=16 is inside c3 ONLY (1 hit total) -> MUST NOT CARVE (stays solid with damage=85)!
+    fire(c3, R);
+
+    // 1. 3-hit intersection voxel (14, 15, 16) carved to air and reset damage to 0
+    REQUIRE(slot->get_tsdf(LocalCoord{14, 15, 16}) > 0);
+    REQUIRE(slot->get_damage(LocalCoord{14, 15, 16}) == 0U);
+
+    // 2. 2-hit voxel (17, 15, 16) inside Click 3's sphere stayed SOLID and advanced from 85 -> 170
+    REQUIRE(slot->get_tsdf(LocalCoord{17, 15, 16}) < 0);
+    REQUIRE(slot->get_damage(LocalCoord{17, 15, 16}) == 170U);
+
+    // 3. 1-hit voxel (21, 15, 16) inside Click 3's sphere stayed SOLID and advanced from 0 -> 85
+    REQUIRE(slot->get_tsdf(LocalCoord{21, 15, 16}) < 0);
+    REQUIRE(slot->get_damage(LocalCoord{21, 15, 16}) == 85U);
+
+    // 4. Exhaustive check across the entire chunk: NO voxel with < 3 hits was carved to air!
+    std::size_t carved_count = 0;
+    for (int32_t z = 0; z < 32; ++z) {
+        for (int32_t y = 0; y <= 16; ++y) {
+            for (int32_t x = 0; x < 32; ++x) {
+                const auto in_sphere = [&](Vec3f c) {
+                    const float dx = static_cast<float>(x) - c.x;
+                    const float dy = static_cast<float>(y) - c.y;
+                    const float dz = static_cast<float>(z) - c.z;
+                    return (dx * dx + dy * dy + dz * dz) <= (R * R);
+                };
+                const int hits = (in_sphere(c1) ? 1 : 0) + (in_sphere(c2) ? 1 : 0) + (in_sphere(c3) ? 1 : 0);
+                const int16_t q = slot->get_tsdf(LocalCoord{x, y, z});
+                if (hits == 3) {
+                    REQUIRE(q > 0);
+                    ++carved_count;
+                } else {
+                    REQUIRE(q < 0);
+                }
+            }
+        }
+    }
+    REQUIRE(carved_count > 10ULL);
+
+    std::printf("[PASS] test_offset_overlapping_clicks_only_carve_3_hit_intersection (%zu 3-hit voxels carved; 0 1-hit/2-hit voxels carved)\n",
+                carved_count);
+}
+
+// ============================================================================
+// 4d. Regression Test: Soil Never Accumulates Cracks, Boundary Never Bleeds,
 //     and Fill Path Resets Old Damage
 // ============================================================================
 void test_soil_never_accumulates_or_bleeds_cracks_and_fill_resets_damage() {
@@ -317,9 +471,6 @@ void test_soil_never_accumulates_or_bleeds_cracks_and_fill_resets_damage() {
         slot->state = ChunkLifecycleState::Resident;
         slot->version.store(1, std::memory_order_release);
 
-        // Place a small Hard Rock pocket at x >= 16, y = 16, z = 16 right next to Soil at x < 16
-        // where the hard rock is slightly deeper (-0.2f) than the adjacent soil (-0.05f) so a dual
-        // cell straddling x=15..16 picks best_material == kMaterialSoil.
         for (int32_t z = 0; z < 32; ++z) {
             for (int32_t y = 0; y < 32; ++y) {
                 for (int32_t x = 0; x < 32; ++x) {
@@ -335,9 +486,6 @@ void test_soil_never_accumulates_or_bleeds_cracks_and_fill_resets_damage() {
         }
     }
 
-    // Blast centered at (16, 16, 16) with radius 6.0:
-    // - Soil samples (x < 16) must carve immediately and leave 0 damage even in the (-delta, 0) shell.
-    // - Hard Rock samples (x >= 16) survive Hit 1 with damage == 85.
     {
         EditTransaction tx = EditTransaction::create_from_spheres(
             {SphereCsgTerm{Vec3f{16.0f, 16.0f, 16.0f}, /*radius=*/6.0f}}, 2.0f, 8);
@@ -360,13 +508,11 @@ void test_soil_never_accumulates_or_bleeds_cracks_and_fill_resets_damage() {
     const auto mesh = SurfaceNetsMesher::mesh_chunk_from_scratch_36(ck, scratch, 1, stamp.captured_terrain_revision);
     REQUIRE(!mesh.vertices.empty());
     for (const Vec3f& col : mesh.colors) {
-        // Every soil vertex (is_hard_rock == 0.0) MUST have 0.0 damage_ratio (no boundary bleed)
         if (col.y < 0.5f) {
             REQUIRE(col.x == 0.0f);
         }
     }
 
-    // Now test the fill path over the damaged hard-rock region: re-placing dirt must clear damage to 0!
     {
         SphereCsgTerm fill_term{};
         fill_term.center = Vec3f{18.0f, 15.0f, 16.0f};
@@ -469,6 +615,8 @@ int main() {
     test_r_plus_delta_crater_wall_continuity();
     test_anti_crumb_kernel();
     test_persistent_damage_3_hit_hard_rock();
+    test_hard_rock_partial_crater_clears_wall_damage_after_3_hits();
+    test_offset_overlapping_clicks_only_carve_3_hit_intersection();
     test_soil_never_accumulates_or_bleeds_cracks_and_fill_resets_damage();
     test_worker_pool_concurrent_execution_and_teardown();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",

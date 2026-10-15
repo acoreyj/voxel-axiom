@@ -1,7 +1,7 @@
 [gd_scene format=3 uid="uid://bibkhfx6twu3m"]
 
 [ext_resource type="Script" uid="uid://bhuhnykvb2uuo" path="res://terrain_demo.gd" id="1_demo_script"]
-[ext_resource type="Shader" uid="uid://oucs7i2mnfnn" path="res://voxel_triplanar.gdshader" id="2_triplanar_shader"]
+[ext_resource type="Shader" uid="uid://blp1k6511cps4" path="res://voxel_triplanar.gdshader" id="2_triplanar_shader"]
 [ext_resource type="Script" uid="uid://css26at8wuwc0" path="res://ai_companion_patrol.gd" id="3_pill_patrol"]
 
 [sub_resource type="ProceduralSkyMaterial" id="ProceduralSkyMaterial_1"]
@@ -18,11 +18,6 @@ ssao_enabled = true
 [sub_resource type="ShaderMaterial" id="ShaderMaterial_Terrain"]
 render_priority = 0
 shader = ExtResource("2_triplanar_shader")
-shader_parameter/top_grass_color = Color(0.24, 0.48, 0.22, 1)
-shader_parameter/cliff_rock_color = Color(0.42, 0.39, 0.36, 1)
-shader_parameter/deep_cave_color = Color(0.22, 0.24, 0.29, 1)
-shader_parameter/surface_height_threshold = 56.0
-shader_parameter/triplanar_scale = 0.25
 
 [sub_resource type="CapsuleMesh" id="CapsuleMesh_pill"]
 radius = 0.6

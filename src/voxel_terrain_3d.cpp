@@ -487,8 +487,7 @@ void VoxelTerrain3D::_process(double /*delta*/) {
                                   done->edit_transaction.position.z);
                 const int affected =
                     static_cast<int>(done->edit_transaction.total_affected_chunks);
-                const bool is_fill =
-                    (done->edit_transaction.operation == voxel::EditOperation::Fill);
+                const bool is_fill = done->edit_transaction.is_fill;
 #if defined(VOXEL_WITH_GODOT_CPP)
                 emit_signal(is_fill ? "terrain_add_completed" : "explosion_completed",
                             pos, done->edit_transaction.radius, affected);

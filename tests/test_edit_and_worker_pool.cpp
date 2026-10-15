@@ -18,7 +18,6 @@ using voxel::ChunkStore;
 using voxel::CompletionKind;
 using voxel::CoreWorkerPool;
 using voxel::DualDirtyScheduler;
-using voxel::EditOperation;
 using voxel::EditTransaction;
 using voxel::LocalCoord;
 using voxel::MaterialHardness;
@@ -32,7 +31,7 @@ using voxel::Vec3f;
 using voxel::WorkerScratchWindow36;
 using voxel::execute_next_edit_phase;
 using voxel::gather_scratch_window_36;
-using voxel:: map_world_sample;
+using voxel::map_world_sample;
 
 int g_tests_run = 0;
 int g_assertions_checked = 0;
@@ -57,11 +56,8 @@ void test_large_explosion_32_lock_cap_and_no_tearing() {
     ChunkStore store(ledger, /*world_height_chunks=*/8);
     DualDirtyScheduler scheduler;
 
-    // Section 7.1 Test Case:
-    // "Trigger a synthetic explosion with R = 64 voxels (spanning > 100 chunks)
-    //  and assert that each Edit phase locks at most 32 canonical chunks."
     EditTransaction tx = EditTransaction::create_from_spheres(
-        {SphereCsgTerm{Vec3f{64.0f, 96.0f, 64.0f}, /*radius=*/72.0f}},
+        {SphereCsgTerm{Vec3f{64.0f, 96.0f, 64.0f}, /*radius=*/64.0f}},
         /*delta=*/2.0f,
         /*world_height_chunks=*/8);
 
@@ -73,8 +69,6 @@ void test_large_explosion_32_lock_cap_and_no_tearing() {
     REQUIRE(total_candidate_chunks > 100ULL);
     REQUIRE(tx.phases.size() >= 4ULL);
 
-    // Execute phases 1 .. N-1: verify ZERO chunks are published to dirty_edit_chunks
-    // and terrain_revision does NOT advance until the final phase completes.
     const std::size_t num_phases = tx.phases.size();
     for (std::size_t p = 0; p + 1 < num_phases; ++p) {
         auto result = execute_next_edit_phase(store, scheduler, tx);
@@ -84,8 +78,6 @@ void test_large_explosion_32_lock_cap_and_no_tearing() {
         REQUIRE(tx.max_locks_acquired_in_any_phase <= 32ULL);
     }
 
-    // Execute final phase N: verify atomic publication of dirty_edit_chunks,
-    // terrain_revision == 1, and EditTransactionCompleted payload.
     auto final_result = execute_next_edit_phase(store, scheduler, tx);
     REQUIRE(final_result.has_value());
     REQUIRE(tx.is_finished());
@@ -110,10 +102,6 @@ void test_r_plus_delta_crater_wall_continuity() {
     ChunkStore store(ledger, /*world_height_chunks=*/8);
     DualDirtyScheduler scheduler;
 
-    // Section 7.1 Test Case:
-    // "Apply a sphere explosion of radius R = 12.3 and verify that canonical samples
-    //  in the shell R <= ||p - c|| < R + delta contain smooth negative TSDF values
-    //  matching R - ||p - c||, with zero -delta cliff discontinuities adjacent to the zero-crossing."
     const Vec3f center{16.0f, 16.0f, 16.0f};
     const float radius = 12.3f;
     const float delta = 2.0f;
@@ -140,13 +128,11 @@ void test_r_plus_delta_crater_wall_continuity() {
                     REQUIRE(slot != nullptr);
 
                     const int16_t actual_q = slot->get_tsdf(mapped.local);
-                    const float expected_sdf = radius - dist; // in (-delta, 0]
+                    const float expected_sdf = radius - dist;
                     const int16_t expected_q = TsdfFormat::encode(expected_sdf, delta);
 
-                    // Must match smooth negative TSDF value and not remain clamped at kClampedSolid (-32767)
-                    // unless expected_q itself rounds to -32767 at the very outer edge of the shell.
                     REQUIRE(actual_q == expected_q);
-                    // The (-delta, 0) crater-wall skin in kMaterialSoil must retain ZERO crack damage.
+                    // Verify the (-delta, 0) crater wall skin in kMaterialSoil retains ZERO crack damage!
                     REQUIRE(slot->get_damage(mapped.local) == 0U);
                     if (dist < radius + delta - 0.05f) {
                         REQUIRE(actual_q > TsdfFormat::kClampedSolid);
@@ -159,7 +145,7 @@ void test_r_plus_delta_crater_wall_continuity() {
     }
     REQUIRE(shell_samples_verified > 1000ULL);
 
-    std::printf("[PASS] test_r_plus_delta_crater_wall_continuity (%zu shell samples verified in [R, R+delta))\n",
+    std::printf("[PASS] test_r_plus_delta_crater_wall_continuity (%zu shell samples verified in [R, R+delta) with 0 soil damage)\n",
                 shell_samples_verified);
 }
 
@@ -173,9 +159,6 @@ void test_anti_crumb_kernel() {
     ChunkStore store(ledger, /*world_height_chunks=*/8);
     DualDirtyScheduler scheduler;
 
-    // Section 7.1 Test Case:
-    // "Construct a 1-voxel solid sample (S = -0.5) surrounded by 6 air samples (S = +1.0)
-    //  inside an explosion region; verify the post-phase pruning pass flips it to kClampedAir."
     const ChunkKey ck = ChunkKey::from_coords(0, 0, 0);
     ChunkSlot* slot = store.get_or_create_slot(ck);
     {
@@ -184,9 +167,6 @@ void test_anti_crumb_kernel() {
         slot->state = ChunkLifecycleState::Resident;
         slot->version.store(1, std::memory_order_release);
 
-        // Place an isolated 1-voxel solid crumb at (10, 10, 10) with S = -0.5 surrounded by air (+1.0)
-        // and another solid sample at (16, 16, 16) that will be carved by the blast so chunk (0,0,0)
-        // is part of the transaction's modified chunk set.
         const int16_t q_crumb = TsdfFormat::encode(-0.5f, 2.0f);
         const int16_t q_air   = TsdfFormat::encode(+1.0f, 2.0f);
         REQUIRE(slot->set_tsdf(LocalCoord{10, 10, 10}, q_crumb, store.tsdf_pool()));
@@ -197,7 +177,6 @@ void test_anti_crumb_kernel() {
         REQUIRE(slot->set_tsdf(LocalCoord{10, 10, 9},  q_air,   store.tsdf_pool()));
         REQUIRE(slot->set_tsdf(LocalCoord{10, 10, 11}, q_air,   store.tsdf_pool()));
 
-        // Target sample at (20, 20, 20) to be carved by a small sphere blast centered at (20, 20, 20)
         REQUIRE(slot->set_tsdf(LocalCoord{20, 20, 20}, TsdfFormat::kClampedSolid, store.tsdf_pool()));
     }
 
@@ -210,7 +189,6 @@ void test_anti_crumb_kernel() {
         (void)execute_next_edit_phase(store, scheduler, tx);
     }
 
-    // Verify the isolated 1-voxel solid crumb at (10, 10, 10) was pruned to kClampedAir (+32767).
     REQUIRE(slot->get_tsdf(LocalCoord{10, 10, 10}) == TsdfFormat::kClampedAir);
 
     std::printf("[PASS] test_anti_crumb_kernel (isolated 1-voxel solid crumb S=-0.5 pruned to kClampedAir)\n");
@@ -319,9 +297,10 @@ void test_persistent_damage_3_hit_hard_rock() {
 }
 
 // ============================================================================
-// 5. Fill Transactions Tag the Selected Material (rock add / boulder placement)
+// 4b. Regression Test: Hitting Partial Crater in Hard Rock 3x at Exact Same Spot
+//     Leaves 0 Residual Damage on the Newly Carved Concave Crater Wall/Rim
 // ============================================================================
-void test_fill_tags_selected_material() {
+void test_hard_rock_partial_crater_clears_wall_damage_after_3_hits() {
     ++g_tests_run;
 
     MemoryLedger ledger;
@@ -329,93 +308,151 @@ void test_fill_tags_selected_material() {
     DualDirtyScheduler scheduler;
     WorkerScratchWindow36 scratch(ledger);
 
-    EditTransaction tx = EditTransaction::create_from_spheres(
-        {SphereCsgTerm{Vec3f{16.0f, 16.0f, 16.0f}, /*radius=*/10.0f}}, 2.0f,
-        /*world_height_chunks=*/8, EditOperation::Fill, MaterialHardness::kMaterialHardRock);
-    while (!tx.is_finished()) {
-        (void)execute_next_edit_phase(store, scheduler, tx);
+    const ChunkKey ck = ChunkKey::from_coords(0, 0, 0);
+    ChunkSlot* slot = store.get_or_create_slot(ck);
+    {
+        std::unique_lock<std::shared_mutex> lock(slot->mutex);
+        slot->reset_to_uniform(
+            ChunkStorageForm::Solid, MaterialHardness::kMaterialHardRock, store.tsdf_pool(), store.material_pool());
+        slot->state = ChunkLifecycleState::Resident;
+        slot->version.store(1, std::memory_order_release);
     }
 
-    const ChunkKey ck = ChunkKey::from_coords(0, 0, 0);
-    const ChunkSlot* slot = store.find_slot(ck);
-    REQUIRE(slot != nullptr);
+    // Fire 3 explosions of radius 6.0 at the EXACT same spot (16, 16, 16) inside solid Hard Rock
+    const Vec3f blast_pos{16.0f, 16.0f, 16.0f};
+    const float blast_r = 6.0f;
+    for (int hit = 1; hit <= 3; ++hit) {
+        EditTransaction tx = EditTransaction::create_from_spheres(
+            {SphereCsgTerm{blast_pos, blast_r}}, 2.0f, 8);
+        while (!tx.is_finished()) {
+            (void)execute_next_edit_phase(store, scheduler, tx);
+        }
+    }
 
-    // Solid samples created by the fill carry the selected material.
-    REQUIRE(slot->get_tsdf(LocalCoord{16, 16, 16}) < 0);
-    REQUIRE(slot->get_material(LocalCoord{16, 16, 16}) == MaterialHardness::kMaterialHardRock);
-    REQUIRE(slot->get_material(LocalCoord{12, 16, 16}) == MaterialHardness::kMaterialHardRock);
+    // After Hit 3 at the exact same spot:
+    // 1. Center (16, 16, 16) is carved to air (q > 0)
+    REQUIRE(slot->get_tsdf(LocalCoord{16, 16, 16}) > 0);
+    // 2. Concave crater wall in [R, R+delta) (e.g. x=23, dist=7.0 in [6.0, 8.0)) has smooth negative TSDF
+    //    AND 0 residual damage (damage slab is completely freed!)
+    const int16_t wall_q = slot->get_tsdf(LocalCoord{23, 16, 16});
+    REQUIRE(wall_q == TsdfFormat::encode(6.0f - 7.0f, 2.0f));
+    REQUIRE(!slot->has_damage_array());
 
-    // Air outside the filled sphere is not tagged as rock.
-    REQUIRE(slot->get_tsdf(LocalCoord{2, 2, 2}) == TsdfFormat::kClampedAir);
-    REQUIRE(slot->get_material(LocalCoord{2, 2, 2}) == MaterialHardness::kMaterialSoil);
-
-    // The mesher flags filled rock in vertex COLOR.g so the shader tints it.
+    // 3. Every vertex on the newly carved concave hard-rock crater wall has 0.0 damage_ratio!
     const auto stamp = gather_scratch_window_36(store, ck, scratch);
-    const auto mesh = SurfaceNetsMesher::mesh_chunk_from_scratch_36(
-        ck, scratch, 1, stamp.captured_terrain_revision);
+    const auto mesh = SurfaceNetsMesher::mesh_chunk_from_scratch_36(ck, scratch, 1, stamp.captured_terrain_revision);
     REQUIRE(!mesh.vertices.empty());
-    REQUIRE(mesh.colors.size() == mesh.vertices.size());
-    REQUIRE(mesh.colors.front().y == 1.0f);
+    for (const Vec3f& col : mesh.colors) {
+        REQUIRE(col.x == 0.0f);
+        REQUIRE(col.y == 1.0f);
+    }
 
-    std::printf("[PASS] test_fill_tags_selected_material (filled rock tagged + mesher COLOR.g)\n");
+    std::printf("[PASS] test_hard_rock_partial_crater_clears_wall_damage_after_3_hits (0 residual cracks on crater bowl)\n");
 }
 
 // ============================================================================
-// 6. Persistent Damage: 5-Hit Boulder Placement
+// 4c. Regression Test: 3 Offset Clicks with Partial Overlap ONLY Carve the 3-Hit
+//     Intersection (Never Blow Up the 1-Hit or 2-Hit Areas of the 3rd Click!)
 // ============================================================================
-void test_persistent_damage_5_hit_boulder() {
+void test_offset_overlapping_clicks_only_carve_3_hit_intersection() {
     ++g_tests_run;
 
     MemoryLedger ledger;
     ChunkStore store(ledger, /*world_height_chunks=*/8);
     DualDirtyScheduler scheduler;
 
-    // Place a boulder: a radius-5 sphere of kMaterialBoulder centred at (16, 16, 16).
+    const ChunkKey ck = ChunkKey::from_coords(0, 0, 0);
+    ChunkSlot* slot = store.get_or_create_slot(ck);
     {
-        EditTransaction place = EditTransaction::create_from_spheres(
-            {SphereCsgTerm{Vec3f{16.0f, 16.0f, 16.0f}, /*radius=*/5.0f}}, 2.0f,
-            /*world_height_chunks=*/8, EditOperation::Fill, MaterialHardness::kMaterialBoulder);
-        while (!place.is_finished()) {
-            (void)execute_next_edit_phase(store, scheduler, place);
+        std::unique_lock<std::shared_mutex> lock(slot->mutex);
+        slot->reset_to_uniform(
+            ChunkStorageForm::Solid, MaterialHardness::kMaterialHardRock, store.tsdf_pool(), store.material_pool());
+        slot->state = ChunkLifecycleState::Resident;
+        slot->version.store(1, std::memory_order_release);
+
+        // Flat hard-rock surface at y = 16
+        for (int32_t z = 0; z < 32; ++z) {
+            for (int32_t y = 0; y < 32; ++y) {
+                for (int32_t x = 0; x < 32; ++x) {
+                    const float sdf = static_cast<float>(y) - 16.2f;
+                    const int16_t q = TsdfFormat::encode(std::clamp(sdf, -2.0f, +2.0f), 2.0f);
+                    REQUIRE(slot->set_tsdf(LocalCoord{x, y, z}, q, store.tsdf_pool()));
+                }
+            }
         }
     }
 
-    ChunkSlot* slot = store.find_slot(ChunkKey::from_coords(0, 0, 0));
-    REQUIRE(slot != nullptr);
-    const LocalCoord core{16, 16, 16};
-    REQUIRE(slot->get_tsdf(core) < 0);
-    REQUIRE(slot->get_material(core) == MaterialHardness::kMaterialBoulder);
-
-    // Four explosions only crack it: 51, 102, 153, 204 (< 255).
-    for (uint8_t expected_dmg = 51U; expected_dmg <= 204U; expected_dmg += 51U) {
-        EditTransaction hit = EditTransaction::create_from_spheres(
-            {SphereCsgTerm{Vec3f{16.0f, 16.0f, 16.0f}, /*radius=*/9.5f}}, 2.0f, 8);
-        while (!hit.is_finished()) {
-            (void)execute_next_edit_phase(store, scheduler, hit);
+    auto fire = [&](Vec3f c, float r) {
+        EditTransaction tx = EditTransaction::create_from_spheres({SphereCsgTerm{c, r}}, 2.0f, 8);
+        while (!tx.is_finished()) {
+            (void)execute_next_edit_phase(store, scheduler, tx);
         }
-        REQUIRE(slot->get_damage(core) == expected_dmg);
-        REQUIRE(slot->get_tsdf(core) < 0);
-    }
-    REQUIRE(slot->has_damage_array());
+    };
 
-    // Fifth explosion reaches 255 >= threshold -> the boulder shatters to air.
-    {
-        EditTransaction hit = EditTransaction::create_from_spheres(
-            {SphereCsgTerm{Vec3f{16.0f, 16.0f, 16.0f}, /*radius=*/9.5f}}, 2.0f, 8);
-        while (!hit.is_finished()) {
-            (void)execute_next_edit_phase(store, scheduler, hit);
+    const float R = 5.0f;
+    const Vec3f c1{10.0f, 16.0f, 16.0f};
+    const Vec3f c2{14.0f, 16.0f, 16.0f};
+    const Vec3f c3{18.0f, 16.0f, 16.0f};
+
+    // Click 1 at x=10 and Click 2 at x=14 create a 2-hit overlap in x=[9..15]
+    fire(c1, R);
+    fire(c2, R);
+
+    // Verify no voxels broke after 2 clicks, and x=13..15 has 2 hits (170) while x=17 has 1 hit (85)
+    REQUIRE(slot->get_tsdf(LocalCoord{14, 15, 16}) < 0);
+    REQUIRE(slot->get_damage(LocalCoord{14, 15, 16}) == 170U);
+    REQUIRE(slot->get_damage(LocalCoord{17, 15, 16}) == 85U);
+    REQUIRE(slot->get_damage(LocalCoord{21, 15, 16}) == 0U);
+
+    // Click 3 at x=18 (radius 5.0 spans x=[13..23]):
+    // - x=14, y=15, z=16 is inside c1 (dist=4.12<=5), c2 (dist=1.0<=5), AND c3 (dist=4.12<=5) -> 3 hits -> MUST CARVE!
+    // - x=17, y=15, z=16 is inside c2 and c3 ONLY (2 hits total) -> MUST NOT CARVE (stays solid with damage=170)!
+    // - x=21, y=15, z=16 is inside c3 ONLY (1 hit total) -> MUST NOT CARVE (stays solid with damage=85)!
+    fire(c3, R);
+
+    // 1. 3-hit intersection voxel (14, 15, 16) carved to air and reset damage to 0
+    REQUIRE(slot->get_tsdf(LocalCoord{14, 15, 16}) > 0);
+    REQUIRE(slot->get_damage(LocalCoord{14, 15, 16}) == 0U);
+
+    // 2. 2-hit voxel (17, 15, 16) inside Click 3's sphere stayed SOLID and advanced from 85 -> 170
+    REQUIRE(slot->get_tsdf(LocalCoord{17, 15, 16}) < 0);
+    REQUIRE(slot->get_damage(LocalCoord{17, 15, 16}) == 170U);
+
+    // 3. 1-hit voxel (21, 15, 16) inside Click 3's sphere stayed SOLID and advanced from 0 -> 85
+    REQUIRE(slot->get_tsdf(LocalCoord{21, 15, 16}) < 0);
+    REQUIRE(slot->get_damage(LocalCoord{21, 15, 16}) == 85U);
+
+    // 4. Exhaustive check across the entire chunk: NO voxel with < 3 hits was carved to air!
+    std::size_t carved_count = 0;
+    for (int32_t z = 0; z < 32; ++z) {
+        for (int32_t y = 0; y <= 16; ++y) {
+            for (int32_t x = 0; x < 32; ++x) {
+                const auto in_sphere = [&](Vec3f c) {
+                    const float dx = static_cast<float>(x) - c.x;
+                    const float dy = static_cast<float>(y) - c.y;
+                    const float dz = static_cast<float>(z) - c.z;
+                    return (dx * dx + dy * dy + dz * dz) <= (R * R);
+                };
+                const int hits = (in_sphere(c1) ? 1 : 0) + (in_sphere(c2) ? 1 : 0) + (in_sphere(c3) ? 1 : 0);
+                const int16_t q = slot->get_tsdf(LocalCoord{x, y, z});
+                if (hits == 3) {
+                    REQUIRE(q > 0);
+                    ++carved_count;
+                } else {
+                    REQUIRE(q < 0);
+                }
+            }
         }
     }
-    REQUIRE(slot->get_tsdf(core) == TsdfFormat::kClampedAir);
-    REQUIRE(slot->form == ChunkStorageForm::Empty);
-    REQUIRE(!slot->has_damage_array());
+    REQUIRE(carved_count > 10ULL);
 
-    std::printf("[PASS] test_persistent_damage_5_hit_boulder (51x4 cracks, 5th shatters)\n");
+    std::printf("[PASS] test_offset_overlapping_clicks_only_carve_3_hit_intersection (%zu 3-hit voxels carved; 0 1-hit/2-hit voxels carved)\n",
+                carved_count);
 }
 
 // ============================================================================
-// 6b. Regression: Soil Never Retains Cracks, Damage Never Bleeds Across a
-//     Rock -> Soil Boundary, and the Fill Path Resets Stale Damage
+// 4d. Regression Test: Soil Never Accumulates Cracks, Boundary Never Bleeds,
+//     and Fill Path Resets Old Damage
 // ============================================================================
 void test_soil_never_accumulates_or_bleeds_cracks_and_fill_resets_damage() {
     ++g_tests_run;
@@ -434,8 +471,6 @@ void test_soil_never_accumulates_or_bleeds_cracks_and_fill_resets_damage() {
         slot->state = ChunkLifecycleState::Resident;
         slot->version.store(1, std::memory_order_release);
 
-        // Flat ground solid for y <= 16, with a Hard Rock pocket on x >= 16 so dual cells
-        // straddle a rock -> soil boundary.
         for (int32_t z = 0; z < 32; ++z) {
             for (int32_t y = 0; y < 32; ++y) {
                 for (int32_t x = 0; x < 32; ++x) {
@@ -451,8 +486,6 @@ void test_soil_never_accumulates_or_bleeds_cracks_and_fill_resets_damage() {
         }
     }
 
-    // Blast the boundary: soil (x < 16) must carve immediately and keep 0 damage; hard rock
-    // (x >= 16) survives Hit 1 with damage == 85.
     {
         EditTransaction tx = EditTransaction::create_from_spheres(
             {SphereCsgTerm{Vec3f{16.0f, 16.0f, 16.0f}, /*radius=*/6.0f}}, 2.0f, 8);
@@ -471,10 +504,8 @@ void test_soil_never_accumulates_or_bleeds_cracks_and_fill_resets_damage() {
         }
     }
 
-    // The mesher must never emit a non-zero damage ratio on a soil vertex (no boundary bleed).
     const auto stamp = gather_scratch_window_36(store, ck, scratch);
-    const auto mesh = SurfaceNetsMesher::mesh_chunk_from_scratch_36(
-        ck, scratch, 1, stamp.captured_terrain_revision);
+    const auto mesh = SurfaceNetsMesher::mesh_chunk_from_scratch_36(ck, scratch, 1, stamp.captured_terrain_revision);
     REQUIRE(!mesh.vertices.empty());
     for (const Vec3f& col : mesh.colors) {
         if (col.y < 0.5f) {
@@ -482,11 +513,14 @@ void test_soil_never_accumulates_or_bleeds_cracks_and_fill_resets_damage() {
         }
     }
 
-    // Fill soil over the previously damaged hard rock: stale damage must be reset to 0.
     {
-        EditTransaction fill_tx = EditTransaction::create_from_spheres(
-            {SphereCsgTerm{Vec3f{18.0f, 15.0f, 16.0f}, /*radius=*/4.0f}}, 2.0f,
-            /*world_height_chunks=*/8, EditOperation::Fill, MaterialHardness::kMaterialSoil);
+        SphereCsgTerm fill_term{};
+        fill_term.center = Vec3f{18.0f, 15.0f, 16.0f};
+        fill_term.radius = 4.0f;
+        fill_term.is_fill = true;
+        fill_term.fill_material = MaterialHardness::kMaterialSoil;
+
+        EditTransaction fill_tx = EditTransaction::create_from_spheres({fill_term}, 2.0f, 8);
         while (!fill_tx.is_finished()) {
             (void)execute_next_edit_phase(store, scheduler, fill_tx);
         }
@@ -498,91 +532,7 @@ void test_soil_never_accumulates_or_bleeds_cracks_and_fill_resets_damage() {
 }
 
 // ============================================================================
-// 7. Multi-Threaded Worker Pool, Coalesced Blasts & Ordered Teardown (Section 5.3)
-// ============================================================================
-void test_worker_pool_concurrent_execution_and_teardown() {
-    ++g_tests_run;
-
-    MemoryLedger ledger;
-    ChunkStore store(ledger, /*world_height_chunks=*/8);
-    DualDirtyScheduler scheduler;
-
-    std::atomic<std::size_t> meshes_generated{0};
-    std::atomic<bool> save_hook_called{false};
-
-    CoreWorkerPool pool(
-        store,
-        scheduler,
-        [&](const ChunkStore&,
-            ChunkKey key,
-            WorkerScratchWindow36& scratch,
-            const NeighborhoodVersionStamp& stamp) -> ChunkMeshPayload {
-            // Read center sample from 36^3 scratch window to verify thread-safe snapshot access
-            const int16_t center_s = scratch.get_tsdf(16, 16, 16);
-            (void)center_s;
-            meshes_generated.fetch_add(1, std::memory_order_relaxed);
-
-            ChunkMeshPayload out{};
-            out.key = key;
-            out.captured_terrain_revision = stamp.captured_terrain_revision;
-            out.vertices.push_back(Vec3f{0.0f, 0.0f, 0.0f});
-            out.vertices.push_back(Vec3f{1.0f, 0.0f, 0.0f});
-            out.vertices.push_back(Vec3f{0.0f, 1.0f, 0.0f});
-            out.collision_faces = out.vertices;
-            return out;
-        });
-
-    pool.set_shutdown_save_hook([&](ChunkStore&) {
-        save_hook_called.store(true, std::memory_order_release);
-    });
-
-    pool.start(/*num_workers=*/3);
-
-    // Enqueue 4 explosions rapidly.
-    REQUIRE(pool.enqueue_explosion(Vec3f{16.0f, 16.0f, 16.0f}, 6.0f));
-    REQUIRE(pool.enqueue_explosion(Vec3f{24.0f, 16.0f, 16.0f}, 6.0f));
-    REQUIRE(pool.enqueue_explosion(Vec3f{48.0f, 16.0f, 16.0f}, 8.0f));
-    REQUIRE(pool.enqueue_explosion(Vec3f{64.0f, 32.0f, 64.0f}, 10.0f));
-
-    // Drain completions on the simulated main thread until pool.core_idle() and queue is empty.
-    std::size_t edit_completions = 0;
-    std::size_t mesh_completions = 0;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-
-    while (std::chrono::steady_clock::now() < deadline) {
-        while (auto rec = pool.try_pop_completion()) {
-            if (rec->kind == CompletionKind::EditTransactionCompleted) {
-                ++edit_completions;
-            } else if (rec->kind == CompletionKind::ChunkMesh) {
-                ++mesh_completions;
-            }
-        }
-        if (pool.core_idle() && pool.completion_queue_depth() == 0 && edit_completions >= 1 && mesh_completions >= 1) {
-            break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-
-    REQUIRE(edit_completions >= 1ULL);
-    REQUIRE(mesh_completions >= 1ULL);
-    REQUIRE(meshes_generated.load() >= mesh_completions);
-
-    // Execute Ordered Teardown Protocol (Section 5.3) with save = true.
-    pool.shutdown(/*save=*/true);
-    REQUIRE(save_hook_called.load(std::memory_order_acquire));
-
-    // New explosion submissions after shutdown must be rejected cleanly.
-    REQUIRE(!pool.enqueue_explosion(Vec3f{0.0f, 0.0f, 0.0f}, 5.0f));
-
-    // All memory ledger pools must be strictly 0 bytes after Step 6 of shutdown.
-    REQUIRE(ledger.total_reserved_bytes() == 0ULL);
-
-    std::printf("[PASS] test_worker_pool_concurrent_execution_and_teardown (%zu edit tx, %zu meshes, 0 B leaked)\n",
-                edit_completions, mesh_completions);
-}
-
-// ============================================================================
-// 5. Add-Terrain (Fill) CSG Union Semantics
+// 4e. Add-Terrain (Fill) CSG Union Semantics
 // ============================================================================
 void test_fill_add_terrain_union_semantics() {
     ++g_tests_run;
@@ -595,9 +545,12 @@ void test_fill_add_terrain_union_semantics() {
     const float radius = 10.0f;
     const float delta = 2.0f;
 
-    EditTransaction tx = EditTransaction::create_from_spheres(
-        {SphereCsgTerm{center, radius}}, delta, /*world_height_chunks=*/8, EditOperation::Fill);
-    REQUIRE(tx.operation == EditOperation::Fill);
+    SphereCsgTerm fill_term{};
+    fill_term.center = center;
+    fill_term.radius = radius;
+    fill_term.is_fill = true;
+
+    EditTransaction tx = EditTransaction::create_from_spheres({fill_term}, delta, /*world_height_chunks=*/8);
 
     while (!tx.is_finished()) {
         (void)execute_next_edit_phase(store, scheduler, tx);
@@ -648,9 +601,12 @@ void test_fill_add_terrain_union_semantics() {
         solid_slot->version.store(1, std::memory_order_release);
     }
 
-    EditTransaction noop_tx = EditTransaction::create_from_spheres(
-        {SphereCsgTerm{Vec3f{16.0f, 16.0f, 16.0f}, 4.0f}}, delta,
-        /*world_height_chunks=*/8, EditOperation::Fill);
+    SphereCsgTerm noop_term{};
+    noop_term.center = Vec3f{16.0f, 16.0f, 16.0f};
+    noop_term.radius = 4.0f;
+    noop_term.is_fill = true;
+
+    EditTransaction noop_tx = EditTransaction::create_from_spheres({noop_term}, delta, /*world_height_chunks=*/8);
     while (!noop_tx.is_finished()) {
         (void)execute_next_edit_phase(solid_store, solid_scheduler, noop_tx);
     }
@@ -659,6 +615,185 @@ void test_fill_add_terrain_union_semantics() {
 
     std::printf("[PASS] test_fill_add_terrain_union_semantics (%zu shell samples verified, no-op inside solid)\n",
                 shell_samples_verified);
+}
+
+// ============================================================================
+// 4f. Fill Transactions Tag the Selected Material (rock add / boulder placement)
+// ============================================================================
+void test_fill_tags_selected_material() {
+    ++g_tests_run;
+
+    MemoryLedger ledger;
+    ChunkStore store(ledger, /*world_height_chunks=*/8);
+    DualDirtyScheduler scheduler;
+    WorkerScratchWindow36 scratch(ledger);
+
+    SphereCsgTerm fill_term{};
+    fill_term.center = Vec3f{16.0f, 16.0f, 16.0f};
+    fill_term.radius = 10.0f;
+    fill_term.is_fill = true;
+    fill_term.fill_material = MaterialHardness::kMaterialHardRock;
+
+    EditTransaction tx = EditTransaction::create_from_spheres({fill_term}, 2.0f, /*world_height_chunks=*/8);
+    while (!tx.is_finished()) {
+        (void)execute_next_edit_phase(store, scheduler, tx);
+    }
+
+    const ChunkKey ck = ChunkKey::from_coords(0, 0, 0);
+    const ChunkSlot* slot = store.find_slot(ck);
+    REQUIRE(slot != nullptr);
+
+    // Solid samples created by the fill carry the selected material.
+    REQUIRE(slot->get_tsdf(LocalCoord{16, 16, 16}) < 0);
+    REQUIRE(slot->get_material(LocalCoord{16, 16, 16}) == MaterialHardness::kMaterialHardRock);
+    REQUIRE(slot->get_material(LocalCoord{12, 16, 16}) == MaterialHardness::kMaterialHardRock);
+
+    // Air outside the filled sphere is not tagged as rock.
+    REQUIRE(slot->get_tsdf(LocalCoord{2, 2, 2}) == TsdfFormat::kClampedAir);
+    REQUIRE(slot->get_material(LocalCoord{2, 2, 2}) == MaterialHardness::kMaterialSoil);
+
+    // The mesher flags filled rock in vertex COLOR.g so the shader tints it.
+    const auto stamp = gather_scratch_window_36(store, ck, scratch);
+    const auto mesh = SurfaceNetsMesher::mesh_chunk_from_scratch_36(
+        ck, scratch, 1, stamp.captured_terrain_revision);
+    REQUIRE(!mesh.vertices.empty());
+    REQUIRE(mesh.colors.size() == mesh.vertices.size());
+    REQUIRE(mesh.colors.front().y == 1.0f);
+
+    std::printf("[PASS] test_fill_tags_selected_material (filled rock tagged + mesher COLOR.g)\n");
+}
+
+// ============================================================================
+// 4g. Persistent Damage: 5-Hit Boulder Placement
+// ============================================================================
+void test_persistent_damage_5_hit_boulder() {
+    ++g_tests_run;
+
+    MemoryLedger ledger;
+    ChunkStore store(ledger, /*world_height_chunks=*/8);
+    DualDirtyScheduler scheduler;
+
+    // Place a boulder: a radius-5 sphere of kMaterialBoulder centred at (16, 16, 16).
+    {
+        SphereCsgTerm boulder_term{};
+        boulder_term.center = Vec3f{16.0f, 16.0f, 16.0f};
+        boulder_term.radius = 5.0f;
+        boulder_term.is_fill = true;
+        boulder_term.fill_material = MaterialHardness::kMaterialBoulder;
+
+        EditTransaction place = EditTransaction::create_from_spheres({boulder_term}, 2.0f, /*world_height_chunks=*/8);
+        while (!place.is_finished()) {
+            (void)execute_next_edit_phase(store, scheduler, place);
+        }
+    }
+
+    ChunkSlot* slot = store.find_slot(ChunkKey::from_coords(0, 0, 0));
+    REQUIRE(slot != nullptr);
+    const LocalCoord core{16, 16, 16};
+    REQUIRE(slot->get_tsdf(core) < 0);
+    REQUIRE(slot->get_material(core) == MaterialHardness::kMaterialBoulder);
+
+    // Four explosions only crack it: 51, 102, 153, 204 (< 255).
+    for (uint8_t expected_dmg = 51U; expected_dmg <= 204U; expected_dmg += 51U) {
+        EditTransaction hit = EditTransaction::create_from_spheres(
+            {SphereCsgTerm{Vec3f{16.0f, 16.0f, 16.0f}, /*radius=*/9.5f}}, 2.0f, 8);
+        while (!hit.is_finished()) {
+            (void)execute_next_edit_phase(store, scheduler, hit);
+        }
+        REQUIRE(slot->get_damage(core) == expected_dmg);
+        REQUIRE(slot->get_tsdf(core) < 0);
+    }
+    REQUIRE(slot->has_damage_array());
+
+    // Fifth explosion reaches 255 >= threshold -> the boulder shatters to air.
+    {
+        EditTransaction hit = EditTransaction::create_from_spheres(
+            {SphereCsgTerm{Vec3f{16.0f, 16.0f, 16.0f}, /*radius=*/9.5f}}, 2.0f, 8);
+        while (!hit.is_finished()) {
+            (void)execute_next_edit_phase(store, scheduler, hit);
+        }
+    }
+    REQUIRE(slot->get_tsdf(core) == TsdfFormat::kClampedAir);
+    REQUIRE(slot->form == ChunkStorageForm::Empty);
+    REQUIRE(!slot->has_damage_array());
+
+    std::printf("[PASS] test_persistent_damage_5_hit_boulder (51x4 cracks, 5th shatters)\n");
+}
+
+// ============================================================================
+// 5. Multi-Threaded Worker Pool, Coalesced Blasts & Ordered Teardown (Section 5.3)
+// ============================================================================
+void test_worker_pool_concurrent_execution_and_teardown() {
+    ++g_tests_run;
+
+    MemoryLedger ledger;
+    ChunkStore store(ledger, /*world_height_chunks=*/8);
+    DualDirtyScheduler scheduler;
+
+    std::atomic<std::size_t> meshes_generated{0};
+    std::atomic<bool> save_hook_called{false};
+
+    CoreWorkerPool pool(
+        store,
+        scheduler,
+        [&](const ChunkStore&,
+            ChunkKey key,
+            WorkerScratchWindow36& scratch,
+            const NeighborhoodVersionStamp& stamp) -> ChunkMeshPayload {
+            const int16_t center_s = scratch.get_tsdf(16, 16, 16);
+            (void)center_s;
+            meshes_generated.fetch_add(1, std::memory_order_relaxed);
+
+            ChunkMeshPayload out{};
+            out.key = key;
+            out.captured_terrain_revision = stamp.captured_terrain_revision;
+            out.vertices.push_back(Vec3f{0.0f, 0.0f, 0.0f});
+            out.vertices.push_back(Vec3f{1.0f, 0.0f, 0.0f});
+            out.vertices.push_back(Vec3f{0.0f, 1.0f, 0.0f});
+            out.collision_faces = out.vertices;
+            return out;
+        });
+
+    pool.set_shutdown_save_hook([&](ChunkStore&) {
+        save_hook_called.store(true, std::memory_order_release);
+    });
+
+    pool.start(/*num_workers=*/3);
+
+    REQUIRE(pool.enqueue_explosion(Vec3f{16.0f, 16.0f, 16.0f}, 6.0f));
+    REQUIRE(pool.enqueue_explosion(Vec3f{24.0f, 16.0f, 16.0f}, 6.0f));
+    REQUIRE(pool.enqueue_explosion(Vec3f{48.0f, 16.0f, 16.0f}, 8.0f));
+    REQUIRE(pool.enqueue_explosion(Vec3f{64.0f, 32.0f, 64.0f}, 10.0f));
+
+    std::size_t edit_completions = 0;
+    std::size_t mesh_completions = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        while (auto rec = pool.try_pop_completion()) {
+            if (rec->kind == CompletionKind::EditTransactionCompleted) {
+                ++edit_completions;
+            } else if (rec->kind == CompletionKind::ChunkMesh) {
+                ++mesh_completions;
+            }
+        }
+        if (pool.core_idle() && pool.completion_queue_depth() == 0 && edit_completions >= 1 && mesh_completions >= 1) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    REQUIRE(edit_completions >= 1ULL);
+    REQUIRE(mesh_completions >= 1ULL);
+    REQUIRE(meshes_generated.load() >= mesh_completions);
+
+    pool.shutdown(/*save=*/true);
+    REQUIRE(save_hook_called.load(std::memory_order_acquire));
+    REQUIRE(!pool.enqueue_explosion(Vec3f{0.0f, 0.0f, 0.0f}, 5.0f));
+    REQUIRE(ledger.total_reserved_bytes() == 0ULL);
+
+    std::printf("[PASS] test_worker_pool_concurrent_execution_and_teardown (%zu edit tx, %zu meshes, 0 B leaked)\n",
+                edit_completions, mesh_completions);
 }
 
 // ============================================================================
@@ -684,7 +819,7 @@ void test_fill_and_carve_do_not_coalesce() {
     while (std::chrono::steady_clock::now() < deadline) {
         while (auto rec = pool.try_pop_completion()) {
             if (rec->kind == CompletionKind::EditTransactionCompleted) {
-                if (rec->edit_transaction.operation == EditOperation::Fill) {
+                if (rec->edit_transaction.is_fill) {
                     ++fill_completions;
                     REQUIRE(rec->edit_transaction.radius == 4.0f);
                     REQUIRE(rec->edit_transaction.position.x == 48.0f);
@@ -717,11 +852,13 @@ int main() {
     test_r_plus_delta_crater_wall_continuity();
     test_anti_crumb_kernel();
     test_persistent_damage_3_hit_hard_rock();
+    test_hard_rock_partial_crater_clears_wall_damage_after_3_hits();
+    test_offset_overlapping_clicks_only_carve_3_hit_intersection();
+    test_soil_never_accumulates_or_bleeds_cracks_and_fill_resets_damage();
+    test_fill_add_terrain_union_semantics();
     test_fill_tags_selected_material();
     test_persistent_damage_5_hit_boulder();
-    test_soil_never_accumulates_or_bleeds_cracks_and_fill_resets_damage();
     test_worker_pool_concurrent_execution_and_teardown();
-    test_fill_add_terrain_union_semantics();
     test_fill_and_carve_do_not_coalesce();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",
                 g_tests_run, g_assertions_checked);

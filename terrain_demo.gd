@@ -18,6 +18,14 @@ extends Node3D
 @export var brush_spacing_factor: float = 0.6
 @export var brush_interval: float = 0.05
 @export var max_ray_distance: float = 250.0
+## A repeat explosive click whose re-raycast impact point has merely receded
+## along the view ray (soft ground in front of the rock was blown away by the
+## previous hit) by up to this fraction of the blast radius still counts as the
+## same spot: the previous impact point is reused so blast spheres stack on the
+## rock instead of creeping deeper every click. Moving the aim sideways beyond
+## `boom_snap_lateral` releases the snap and starts a new spot.
+@export var boom_snap_depth_factor: float = 0.5
+@export var boom_snap_lateral: float = 0.75
 
 enum Tool { ADD_TERRAIN, EXPLODE, LARGE_EXPLODE, PAINT, PAINT_DELETE, BOULDER }
 
@@ -45,6 +53,7 @@ var _add_material: int = MATERIAL_SOIL
 var _tool_pressed: bool = false
 var _brush_cooldown: float = 0.0
 var _last_brush_point: Vector3 = Vector3(INF, INF, INF)
+var _last_boom_point: Vector3 = Vector3(INF, INF, INF)
 var _last_event_print_ms: int = 0
 var _last_fail_warn_ms: int = 0
 
@@ -97,7 +106,7 @@ func _unhandled_input(event: InputEvent) -> void:
 					_brush_cooldown = 0.0
 					_process_brush(0.0)
 				else:
-					_apply_tool_at(_aim_point())
+					_apply_click_tool()
 		elif event.button_index == MOUSE_BUTTON_RIGHT and event.pressed:
 			_query_companion_cave_path()
 
@@ -177,6 +186,7 @@ func _set_tool(tool: int) -> void:
 	if tool == _active_tool:
 		return
 	_active_tool = tool
+	_last_boom_point = Vector3(INF, INF, INF)
 	print("[VoxelTerrain3D] Active tool: [%d] %s" % [tool + 1, TOOL_NAMES[tool]])
 
 func _toggle_add_material() -> void:
@@ -185,6 +195,31 @@ func _toggle_add_material() -> void:
 
 func _is_drag_tool() -> bool:
 	return _active_tool == Tool.PAINT or _active_tool == Tool.PAINT_DELETE
+
+func _is_boom_tool() -> bool:
+	return _active_tool == Tool.EXPLODE or _active_tool == Tool.LARGE_EXPLODE
+
+## Applies a discrete (click) tool. Repeat explosive clicks on the same spot
+## reuse the previous impact point: each explosion re-raycasts from the camera,
+## so once an earlier hit blows the soft ground out in front of the rock the
+## next ray hits a voxel or two deeper and the blast spheres creep down the hole
+## instead of stacking their damage on the same rock. Compatibility test: the
+## surface receded forward along the view ray by at most boom_snap_depth_factor
+## of the blast radius and the aim did not slide sideways.
+func _apply_click_tool() -> void:
+	var point := _aim_point()
+	if _is_boom_tool():
+		if is_finite(_last_boom_point.x):
+			var forward := -camera.global_transform.basis.z
+			var drift := point - _last_boom_point
+			var recession := drift.dot(forward)
+			var lateral := (drift - forward * recession).length()
+			if recession >= -0.1 \
+					and recession <= _active_radius() * boom_snap_depth_factor \
+					and lateral <= boom_snap_lateral:
+				point = _last_boom_point
+		_last_boom_point = point
+	_apply_tool_at(point)
 
 func _active_radius() -> float:
 	match _active_tool:
