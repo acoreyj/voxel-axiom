@@ -167,7 +167,9 @@ struct ChunkMeshPayload {
     uint64_t captured_terrain_revision = 0;
     std::vector<Vec3f> vertices;
     std::vector<Vec3f> normals;
-    // Per-vertex attributes: x = damage_ratio in [0, 1], y = is_hard_rock (0 or 1), z = 0
+    // Per-vertex attributes: x = damage_ratio in [0, 1], y = is_hard_rock (0 or 1),
+    // z = hits-to-break / 255 (3/255 hard rock, 5/255 boulder, else 1/255). The shader keys
+    // boulder-vs-hard-rock material separation off z (hits-to-break), not y.
     std::vector<Vec3f> colors;
     std::vector<int32_t> indices;
     std::vector<Vec3f> collision_faces;

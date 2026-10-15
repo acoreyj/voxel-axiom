@@ -269,6 +269,11 @@ void test_material_hardness_thresholds() {
     REQUIRE(4U * MaterialHardness::damage_per_hit(MaterialHardness::kMaterialBoulder) <
             MaterialHardness::break_threshold(MaterialHardness::kMaterialBoulder));
 
+    // Hits-to-break drives the shader's damage ramp (mesher packs it into COLOR.b).
+    REQUIRE(MaterialHardness::hits_to_break(MaterialHardness::kMaterialSoil) == 1U);
+    REQUIRE(MaterialHardness::hits_to_break(MaterialHardness::kMaterialHardRock) == 3U);
+    REQUIRE(MaterialHardness::hits_to_break(MaterialHardness::kMaterialBoulder) == 5U);
+
     std::printf("[PASS] test_material_hardness_thresholds (soil 1-hit, hard rock 3-hit, boulder 5-hit)\n");
 }
 

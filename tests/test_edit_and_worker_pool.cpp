@@ -252,9 +252,11 @@ void test_persistent_damage_3_hit_hard_rock() {
         const auto mesh1 = SurfaceNetsMesher::mesh_chunk_from_scratch_36(ck, scratch, 1, stamp.captured_terrain_revision);
         REQUIRE(!mesh1.vertices.empty());
         REQUIRE(mesh1.colors.size() == mesh1.vertices.size());
-        // Verify vertices carry damage_ratio = 85 / 255 (~0.333) and is_hard_rock = 1.0
+        // Verify vertices carry damage_ratio = 85 / 255 (~0.333), is_hard_rock = 1.0
+        // and hits_to_break = 3 / 255 for the shader's hits-remaining damage ramp.
         REQUIRE(std::abs(mesh1.colors.front().x - (85.0f / 255.0f)) < 1e-3f);
         REQUIRE(std::abs(mesh1.colors.front().y - 1.0f) < 1e-3f);
+        REQUIRE(std::abs(mesh1.colors.front().z - (3.0f / 255.0f)) < 1e-6f);
     }
 
     // --- EXPLOSION 2 ---
@@ -659,6 +661,8 @@ void test_fill_tags_selected_material() {
     REQUIRE(!mesh.vertices.empty());
     REQUIRE(mesh.colors.size() == mesh.vertices.size());
     REQUIRE(mesh.colors.front().y == 1.0f);
+    // Filled hard rock packs hits_to_break = 3 / 255 into COLOR.b.
+    REQUIRE(std::abs(mesh.colors.front().z - (3.0f / 255.0f)) < 1e-6f);
 
     std::printf("[PASS] test_fill_tags_selected_material (filled rock tagged + mesher COLOR.g)\n");
 }
@@ -672,6 +676,7 @@ void test_persistent_damage_5_hit_boulder() {
     MemoryLedger ledger;
     ChunkStore store(ledger, /*world_height_chunks=*/8);
     DualDirtyScheduler scheduler;
+    WorkerScratchWindow36 scratch(ledger);
 
     // Place a boulder: a radius-5 sphere of kMaterialBoulder centred at (16, 16, 16).
     {
@@ -704,6 +709,18 @@ void test_persistent_damage_5_hit_boulder() {
         REQUIRE(slot->get_tsdf(core) < 0);
     }
     REQUIRE(slot->has_damage_array());
+
+    // The pre-shatter state (204 / 255) packs damage_ratio 204/255 and hits_to_break 5/255,
+    // so the shader renders it in the same bright-red band as the 3-hit rock's final state.
+    {
+        const auto stamp = gather_scratch_window_36(store, ChunkKey::from_coords(0, 0, 0), scratch);
+        const auto mesh = SurfaceNetsMesher::mesh_chunk_from_scratch_36(
+            ChunkKey::from_coords(0, 0, 0), scratch, 1, stamp.captured_terrain_revision);
+        REQUIRE(!mesh.vertices.empty());
+        REQUIRE(!mesh.colors.empty());
+        REQUIRE(std::abs(mesh.colors.front().x - (204.0f / 255.0f)) < 1e-3f);
+        REQUIRE(std::abs(mesh.colors.front().z - (5.0f / 255.0f)) < 1e-6f);
+    }
 
     // Fifth explosion reaches 255 >= threshold -> the boulder shatters to air.
     {

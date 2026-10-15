@@ -60,6 +60,17 @@ struct MaterialHardness {
         }
         return 255U;
     }
+
+    /// Number of explosion hits required to break the material:
+    ///   - kMaterialSoil (1): 1 hit
+    ///   - kMaterialHardRock (2): 3 hits
+    ///   - kMaterialBoulder (3): 5 hits
+    /// The mesher packs this into a vertex color channel so the terrain shader can key its
+    /// damage ramp off hits remaining instead of raw damage, making the hit before destruction
+    /// read as the same bright red regardless of material hit count.
+    [[nodiscard]] static constexpr uint8_t hits_to_break(uint8_t material_id) noexcept {
+        return static_cast<uint8_t>(break_threshold(material_id) / damage_per_hit(material_id));
+    }
 };
 
 // ============================================================================

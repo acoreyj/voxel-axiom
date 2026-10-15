@@ -581,14 +581,19 @@ public:
                 cell.vertex_index = static_cast<uint32_t>(out.vertices.size());
                 out.vertices.push_back(cell.local_pos);
                 out.normals.push_back(cell.normal);
-                // Pack damage ratio in [0, 1] into colors.x (R) and the rock flag into colors.y (G).
-                // Placed boulders share the hard-rock tint and progressive crack visuals. Only
-                // persistent-damage materials carry a non-zero damage ratio; grass/dirt emit 0.0.
+                // Pack damage ratio in [0, 1] into colors.x (R), the rock flag into colors.y (G)
+                // and hits-to-break / 255 into colors.z (B). 3-hit Hard Rock and 5-hit placed
+                // boulders both set the rock flag, so the shader further separates them by
+                // hits-to-break (B): boulders render as warm speckled matte granite, Hard Rock as
+                // dark metallic basalt. Only persistent-damage materials carry a non-zero damage
+                // ratio; grass/dirt emit 0.0.
                 const bool is_hard_rock_mat = MaterialHardness::supports_persistent_damage(cell.material_id);
                 const float dmg_ratio =
                     is_hard_rock_mat ? (static_cast<float>(cell.damage) / 255.0f) : 0.0f;
                 const float is_rock = is_hard_rock_mat ? 1.0f : 0.0f;
-                out.colors.push_back(Vec3f{dmg_ratio, is_rock, 0.0f});
+                const float hits_norm =
+                    static_cast<float>(MaterialHardness::hits_to_break(cell.material_id)) / 255.0f;
+                out.colors.push_back(Vec3f{dmg_ratio, is_rock, hits_norm});
             }
             return cell.vertex_index;
         };
