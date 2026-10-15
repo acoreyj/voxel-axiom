@@ -160,6 +160,13 @@ void fragment() {
 	float hits_left = max_hits * (1.0 - rock_damage);
 	float dmg_level = clamp(floor(6.0 - hits_left + 0.5) - 1.0, 0.0, 4.0);
 	float level01 = clamp((dmg_level + 1.0) / 5.0, 0.0, 1.0);
+	// Realistic crack severity. Boulders walk the five-step ramp directly; the shorter
+	// 3-hit rock instead tracks progress across its own hits, so its first hit is a
+	// moderate split and the amount of cracks grows into the full web before shatter.
+	float crack_level = level01;
+	if (max_hits < 4.0) {
+		crack_level = clamp((max_hits - hits_left) / (max_hits - 1.0), 0.0, 1.0);
+	}
 	vec3 damage_col = damage_level_color(dmg_level);
 	float damage_presence = smoothstep(0.02, 0.30, rock_damage);
 	if (rock_damage > 0.02) {
@@ -195,19 +202,19 @@ void fragment() {
 
 			// Per-network open-in ramps: big plates split first, then the coarse, fine and
 			// micro webs fill in as destruction nears.
-			float ramp_plate  = clamp((level01 - 0.30) / 0.45, 0.0, 1.0);
-			float ramp_coarse = clamp((level01 - 0.45) / 0.50, 0.0, 1.0);
-			float ramp_fine   = clamp((level01 - 0.55) / 0.45, 0.0, 1.0);
-			float ramp_micro  = clamp((level01 - 0.72) / 0.28, 0.0, 1.0);
+			float ramp_plate  = clamp((crack_level - 0.30) / 0.45, 0.0, 1.0);
+			float ramp_coarse = clamp((crack_level - 0.45) / 0.50, 0.0, 1.0);
+			float ramp_fine   = clamp((crack_level - 0.55) / 0.45, 0.0, 1.0);
+			float ramp_micro  = clamp((crack_level - 0.72) / 0.28, 0.0, 1.0);
 			float open_plate  = smoothstep(plate_e.y * 0.8,  plate_e.y * 0.8 + 0.06,  ramp_plate);
 			float open_coarse = smoothstep(coarse_e.y * 0.8, coarse_e.y * 0.8 + 0.06, ramp_coarse);
 			float open_fine   = smoothstep(fine_e.y * 0.8,   fine_e.y * 0.8 + 0.06,   ramp_fine);
 			float open_micro  = smoothstep(micro_e.y * 0.8,  micro_e.y * 0.8 + 0.06,  ramp_micro);
 			// Cracks widen only slightly with damage; the ramp is mostly new lines opening.
-			float c4 = (1.0 - smoothstep(0.0, mix(0.16, 0.24, level01), plate_e.x)) * open_plate;
-			float c1 = (1.0 - smoothstep(0.0, mix(0.12, 0.20, level01), coarse_e.x)) * open_coarse;
-			float c2 = (1.0 - smoothstep(0.0, mix(0.07, 0.12, level01), fine_e.x)) * open_fine;
-			float c3 = (1.0 - smoothstep(0.0, mix(0.05, 0.09, level01), micro_e.x)) * open_micro;
+			float c4 = (1.0 - smoothstep(0.0, mix(0.16, 0.24, crack_level), plate_e.x)) * open_plate;
+			float c1 = (1.0 - smoothstep(0.0, mix(0.12, 0.20, crack_level), coarse_e.x)) * open_coarse;
+			float c2 = (1.0 - smoothstep(0.0, mix(0.07, 0.12, crack_level), fine_e.x)) * open_fine;
+			float c3 = (1.0 - smoothstep(0.0, mix(0.05, 0.09, crack_level), micro_e.x)) * open_micro;
 			crack_mask = clamp(max(c4, max(c1, max(c2 * 0.90, c3 * 0.85))), 0.0, 1.0)
 				* hard_rock_weight;
 
