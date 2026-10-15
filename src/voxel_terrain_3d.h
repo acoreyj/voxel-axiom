@@ -55,6 +55,12 @@ public:
     // Core GDScript-exposed API (Section 4.2)
     void trigger_explosion(Vector3 p_position, float p_radius);
     void add_terrain(Vector3 p_position, float p_radius);
+    /// Fills a sphere tagged with `p_material` (1 = soil, 2 = 3-hit hard rock,
+    /// 3 = 5-hit boulder). Values outside [0, 255] are clamped.
+    void add_terrain_with_material(Vector3 p_position, float p_radius, int p_material);
+    /// Places a 5-hit boulder: fills a sphere of MaterialHardness::kMaterialBoulder
+    /// that shatters only after 5 explosions.
+    void place_boulder(Vector3 p_position, float p_radius);
     /// Engine-side voxel raycast against resident TSDF chunks. Returns the
     /// interpolated surface point, or a Vector3 of +INF when nothing is hit
     /// (ray starts inside solid, ends in air, or crosses only unloaded space).
@@ -210,6 +216,8 @@ private:
 
     void _apply_stage_timings();
     void _log(const std::string& p_message) const;
+    /// Shared fill entry point for add_terrain / add_terrain_with_material / place_boulder.
+    void _enqueue_fill(Vector3 p_position, float p_radius, uint8_t p_material);
 
     /// True when `p_key` should own a physics collision body under the current
     /// `collision_distance_chunks` (3D Chebyshev distance from the focus chunk).

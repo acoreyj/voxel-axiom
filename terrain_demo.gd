@@ -1,9 +1,10 @@
 extends Node3D
 ## HLD v4.0 GDScript Demo Controller (`terrain_demo.gd`)
 ## Streams 32^3 chunks around the active Camera3D and applies terrain tools on
-## left-click: keys 1-5 select add / explode / large-explode / paint / paint-delete,
-## where paint and paint-delete are hold-and-drag brushes. Right-click queries
-## 3D cave navigation paths.
+## left-click: keys 1-6 select add / explode / large-explode / paint / paint-delete /
+## place-boulder, where paint and paint-delete are hold-and-drag brushes. R toggles
+## the add/paint material between soil and 3-hit rock. Right-click queries 3D cave
+## navigation paths.
 
 @export var move_speed: float = 24.0
 @export var fast_multiplier: float = 3.0
@@ -13,13 +14,17 @@ extends Node3D
 @export var add_radius: float = 6.0
 @export var paint_radius: float = 3.5
 @export var paint_delete_radius: float = 3.5
+@export var boulder_radius: float = 4.0
 @export var brush_spacing_factor: float = 0.6
 @export var brush_interval: float = 0.05
 @export var max_ray_distance: float = 250.0
 
-enum Tool { ADD_TERRAIN, EXPLODE, LARGE_EXPLODE, PAINT, PAINT_DELETE }
+enum Tool { ADD_TERRAIN, EXPLODE, LARGE_EXPLODE, PAINT, PAINT_DELETE, BOULDER }
 
-const TOOL_NAMES := ["Add terrain", "Explode", "Large explode", "Paint terrain", "Paint delete"]
+const TOOL_NAMES := ["Add terrain", "Explode", "Large explode", "Paint terrain", "Paint delete", "Place boulder"]
+const MATERIAL_NAMES := ["Soil", "Rock"]
+const MATERIAL_SOIL := 1
+const MATERIAL_ROCK := 2
 
 @onready var terrain: VoxelTerrain3D = $VoxelTerrain3D
 @onready var ai_companion: VoxelAICompanion = $VoxelAICompanion
@@ -36,6 +41,7 @@ var _commits_in_window: int = 0
 var _commits_per_second: float = 0.0
 var _stats_accum: float = 0.0
 var _active_tool: int = Tool.EXPLODE
+var _add_material: int = MATERIAL_SOIL
 var _tool_pressed: bool = false
 var _brush_cooldown: float = 0.0
 var _last_brush_point: Vector3 = Vector3(INF, INF, INF)
@@ -77,6 +83,10 @@ func _unhandled_input(event: InputEvent) -> void:
 				_set_tool(Tool.PAINT)
 			KEY_5:
 				_set_tool(Tool.PAINT_DELETE)
+			KEY_6:
+				_set_tool(Tool.BOULDER)
+			KEY_R:
+				_toggle_add_material()
 
 	elif event is InputEventMouseButton:
 		if event.button_index == MOUSE_BUTTON_LEFT:
@@ -145,7 +155,11 @@ func _update_hud(delta: float) -> void:
 	elif not terrain.fully_committed():
 		streaming_state = "committing"
 
-	stats_label.text = "FPS: %.0f  (%.2f ms)\nView dist: %d / %d chunks  (prefetch %d)\nCommitted: %d chunks  (%.0f/s)\nStreaming: %s\nTool: [%d] %s | 1-5 select, LMB use, RMB cave path" % [
+	var material_state := ""
+	if _active_tool == Tool.ADD_TERRAIN or _active_tool == Tool.PAINT:
+		material_state = " | Material: %s (R)" % MATERIAL_NAMES[_add_material - 1]
+
+	stats_label.text = "FPS: %.0f  (%.2f ms)\nView dist: %d / %d chunks  (prefetch %d)\nCommitted: %d chunks  (%.0f/s)\nStreaming: %s\nTool: [%d] %s%s | 1-6 select, LMB use, RMB cave path" % [
 		_fps_smoothed,
 		1000.0 / max(_fps_smoothed, 1.0),
 		terrain.get_effective_view_distance_chunks(),
@@ -156,6 +170,7 @@ func _update_hud(delta: float) -> void:
 		streaming_state,
 		_active_tool + 1,
 		TOOL_NAMES[_active_tool],
+		material_state,
 	]
 
 func _set_tool(tool: int) -> void:
@@ -163,6 +178,10 @@ func _set_tool(tool: int) -> void:
 		return
 	_active_tool = tool
 	print("[VoxelTerrain3D] Active tool: [%d] %s" % [tool + 1, TOOL_NAMES[tool]])
+
+func _toggle_add_material() -> void:
+	_add_material = MATERIAL_ROCK if _add_material == MATERIAL_SOIL else MATERIAL_SOIL
+	print("[VoxelTerrain3D] Add/paint material: %s" % MATERIAL_NAMES[_add_material - 1])
 
 func _is_drag_tool() -> bool:
 	return _active_tool == Tool.PAINT or _active_tool == Tool.PAINT_DELETE
@@ -177,6 +196,8 @@ func _active_radius() -> float:
 			return paint_radius
 		Tool.PAINT_DELETE:
 			return paint_delete_radius
+		Tool.BOULDER:
+			return boulder_radius
 		_:
 			return explosion_radius
 
@@ -203,13 +224,15 @@ func _process_brush(delta: float) -> void:
 func _apply_tool_at(point: Vector3) -> void:
 	match _active_tool:
 		Tool.ADD_TERRAIN:
-			terrain.add_terrain(point, add_radius)
+			terrain.add_terrain_with_material(point, add_radius, _add_material)
 		Tool.LARGE_EXPLODE:
 			terrain.trigger_explosion(point, large_explosion_radius)
 		Tool.PAINT:
-			terrain.add_terrain(point, paint_radius)
+			terrain.add_terrain_with_material(point, paint_radius, _add_material)
 		Tool.PAINT_DELETE:
 			terrain.trigger_explosion(point, paint_delete_radius)
+		Tool.BOULDER:
+			terrain.place_boulder(point, boulder_radius)
 		_:
 			terrain.trigger_explosion(point, explosion_radius)
 

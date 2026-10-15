@@ -12,6 +12,7 @@ using voxel::ChunkSlot;
 using voxel::ChunkStorageForm;
 using voxel::ChunkStore;
 using voxel::LocalCoord;
+using voxel::MaterialHardness;
 using voxel::MemoryLedger;
 using voxel::MemoryPoolId;
 using voxel::TsdfFormat;
@@ -247,6 +248,30 @@ void test_scoped_phase_write_lock_ordering() {
     std::printf("[PASS] test_scoped_phase_write_lock_ordering (32-chunk cap, ascending raw lock order)\n");
 }
 
+// ============================================================================
+// 6. Persistent Damage Hardness: Per-Material Damage & Break Thresholds
+// ============================================================================
+void test_material_hardness_thresholds() {
+    ++g_tests_run;
+
+    // Soil breaks on the 1st explosion: 1 * 85 >= 85.
+    REQUIRE(MaterialHardness::damage_per_hit(MaterialHardness::kMaterialSoil) == 85U);
+    REQUIRE(MaterialHardness::break_threshold(MaterialHardness::kMaterialSoil) == 85U);
+
+    // Hard rock takes 3 explosions: 85, 170, 255.
+    REQUIRE(MaterialHardness::damage_per_hit(MaterialHardness::kMaterialHardRock) == 85U);
+    REQUIRE(MaterialHardness::break_threshold(MaterialHardness::kMaterialHardRock) == 255U);
+
+    // Placed boulders take 5 explosions: 51, 102, 153, 204, 255.
+    REQUIRE(MaterialHardness::damage_per_hit(MaterialHardness::kMaterialBoulder) == 51U);
+    REQUIRE(MaterialHardness::break_threshold(MaterialHardness::kMaterialBoulder) == 255U);
+    REQUIRE(5U * MaterialHardness::damage_per_hit(MaterialHardness::kMaterialBoulder) == 255U);
+    REQUIRE(4U * MaterialHardness::damage_per_hit(MaterialHardness::kMaterialBoulder) <
+            MaterialHardness::break_threshold(MaterialHardness::kMaterialBoulder));
+
+    std::printf("[PASS] test_material_hardness_thresholds (soil 1-hit, hard rock 3-hit, boulder 5-hit)\n");
+}
+
 } // namespace
 
 int main() {
@@ -256,6 +281,7 @@ int main() {
     test_lazy_material_channel();
     test_memory_budget_ledger_ceiling();
     test_scoped_phase_write_lock_ordering();
+    test_material_hardness_thresholds();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",
                 g_tests_run, g_assertions_checked);
     return EXIT_SUCCESS;

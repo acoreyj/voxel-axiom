@@ -30,17 +30,28 @@ struct MaterialHardness {
     static constexpr uint8_t kMaterialAir      = 0;
     static constexpr uint8_t kMaterialSoil     = 1; // Soft terrain / standard rock: breaks in 1 explosion
     static constexpr uint8_t kMaterialHardRock = 2; // Hard Rock: takes 3 explosions to break, shows progressive cracks
+    static constexpr uint8_t kMaterialBoulder  = 3; // Placed boulder: takes 5 explosions to break
 
-    static constexpr uint8_t kDamagePerExplosionHit = 85; // 3 * 85 = 255
+    static constexpr uint8_t kDamagePerExplosionHit = 85; // soil / hard rock: 3 * 85 = 255
+    static constexpr uint8_t kBoulderDamagePerHit = 51;   // boulder: 5 * 51 = 255
+
+    /// Damage applied to one sample per explosion hit, by material.
+    [[nodiscard]] static constexpr uint8_t damage_per_hit(uint8_t material_id) noexcept {
+        if (material_id == kMaterialBoulder) {
+            return kBoulderDamagePerHit;
+        }
+        return kDamagePerExplosionHit;
+    }
 
     /// Returns the cumulative damage threshold in [0, 255] required before TSDF carving occurs.
     ///   - kMaterialSoil (1): threshold = 85  (1 hit  * 85 = 85  >= 85  -> breaks on 1st explosion)
     ///   - kMaterialHardRock (2): threshold = 255 (1st hit = 85, 2nd hit = 170, 3rd hit = 255 -> breaks on 3rd explosion)
+    ///   - kMaterialBoulder (3): threshold = 255 (51 damage/hit -> cracks on hits 1-4, shatters on the 5th)
     [[nodiscard]] static constexpr uint8_t break_threshold(uint8_t material_id) noexcept {
-        if (material_id == kMaterialHardRock) {
-            return 255U;
+        if (material_id == kMaterialSoil) {
+            return kDamagePerExplosionHit;
         }
-        return kDamagePerExplosionHit;
+        return 255U;
     }
 };
 

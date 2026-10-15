@@ -37,6 +37,9 @@ void VoxelTerrain3D::_bind_methods() {
 #if defined(VOXEL_WITH_GODOT_CPP)
     ClassDB::bind_method(D_METHOD("trigger_explosion", "position", "radius"), &VoxelTerrain3D::trigger_explosion);
     ClassDB::bind_method(D_METHOD("add_terrain", "position", "radius"), &VoxelTerrain3D::add_terrain);
+    ClassDB::bind_method(D_METHOD("add_terrain_with_material", "position", "radius", "material"),
+                         &VoxelTerrain3D::add_terrain_with_material);
+    ClassDB::bind_method(D_METHOD("place_boulder", "position", "radius"), &VoxelTerrain3D::place_boulder);
     ClassDB::bind_method(D_METHOD("raycast_terrain", "from", "to"), &VoxelTerrain3D::raycast_terrain);
     ClassDB::bind_method(D_METHOD("get_surface_height", "x", "z"), &VoxelTerrain3D::get_surface_height);
     ClassDB::bind_method(D_METHOD("save_world"), &VoxelTerrain3D::save_world);
@@ -308,6 +311,19 @@ void VoxelTerrain3D::trigger_explosion(Vector3 p_position, float p_radius) {
 }
 
 void VoxelTerrain3D::add_terrain(Vector3 p_position, float p_radius) {
+    _enqueue_fill(p_position, p_radius, voxel::MaterialHardness::kMaterialSoil);
+}
+
+void VoxelTerrain3D::add_terrain_with_material(Vector3 p_position, float p_radius, int p_material) {
+    const uint8_t material = static_cast<uint8_t>(std::clamp(p_material, 0, 255));
+    _enqueue_fill(p_position, p_radius, material);
+}
+
+void VoxelTerrain3D::place_boulder(Vector3 p_position, float p_radius) {
+    _enqueue_fill(p_position, p_radius, voxel::MaterialHardness::kMaterialBoulder);
+}
+
+void VoxelTerrain3D::_enqueue_fill(Vector3 p_position, float p_radius, uint8_t p_material) {
     if (!core_engine || p_radius <= 0.0f) {
         const std::string reason = "engine not ready or radius is non-positive";
 #if defined(VOXEL_WITH_GODOT_CPP)
@@ -319,7 +335,7 @@ void VoxelTerrain3D::add_terrain(Vector3 p_position, float p_radius) {
     }
 
     const voxel::Vec3f native_pos{p_position.x, p_position.y, p_position.z};
-    if (core_engine->worker_pool->enqueue_fill_spheres(native_pos, p_radius)) {
+    if (core_engine->worker_pool->enqueue_fill_spheres(native_pos, p_radius, p_material)) {
 #if defined(VOXEL_WITH_GODOT_CPP)
         emit_signal("terrain_add_requested", p_position, p_radius);
 #else

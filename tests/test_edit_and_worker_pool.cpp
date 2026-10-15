@@ -317,7 +317,102 @@ void test_persistent_damage_3_hit_hard_rock() {
 }
 
 // ============================================================================
-// 5. Multi-Threaded Worker Pool, Coalesced Blasts & Ordered Teardown (Section 5.3)
+// 5. Fill Transactions Tag the Selected Material (rock add / boulder placement)
+// ============================================================================
+void test_fill_tags_selected_material() {
+    ++g_tests_run;
+
+    MemoryLedger ledger;
+    ChunkStore store(ledger, /*world_height_chunks=*/8);
+    DualDirtyScheduler scheduler;
+    WorkerScratchWindow36 scratch(ledger);
+
+    EditTransaction tx = EditTransaction::create_from_spheres(
+        {SphereCsgTerm{Vec3f{16.0f, 16.0f, 16.0f}, /*radius=*/10.0f}}, 2.0f,
+        /*world_height_chunks=*/8, EditOperation::Fill, MaterialHardness::kMaterialHardRock);
+    while (!tx.is_finished()) {
+        (void)execute_next_edit_phase(store, scheduler, tx);
+    }
+
+    const ChunkKey ck = ChunkKey::from_coords(0, 0, 0);
+    const ChunkSlot* slot = store.find_slot(ck);
+    REQUIRE(slot != nullptr);
+
+    // Solid samples created by the fill carry the selected material.
+    REQUIRE(slot->get_tsdf(LocalCoord{16, 16, 16}) < 0);
+    REQUIRE(slot->get_material(LocalCoord{16, 16, 16}) == MaterialHardness::kMaterialHardRock);
+    REQUIRE(slot->get_material(LocalCoord{12, 16, 16}) == MaterialHardness::kMaterialHardRock);
+
+    // Air outside the filled sphere is not tagged as rock.
+    REQUIRE(slot->get_tsdf(LocalCoord{2, 2, 2}) == TsdfFormat::kClampedAir);
+    REQUIRE(slot->get_material(LocalCoord{2, 2, 2}) == MaterialHardness::kMaterialSoil);
+
+    // The mesher flags filled rock in vertex COLOR.g so the shader tints it.
+    const auto stamp = gather_scratch_window_36(store, ck, scratch);
+    const auto mesh = SurfaceNetsMesher::mesh_chunk_from_scratch_36(
+        ck, scratch, 1, stamp.captured_terrain_revision);
+    REQUIRE(!mesh.vertices.empty());
+    REQUIRE(mesh.colors.size() == mesh.vertices.size());
+    REQUIRE(mesh.colors.front().y == 1.0f);
+
+    std::printf("[PASS] test_fill_tags_selected_material (filled rock tagged + mesher COLOR.g)\n");
+}
+
+// ============================================================================
+// 6. Persistent Damage: 5-Hit Boulder Placement
+// ============================================================================
+void test_persistent_damage_5_hit_boulder() {
+    ++g_tests_run;
+
+    MemoryLedger ledger;
+    ChunkStore store(ledger, /*world_height_chunks=*/8);
+    DualDirtyScheduler scheduler;
+
+    // Place a boulder: a radius-5 sphere of kMaterialBoulder centred at (16, 16, 16).
+    {
+        EditTransaction place = EditTransaction::create_from_spheres(
+            {SphereCsgTerm{Vec3f{16.0f, 16.0f, 16.0f}, /*radius=*/5.0f}}, 2.0f,
+            /*world_height_chunks=*/8, EditOperation::Fill, MaterialHardness::kMaterialBoulder);
+        while (!place.is_finished()) {
+            (void)execute_next_edit_phase(store, scheduler, place);
+        }
+    }
+
+    ChunkSlot* slot = store.find_slot(ChunkKey::from_coords(0, 0, 0));
+    REQUIRE(slot != nullptr);
+    const LocalCoord core{16, 16, 16};
+    REQUIRE(slot->get_tsdf(core) < 0);
+    REQUIRE(slot->get_material(core) == MaterialHardness::kMaterialBoulder);
+
+    // Four explosions only crack it: 51, 102, 153, 204 (< 255).
+    for (uint8_t expected_dmg = 51U; expected_dmg <= 204U; expected_dmg += 51U) {
+        EditTransaction hit = EditTransaction::create_from_spheres(
+            {SphereCsgTerm{Vec3f{16.0f, 16.0f, 16.0f}, /*radius=*/9.5f}}, 2.0f, 8);
+        while (!hit.is_finished()) {
+            (void)execute_next_edit_phase(store, scheduler, hit);
+        }
+        REQUIRE(slot->get_damage(core) == expected_dmg);
+        REQUIRE(slot->get_tsdf(core) < 0);
+    }
+    REQUIRE(slot->has_damage_array());
+
+    // Fifth explosion reaches 255 >= threshold -> the boulder shatters to air.
+    {
+        EditTransaction hit = EditTransaction::create_from_spheres(
+            {SphereCsgTerm{Vec3f{16.0f, 16.0f, 16.0f}, /*radius=*/9.5f}}, 2.0f, 8);
+        while (!hit.is_finished()) {
+            (void)execute_next_edit_phase(store, scheduler, hit);
+        }
+    }
+    REQUIRE(slot->get_tsdf(core) == TsdfFormat::kClampedAir);
+    REQUIRE(slot->form == ChunkStorageForm::Empty);
+    REQUIRE(!slot->has_damage_array());
+
+    std::printf("[PASS] test_persistent_damage_5_hit_boulder (51x4 cracks, 5th shatters)\n");
+}
+
+// ============================================================================
+// 7. Multi-Threaded Worker Pool, Coalesced Blasts & Ordered Teardown (Section 5.3)
 // ============================================================================
 void test_worker_pool_concurrent_execution_and_teardown() {
     ++g_tests_run;
@@ -536,6 +631,8 @@ int main() {
     test_r_plus_delta_crater_wall_continuity();
     test_anti_crumb_kernel();
     test_persistent_damage_3_hit_hard_rock();
+    test_fill_tags_selected_material();
+    test_persistent_damage_5_hit_boulder();
     test_worker_pool_concurrent_execution_and_teardown();
     test_fill_add_terrain_union_semantics();
     test_fill_and_carve_do_not_coalesce();

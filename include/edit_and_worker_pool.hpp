@@ -75,6 +75,9 @@ struct EditTransaction {
 
     std::vector<SphereCsgTerm> spheres;
     EditOperation operation = EditOperation::Carve;
+    /// Material tagged on samples that become solid through a Fill transaction
+    /// (ignored by Carve). Lets add-terrain place rock or a boulder, not just soil.
+    uint8_t fill_material = MaterialHardness::kMaterialSoil;
     float truncation_delta = TsdfFormat::kDefaultTruncationDelta;
 
     IVec3 sample_min{};
@@ -91,11 +94,13 @@ struct EditTransaction {
         std::vector<SphereCsgTerm> terms,
         float delta = TsdfFormat::kDefaultTruncationDelta,
         int32_t world_height_chunks = 8,
-        EditOperation operation = EditOperation::Carve) {
+        EditOperation operation = EditOperation::Carve,
+        uint8_t fill_material = MaterialHardness::kMaterialSoil) {
         assert(!terms.empty() && terms.size() <= kMaxCoalescedSpheres);
         EditTransaction tx;
         tx.spheres = std::move(terms);
         tx.operation = operation;
+        tx.fill_material = fill_material;
         tx.truncation_delta = delta;
 
         int32_t min_x = INT32_MAX, min_y = INT32_MAX, min_z = INT32_MAX;
@@ -320,6 +325,12 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                                     if (slot->set_tsdf(lc, q_new, store.tsdf_pool(), &changed) && changed) {
                                         chunk_modified = true;
                                         local_dirty_mask.record_mutated_sample(lc);
+                                        // Tag newly filled solid samples with the selected material
+                                        // so placed rock/boulders carry their hardness.
+                                        if (q_new < 0) {
+                                            (void)slot->set_material(
+                                                lc, tx.fill_material, store.material_pool());
+                                        }
                                     }
                                 }
                             } else {
@@ -330,7 +341,7 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                                 const uint32_t added_dmg = std::min<uint32_t>(
                                     255U,
                                     static_cast<uint32_t>(spheres_hitting_sample) *
-                                        static_cast<uint32_t>(MaterialHardness::kDamagePerExplosionHit));
+                                        static_cast<uint32_t>(MaterialHardness::damage_per_hit(mat_id)));
                                 bool dmg_changed = false;
                                 const uint8_t total_dmg = slot->add_damage(
                                     lc, static_cast<uint8_t>(added_dmg), store.material_pool(), &dmg_changed);
@@ -564,8 +575,10 @@ public:
         return enqueue_sphere_transaction(EditOperation::Carve, position, radius);
     }
 
-    [[nodiscard]] bool enqueue_fill_spheres(Vec3f position, float radius) {
-        return enqueue_sphere_transaction(EditOperation::Fill, position, radius);
+    [[nodiscard]] bool enqueue_fill_spheres(Vec3f position,
+                                            float radius,
+                                            uint8_t material = MaterialHardness::kMaterialSoil) {
+        return enqueue_sphere_transaction(EditOperation::Fill, position, radius, material);
     }
 
     [[nodiscard]] std::optional<CompletionRecord> try_pop_completion() {
@@ -651,7 +664,10 @@ private:
         bool in_active_set = false;
     };
 
-    [[nodiscard]] bool enqueue_sphere_transaction(EditOperation operation, Vec3f position, float radius) {
+    [[nodiscard]] bool enqueue_sphere_transaction(EditOperation operation,
+                                                  Vec3f position,
+                                                  float radius,
+                                                  uint8_t fill_material = MaterialHardness::kMaterialSoil) {
         if (radius <= 0.0f ||
             !running_.load(std::memory_order_acquire) ||
             shutting_down_.load(std::memory_order_acquire)) {
@@ -667,6 +683,7 @@ private:
                 !edit_queue_.empty() &&
                 edit_queue_.back().next_phase_index == 0 &&
                 edit_queue_.back().operation == operation &&
+                edit_queue_.back().fill_material == fill_material &&
                 edit_queue_.back().spheres.size() < EditTransaction::kMaxCoalescedSpheres;
             if (can_coalesce) {
                 std::vector<SphereCsgTerm> combined = edit_queue_.back().spheres;
@@ -675,7 +692,8 @@ private:
                     std::move(combined),
                     TsdfFormat::kDefaultTruncationDelta,
                     store_.world_height_chunks(),
-                    operation);
+                    operation,
+                    fill_material);
             } else {
                 if (edit_queue_.size() >= kMaxPendingEditTransactions) {
                     return false;
@@ -684,7 +702,8 @@ private:
                     {SphereCsgTerm{position, radius}},
                     TsdfFormat::kDefaultTruncationDelta,
                     store_.world_height_chunks(),
-                    operation));
+                    operation,
+                    fill_material));
             }
         }
         cv_.notify_all();

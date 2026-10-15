@@ -229,13 +229,49 @@ void test_gdextension_streaming_explosion_and_nav_lifecycle() {
     REQUIRE(terrain.fully_committed());
 
     bool saw_terrain_add_completed = false;
+    std::size_t terrain_add_completed_count = 0;
     for (const auto& sig : terrain.emitted_signals()) {
         if (sig.name == "terrain_add_completed") {
             saw_terrain_add_completed = true;
+            ++terrain_add_completed_count;
             REQUIRE(sig.affected_chunks > 0);
         }
     }
     REQUIRE(saw_terrain_add_completed);
+
+    // 5f. Invalid material-fill / boulder radii fail cleanly through the same signals.
+    terrain.add_terrain_with_material(Vector3(16.0f, 48.0f, 16.0f), 0.0f, 2);
+    REQUIRE(terrain.emitted_signals().back().name == "terrain_add_failed");
+    terrain.place_boulder(Vector3(16.0f, 48.0f, 16.0f), -2.0f);
+    REQUIRE(terrain.emitted_signals().back().name == "terrain_add_failed");
+
+    // 5g. Rock-material fill and boulder placement route through the fill pipeline.
+    terrain.add_terrain_with_material(Vector3(20.0f, 48.0f, 16.0f), 5.0f, 2);
+    REQUIRE(terrain.emitted_signals().back().name == "terrain_add_requested");
+    terrain.place_boulder(Vector3(12.0f, 48.0f, 16.0f), 4.0f);
+    REQUIRE(terrain.emitted_signals().back().name == "terrain_add_requested");
+
+    const auto boulder_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (std::chrono::steady_clock::now() < boulder_deadline) {
+        terrain._process(0.016);
+        terrain.get_navigation_manager().complete_in_flight_async_bakes_and_advance_map_iteration();
+        terrain._process(0.016);
+        if (terrain.fully_committed()) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    REQUIRE(terrain.core_idle());
+    REQUIRE(terrain.fully_committed());
+
+    std::size_t final_add_completed_count = 0;
+    for (const auto& sig : terrain.emitted_signals()) {
+        if (sig.name == "terrain_add_completed") {
+            ++final_add_completed_count;
+        }
+    }
+    REQUIRE(final_add_completed_count >= terrain_add_completed_count + 2ULL);
 
     // 6. Ordered teardown via _exit_tree().
     terrain._exit_tree();

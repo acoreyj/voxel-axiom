@@ -573,11 +573,13 @@ public:
                 cell.vertex_index = static_cast<uint32_t>(out.vertices.size());
                 out.vertices.push_back(cell.local_pos);
                 out.normals.push_back(cell.normal);
-                // Pack damage ratio in [0, 1] into colors.x (R) and hard-rock flag into colors.y (G)
+                // Pack damage ratio in [0, 1] into colors.x (R) and the rock flag into colors.y (G).
+                // Placed boulders share the hard-rock tint and progressive crack visuals.
                 const float dmg_ratio = static_cast<float>(cell.damage) / 255.0f;
-                const float is_hard_rock =
-                    (cell.material_id == MaterialHardness::kMaterialHardRock) ? 1.0f : 0.0f;
-                out.colors.push_back(Vec3f{dmg_ratio, is_hard_rock, 0.0f});
+                const float is_rock =
+                    (cell.material_id == MaterialHardness::kMaterialHardRock ||
+                     cell.material_id == MaterialHardness::kMaterialBoulder) ? 1.0f : 0.0f;
+                out.colors.push_back(Vec3f{dmg_ratio, is_rock, 0.0f});
             }
             return cell.vertex_index;
         };
