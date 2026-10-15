@@ -158,6 +158,17 @@ void test_gdextension_streaming_explosion_and_nav_lifecycle() {
         terrain.raycast_terrain(Vector3(16.0f, 90.0f, 16.0f), Vector3(16.0f, 250.0f, 16.0f));
     REQUIRE(std::isinf(sky_hit.x));
 
+    // 3d. The material-aware raycast reports the solid sample behind the surface:
+    // the streamed surface at (16, ?, 16) is soil or a hard-rock vein, and a sky
+    // ray reports the -1 miss sentinel.
+    const int down_material =
+        terrain.raycast_terrain_material(Vector3(16.0f, 90.0f, 16.0f), Vector3(16.0f, 0.0f, 16.0f));
+    REQUIRE(down_material == voxel::MaterialHardness::kMaterialSoil ||
+            down_material == voxel::MaterialHardness::kMaterialHardRock);
+    const int sky_material =
+        terrain.raycast_terrain_material(Vector3(16.0f, 90.0f, 16.0f), Vector3(16.0f, 250.0f, 16.0f));
+    REQUIRE(sky_material == -1);
+
     // 4. Invalid explosion radius (<= 0) must emit explosion_failed immediately.
     terrain.trigger_explosion(Vector3(16.0f, 48.0f, 16.0f), -1.0f);
     REQUIRE(!terrain.emitted_signals().empty());

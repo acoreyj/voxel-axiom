@@ -4,6 +4,7 @@
 #include "stage_timings.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <cmath>
@@ -49,7 +50,7 @@ struct NavigationGroupKeyHash {
 };
 
 // ============================================================================
-// 2. Sphere CSG Primitives & Phased Edit Transaction (Sections 3.2, 3.4, 3.5)
+// 2. Sphere CSG & Elemental Trigger Primitives (Sections 3.2, 3.4, 3.5)
 // ============================================================================
 struct Vec3f {
     float x = 0.0f;
@@ -62,6 +63,9 @@ struct SphereCsgTerm {
     float radius = 0.0f;
     bool is_fill = false;
     uint8_t fill_material = MaterialHardness::kMaterialSoil;
+    /// When != None the term is a Water/Frost/Lava trigger volume instead of a CSG
+    /// blast or fill: it transmutes/reacts with existing solid matter inside R.
+    ElementalKind elemental_kind = ElementalKind::None;
 };
 
 struct EditTransaction {
@@ -167,9 +171,12 @@ struct ChunkMeshPayload {
     uint64_t captured_terrain_revision = 0;
     std::vector<Vec3f> vertices;
     std::vector<Vec3f> normals;
-    // Per-vertex attributes: x = damage_ratio in [0, 1], y = is_hard_rock (0 or 1),
-    // z = hits-to-break / 255 (3/255 hard rock, 5/255 boulder, else 1/255). The shader keys
-    // boulder-vs-hard-rock material separation off z (hits-to-break), not y.
+    // Per-vertex attributes:
+    //   x (R) = damage_ratio in [0, 1]
+    //   y (G) = is_hard_rock_or_obsidian (0 or 1)
+    //   z (B) = material domain: elemental codes use >= 0.25 (0.25=Lava, 0.50=Water,
+    //           0.75=Obsidian, 1.0=Ice); rock materials keep hits-to-break / 255
+    //           (3/255 hard rock, 5/255 boulder, else 1/255), which can never reach 0.25.
     std::vector<Vec3f> colors;
     std::vector<int32_t> indices;
     std::vector<Vec3f> collision_faces;
@@ -196,8 +203,110 @@ struct CompletionRecord {
 };
 
 // ============================================================================
-// 4. 26-Neighbor Closure Readiness Check & Phased CSG + Persistent Damage Executor
+// 4. Cellular Automata Elemental Step & Phased CSG + Persistent Damage Executor
 // ============================================================================
+
+/// Runs a 6-neighbor cellular automata elemental contact pass inside a locked ChunkSlot:
+///   - Solid `kMaterialLava` touching adjacent solid `kMaterialWater` or `kMaterialIce`
+///     quenches into 3-hit `kMaterialObsidian` (and resets any accumulated damage).
+///   - Solid `kMaterialIce` touching adjacent solid `kMaterialLava` melts into air (`kClampedAir`).
+inline bool step_elemental_automata_in_chunk(
+    ChunkStore& store,
+    ChunkSlot* slot,
+    SelectiveDirtyMask& dirty_mask,
+    float delta = TsdfFormat::kDefaultTruncationDelta) {
+
+    if (slot->form == ChunkStorageForm::Empty || !slot->has_material_array()) {
+        return false;
+    }
+
+    struct AutomataTransition {
+        LocalCoord lc;
+        uint8_t new_material;
+        bool melt_to_air;
+    };
+    std::vector<AutomataTransition> transitions;
+
+    static constexpr std::array<IVec3, 6> kOffsets6 = {{
+        {-1, 0, 0}, {+1, 0, 0},
+        {0, -1, 0}, {0, +1, 0},
+        {0, 0, -1}, {0, 0, +1}
+    }};
+
+    for (int32_t lz = 0; lz < 32; ++lz) {
+        for (int32_t ly = 0; ly < 32; ++ly) {
+            for (int32_t lx = 0; lx < 32; ++lx) {
+                const LocalCoord lc{lx, ly, lz};
+                if (slot->get_tsdf(lc) >= 0) {
+                    continue;
+                }
+                const uint8_t mat = slot->get_material(lc);
+                if (mat != MaterialHardness::kMaterialLava &&
+                    mat != MaterialHardness::kMaterialIce) {
+                    continue;
+                }
+
+                bool touches_water_or_ice = false;
+                bool touches_lava = false;
+
+                for (const IVec3& off : kOffsets6) {
+                    const int32_t nx = lx + off.x;
+                    const int32_t ny = ly + off.y;
+                    const int32_t nz = lz + off.z;
+                    if (nx < 0 || nx >= 32 || ny < 0 || ny >= 32 || nz < 0 || nz >= 32) {
+                        continue;
+                    }
+                    const LocalCoord nlc{nx, ny, nz};
+                    if (slot->get_tsdf(nlc) >= 0) {
+                        continue;
+                    }
+                    const uint8_t nmat = slot->get_material(nlc);
+                    if (nmat == MaterialHardness::kMaterialWater ||
+                        nmat == MaterialHardness::kMaterialIce) {
+                        touches_water_or_ice = true;
+                    } else if (nmat == MaterialHardness::kMaterialLava) {
+                        touches_lava = true;
+                    }
+                }
+
+                if (mat == MaterialHardness::kMaterialLava && touches_water_or_ice) {
+                    transitions.push_back(AutomataTransition{
+                        lc, MaterialHardness::kMaterialObsidian, /*melt_to_air=*/false});
+                } else if (mat == MaterialHardness::kMaterialIce && touches_lava) {
+                    transitions.push_back(AutomataTransition{
+                        lc, MaterialHardness::kMaterialAir, /*melt_to_air=*/true});
+                }
+            }
+        }
+    }
+
+    if (transitions.empty()) {
+        return false;
+    }
+
+    bool modified = false;
+    for (const AutomataTransition& tr : transitions) {
+        if (tr.melt_to_air) {
+            bool changed = false;
+            const int16_t q_melted = TsdfFormat::encode(+1.0f, delta);
+            if (slot->set_tsdf(tr.lc, q_melted, store.tsdf_pool(), &changed) && changed) {
+                modified = true;
+                dirty_mask.record_mutated_sample(tr.lc);
+            }
+            (void)slot->set_material(tr.lc, MaterialHardness::kMaterialAir, store.material_pool());
+            (void)slot->clear_damage(tr.lc);
+        } else {
+            if (slot->get_material(tr.lc) != tr.new_material) {
+                (void)slot->set_material(tr.lc, tr.new_material, store.material_pool());
+                (void)slot->clear_damage(tr.lc);
+                modified = true;
+                dirty_mask.record_mutated_sample(tr.lc);
+            }
+        }
+    }
+
+    return modified;
+}
 
 [[nodiscard]] inline bool are_all_in_bounds_neighbors_resident(
     const ChunkStore& store,
@@ -232,10 +341,15 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
     const std::vector<ChunkKey>& phase_keys = tx.phases[phase_idx];
 
     bool has_any_fill = false;
+    bool has_any_elemental = false;
+    bool has_any_carve = false;
     for (const SphereCsgTerm& s : tx.spheres) {
         if (s.is_fill) {
             has_any_fill = true;
-            break;
+        } else if (s.elemental_kind != ElementalKind::None) {
+            has_any_elemental = true;
+        } else {
+            has_any_carve = true;
         }
     }
 
@@ -277,7 +391,7 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
             float d_blast = -1e30f;
             int hits = 0;
             for (const SphereCsgTerm& s : tx.spheres) {
-                if (s.is_fill) continue;
+                if (s.is_fill || s.elemental_kind != ElementalKind::None) continue;
                 const float dx = px - s.center.x;
                 const float dy = py - s.center.y;
                 const float dz = pz - s.center.z;
@@ -297,7 +411,7 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
         };
 
         for (ChunkSlot* slot : phase_lock.slots()) {
-            if (slot->form == ChunkStorageForm::Empty && !has_any_fill) {
+            if (slot->form == ChunkStorageForm::Empty && !has_any_fill && !has_any_elemental) {
                 continue;
             }
 
@@ -337,7 +451,7 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                         bool touched_by_fill = false;
 
                         for (const SphereCsgTerm& s : tx.spheres) {
-                            if (!s.is_fill) continue;
+                            if (!s.is_fill || s.elemental_kind != ElementalKind::None) continue;
                             const float dx = px - s.center.x;
                             const float dy = py - s.center.y;
                             const float dz = pz - s.center.z;
@@ -372,7 +486,118 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                             }
                         }
 
+                        // 1b. Handle Bananza-style Elemental Trigger Volumes (Water, Frost, Lava)
+                        for (const SphereCsgTerm& s : tx.spheres) {
+                            if (s.elemental_kind == ElementalKind::None) continue;
+                            const float dx = px - s.center.x;
+                            const float dy = py - s.center.y;
+                            const float dz = pz - s.center.z;
+                            const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+                            const float d_elem = dist - s.radius; // <= 0 inside elemental sphere
+
+                            if (d_elem >= delta) {
+                                continue;
+                            }
+
+                            const int16_t q_cur = slot->get_tsdf(lc);
+                            const uint8_t cur_mat = slot->get_material(lc);
+
+                            if (s.elemental_kind == ElementalKind::Water) {
+                                // Water Trigger Volume:
+                                // - Solid Lava (kMaterialLava) inside R quenches into 3-hit Obsidian (kMaterialObsidian)!
+                                // - Any damaged rock inside R is cooled (damage cleared).
+                                if (d_elem <= 0.0f && q_cur < 0) {
+                                    if (cur_mat == MaterialHardness::kMaterialLava) {
+                                        if (slot->set_material(
+                                                lc, MaterialHardness::kMaterialObsidian, store.material_pool())) {
+                                            chunk_modified = true;
+                                            local_dirty_mask.record_mutated_sample(lc);
+                                        }
+                                    }
+                                    if (slot->clear_damage(lc)) {
+                                        chunk_modified = true;
+                                        local_dirty_mask.record_mutated_sample(lc);
+                                    }
+                                }
+                            } else if (s.elemental_kind == ElementalKind::Frost) {
+                                // Frost Trigger Volume:
+                                // - Quenches solid Lava -> 3-hit Obsidian on contact.
+                                // - Flips Air (q_cur >= 0) or Water (kMaterialWater) -> solid Ice (kMaterialIce)
+                                //   with smooth R + delta TSDF surface!
+                                if (q_cur < 0 && d_elem <= 0.0f) {
+                                    if (cur_mat == MaterialHardness::kMaterialLava) {
+                                        (void)slot->set_material(
+                                            lc, MaterialHardness::kMaterialObsidian, store.material_pool());
+                                        (void)slot->clear_damage(lc);
+                                        chunk_modified = true;
+                                        local_dirty_mask.record_mutated_sample(lc);
+                                    } else if (cur_mat == MaterialHardness::kMaterialWater) {
+                                        (void)slot->set_material(
+                                            lc, MaterialHardness::kMaterialIce, store.material_pool());
+                                        (void)slot->clear_damage(lc);
+                                        chunk_modified = true;
+                                        local_dirty_mask.record_mutated_sample(lc);
+                                    }
+                                } else {
+                                    const int16_t q_ice = TsdfFormat::encode(d_elem, delta);
+                                    const int16_t q_new = std::min(q_cur, q_ice);
+                                    if (q_new != q_cur) {
+                                        bool changed = false;
+                                        if (slot->set_tsdf(lc, q_new, store.tsdf_pool(), &changed) && changed) {
+                                            chunk_modified = true;
+                                            local_dirty_mask.record_mutated_sample(lc);
+                                        }
+                                    }
+                                    if (d_elem <= 0.0f && q_new < 0) {
+                                        (void)slot->set_material(
+                                            lc, MaterialHardness::kMaterialIce, store.material_pool());
+                                        (void)slot->clear_damage(lc);
+                                    }
+                                }
+                            } else if (s.elemental_kind == ElementalKind::Lava) {
+                                // Lava Trigger Volume:
+                                // - Melts solid Ice (kMaterialIce) back into Air!
+                                // - Contacts Water (kMaterialWater) -> solidifies into 3-hit Obsidian!
+                                // - Transmutes Soil (kMaterialSoil) inside R into glowing molten Lava!
+                                if (q_cur < 0) {
+                                    if (cur_mat == MaterialHardness::kMaterialIce) {
+                                        const int16_t q_melt = TsdfFormat::encode(-d_elem, delta);
+                                        const int16_t q_new = std::max(q_cur, q_melt);
+                                        if (q_new != q_cur) {
+                                            bool changed = false;
+                                            if (slot->set_tsdf(lc, q_new, store.tsdf_pool(), &changed) && changed) {
+                                                chunk_modified = true;
+                                                local_dirty_mask.record_mutated_sample(lc);
+                                            }
+                                        }
+                                        if (q_new >= 0) {
+                                            (void)slot->set_material(
+                                                lc, MaterialHardness::kMaterialAir, store.material_pool());
+                                        }
+                                        (void)slot->clear_damage(lc);
+                                    } else if (d_elem <= 0.0f) {
+                                        if (cur_mat == MaterialHardness::kMaterialWater) {
+                                            (void)slot->set_material(
+                                                lc, MaterialHardness::kMaterialObsidian, store.material_pool());
+                                            (void)slot->clear_damage(lc);
+                                            chunk_modified = true;
+                                            local_dirty_mask.record_mutated_sample(lc);
+                                        } else if (cur_mat == MaterialHardness::kMaterialSoil) {
+                                            (void)slot->set_material(
+                                                lc, MaterialHardness::kMaterialLava, store.material_pool());
+                                            (void)slot->clear_damage(lc);
+                                            chunk_modified = true;
+                                            local_dirty_mask.record_mutated_sample(lc);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         // 2. Handle Carve / Blast terms
+                        if (!has_any_carve) {
+                            continue;
+                        }
                         int spheres_hitting_interior = 0;
                         const float d_blast = eval_carve_spheres(px, py, pz, &spheres_hitting_interior);
 
@@ -593,6 +818,12 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                 }
             }
 
+            // Pass 3: Run 6-neighbor Cellular Automata Elemental Contact Pass
+            // (e.g., Lava adjacent to Water or Ice quenches into 3-hit Obsidian, Ice adjacent to Lava melts).
+            if (step_elemental_automata_in_chunk(store, slot, local_dirty_mask, delta)) {
+                chunk_modified = true;
+            }
+
             if (chunk_modified) {
                 slot->try_demote_if_uniform(store.tsdf_pool(), store.material_pool());
                 slot->dirty_persist = true;
@@ -797,8 +1028,19 @@ public:
                                           MaterialHardness::kMaterialSoil);
     }
 
+    /// Enqueues a Water / Frost / Lava elemental trigger volume (ElementalKind::None
+    /// falls through to a plain explosion).
+    [[nodiscard]] bool enqueue_elemental_sphere(Vec3f position, float radius, ElementalKind kind) {
+        if (kind == ElementalKind::None) {
+            return enqueue_explosion(position, radius);
+        }
+        return enqueue_sphere_transaction(/*is_fill=*/false, position, radius,
+                                          MaterialHardness::kMaterialSoil, kind);
+    }
+
     /// Add-terrain / boulder placement: fills a sphere with the selected material.
-    /// Fill transactions never coalesce with explosions or fills of another material.
+    /// Fill transactions never coalesce with explosions or fills of another material,
+    /// and elemental trigger volumes only coalesce with the same element.
     [[nodiscard]] bool enqueue_fill_spheres(Vec3f position,
                                             float radius,
                                             uint8_t material = MaterialHardness::kMaterialSoil) {
@@ -891,7 +1133,8 @@ private:
     [[nodiscard]] bool enqueue_sphere_transaction(bool is_fill,
                                                   Vec3f position,
                                                   float radius,
-                                                  uint8_t fill_material) {
+                                                  uint8_t fill_material,
+                                                  ElementalKind elemental_kind = ElementalKind::None) {
         if (radius <= 0.0f ||
             !running_.load(std::memory_order_acquire) ||
             shutting_down_.load(std::memory_order_acquire)) {
@@ -903,6 +1146,7 @@ private:
         term.radius = radius;
         term.is_fill = is_fill;
         term.fill_material = fill_material;
+        term.elemental_kind = elemental_kind;
 
         {
             std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -910,14 +1154,15 @@ private:
                 return false;
             }
             // Coalesce only with a not-yet-started transaction of the same kind, so a
-            // fill never merges into an explosion blast (or a fill of another material).
+            // fill never merges into an explosion blast (or a fill of another material),
+            // and elemental trigger volumes only merge with the same element.
             const auto back_is_compatible = [&](const EditTransaction& back) noexcept {
                 if (back.next_phase_index != 0 ||
                     back.spheres.size() >= EditTransaction::kMaxCoalescedSpheres) {
                     return false;
                 }
                 for (const SphereCsgTerm& s : back.spheres) {
-                    if (s.is_fill != is_fill) {
+                    if (s.is_fill != is_fill || s.elemental_kind != elemental_kind) {
                         return false;
                     }
                     if (is_fill && s.fill_material != fill_material) {

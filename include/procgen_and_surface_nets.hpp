@@ -93,6 +93,11 @@ struct CaveNoiseGenerator {
     Vec3f demo_hard_boulder_center{16.0f, 70.0f, 24.0f};
     float demo_hard_boulder_radius = 7.5f;
 
+    // Showcase Molten Lava dome right beside the boulder at (30, 69, 24) so players can
+    // splash Water/Frost on it to turn 1-hit Lava into 3-hit Obsidian!
+    Vec3f demo_lava_dome_center{30.0f, 69.0f, 24.0f};
+    float demo_lava_dome_radius = 5.5f;
+
     static constexpr float kEpsilonGrad = 0.05f; // Regularization floor (Section 3.5.2)
 
     [[nodiscard]] static constexpr float fade(float t) noexcept {
@@ -150,6 +155,13 @@ struct CaveNoiseGenerator {
         return std::sqrt(dx * dx + dy * dy + dz * dz) - demo_hard_boulder_radius;
     }
 
+    [[nodiscard]] float lava_dome_sdf(float wx, float wy, float wz) const noexcept {
+        const float dx = wx - demo_lava_dome_center.x;
+        const float dy = wy - demo_lava_dome_center.y;
+        const float dz = wz - demo_lava_dome_center.z;
+        return std::sqrt(dx * dx + dy * dy + dz * dz) - demo_lava_dome_radius;
+    }
+
     /// Returns true if world position (wx, wy, wz) belongs to a 3-hit Hard Rock formation
     /// (either the showcase boulder in front of the camera or procedural hard-rock outcrops).
     [[nodiscard]] bool is_hard_rock_region(float wx, float wy, float wz) const noexcept {
@@ -158,6 +170,24 @@ struct CaveNoiseGenerator {
         }
         const float vein = smooth_noise_3d(wx * 0.045f, wy * 0.045f, wz * 0.045f, seed + 707U);
         return vein > 0.38f;
+    }
+
+    /// Returns true if world position (wx, wy, wz) belongs to the showcase Lava dome or deep magma veins.
+    [[nodiscard]] bool is_lava_region(float wx, float wy, float wz) const noexcept {
+        if (lava_dome_sdf(wx, wy, wz) <= 1.5f) {
+            return true;
+        }
+        if (wy < 28.0f) {
+            const float magma = smooth_noise_3d(wx * 0.05f, wy * 0.05f, wz * 0.05f, seed + 909U);
+            return magma > 0.52f;
+        }
+        return false;
+    }
+
+    /// Combined solid density of the decorative formations: the 3-hit Hard Rock showcase
+    /// boulder and the molten Lava showcase dome (both min-combined into the terrain).
+    [[nodiscard]] float props_sdf(float wx, float wy, float wz) const noexcept {
+        return std::min(hard_boulder_sdf(wx, wy, wz), lava_dome_sdf(wx, wy, wz));
     }
 
     /// Evaluates composite surface + 3D dual-noise spaghetti cave density D(x, y, z)
@@ -172,7 +202,7 @@ struct CaveNoiseGenerator {
         // Cave generation is optional: when disabled, the terrain is the pure
         // 2D surface + overhang field with no 3D cavities carved into it.
         if (!caves_enabled) {
-            return std::min(d_surf, hard_boulder_sdf(wx, wy, wz));
+            return std::min(d_surf, props_sdf(wx, wy, wz));
         }
 
         // 2. 3D Dual-Noise Ridge Intersection Cave Density:
@@ -187,9 +217,9 @@ struct CaveNoiseGenerator {
         const float n_b = 20.0f * smooth_noise_3d(wx * 0.022f, wy * 0.028f, wz * 0.022f, seed + 303U);
         const float d_cave = r_y - std::sqrt(n_a * n_a + n_b * n_b);
 
-        // 3. Combined density: D(x,y,z) = min(max(D_surf, D_cave), D_boulder)
+        // 3. Combined density: D(x,y,z) = min(max(D_surf, D_cave), D_props)
         const float terrain_and_caves = std::max(d_surf, d_cave);
-        return std::min(terrain_and_caves, hard_boulder_sdf(wx, wy, wz));
+        return std::min(terrain_and_caves, props_sdf(wx, wy, wz));
     }
 
     /// Pass 2 of chunk population: converts an already-filled 34^3 ([-1..32]^3) density
@@ -197,10 +227,11 @@ struct CaveNoiseGenerator {
     /// regularized gradient normalization max(||grad D||, 0.05), then publishes the slot
     /// as Resident (HLD v4.0 Section 3.5.2). Shared by the generic density-fn path and the
     /// cached composite-density path so both stay bit-identical.
-    /// @param mark_hard_rock  When true, solid samples inside a Hard Rock formation
-    ///   (showcase boulder or procedural hard-rock veins) are tagged
-    ///   `MaterialHardness::kMaterialHardRock` so explosions crack them over 3 hits
-    ///   instead of shattering them on the first.
+    /// @param mark_hard_rock  When true, solid samples inside a formation are tagged by
+    ///   region: the showcase Lava dome and deep magma veins become
+    ///   `MaterialHardness::kMaterialLava`, while the Hard Rock showcase boulder and
+    ///   procedural hard-rock veins become `MaterialHardness::kMaterialHardRock` so
+    ///   explosions crack them over 3 hits instead of shattering them on the first.
     void encode_chunk_from_density_grid(
         ChunkStore& store,
         ChunkKey chunk_key,
@@ -236,7 +267,10 @@ struct CaveNoiseGenerator {
                         const float wx = static_cast<float>(chunk_min.x + lx) * voxel_scale;
                         const float wy = static_cast<float>(chunk_min.y + ly) * voxel_scale;
                         const float wz = static_cast<float>(chunk_min.z + lz) * voxel_scale;
-                        if (is_hard_rock_region(wx, wy, wz)) {
+                        if (is_lava_region(wx, wy, wz)) {
+                            (void)slot->set_material(
+                                lc, MaterialHardness::kMaterialLava, store.material_pool());
+                        } else if (is_hard_rock_region(wx, wy, wz)) {
                             (void)slot->set_material(
                                 lc, MaterialHardness::kMaterialHardRock, store.material_pool());
                         }
@@ -315,7 +349,7 @@ struct CaveNoiseGenerator {
                     // Cave generation is optional: when disabled, the terrain is the pure
                     // 2D surface + overhang field with no 3D cavities carved into it.
                     if (!caves_enabled) {
-                        grid34.set(lx, ly, lz, std::min(d_surf, hard_boulder_sdf(wx, wy, wz)));
+                        grid34.set(lx, ly, lz, std::min(d_surf, props_sdf(wx, wy, wz)));
                         continue;
                     }
 
@@ -326,7 +360,7 @@ struct CaveNoiseGenerator {
                     const float n_b = 20.0f * smooth_noise_3d(wx * 0.022f, wy * 0.028f, wz * 0.022f, seed + 303U);
                     const float d_cave = r_y - std::sqrt(n_a * n_a + n_b * n_b);
 
-                    grid34.set(lx, ly, lz, std::min(std::max(d_surf, d_cave), hard_boulder_sdf(wx, wy, wz)));
+                    grid34.set(lx, ly, lz, std::min(std::max(d_surf, d_cave), props_sdf(wx, wy, wz)));
                 }
             }
         }
@@ -581,18 +615,24 @@ public:
                 cell.vertex_index = static_cast<uint32_t>(out.vertices.size());
                 out.vertices.push_back(cell.local_pos);
                 out.normals.push_back(cell.normal);
-                // Pack damage ratio in [0, 1] into colors.x (R), the rock flag into colors.y (G)
-                // and hits-to-break / 255 into colors.z (B). 3-hit Hard Rock and 5-hit placed
-                // boulders both set the rock flag, so the shader further separates them by
-                // hits-to-break (B): boulders render as warm speckled matte granite, Hard Rock as
-                // dark metallic basalt. Only persistent-damage materials carry a non-zero damage
-                // ratio; grass/dirt emit 0.0.
+                // Pack damage ratio in [0, 1] into colors.x (R), the persistent-damage rock
+                // flag into colors.y (G) and the material domain into colors.z (B):
+                //   - elemental materials (Lava/Water/Obsidian/Ice) carry their
+                //     shader_material_code (0.25 / 0.50 / 0.75 / 1.00),
+                //   - rock materials carry hits-to-break / 255 (3/255 Hard Rock, 5/255 placed
+                //     boulder, else 1/255) so the shader separates boulder-vs-hard-rock and
+                //     keys its damage ramp off hits remaining.
+                // Both domains are disjoint: every elemental code is >= 0.25 while hits <= 5/255.
+                // Only persistent-damage materials carry a non-zero damage ratio; grass/dirt
+                // emit 0.0.
                 const bool is_hard_rock_mat = MaterialHardness::supports_persistent_damage(cell.material_id);
                 const float dmg_ratio =
                     is_hard_rock_mat ? (static_cast<float>(cell.damage) / 255.0f) : 0.0f;
                 const float is_rock = is_hard_rock_mat ? 1.0f : 0.0f;
-                const float hits_norm =
-                    static_cast<float>(MaterialHardness::hits_to_break(cell.material_id)) / 255.0f;
+                const float mat_code = MaterialHardness::shader_material_code(cell.material_id);
+                const float hits_norm = (mat_code > 0.0f)
+                                            ? mat_code
+                                            : (static_cast<float>(MaterialHardness::hits_to_break(cell.material_id)) / 255.0f);
                 out.colors.push_back(Vec3f{dmg_ratio, is_rock, hits_norm});
             }
             return cell.vertex_index;

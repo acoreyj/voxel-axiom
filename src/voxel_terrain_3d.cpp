@@ -36,11 +36,15 @@ uint64_t monotonic_ticks_usec() noexcept {
 void VoxelTerrain3D::_bind_methods() {
 #if defined(VOXEL_WITH_GODOT_CPP)
     ClassDB::bind_method(D_METHOD("trigger_explosion", "position", "radius"), &VoxelTerrain3D::trigger_explosion);
+    ClassDB::bind_method(D_METHOD("trigger_elemental_sphere", "position", "radius", "element_kind"),
+                         &VoxelTerrain3D::trigger_elemental_sphere);
     ClassDB::bind_method(D_METHOD("add_terrain", "position", "radius"), &VoxelTerrain3D::add_terrain);
     ClassDB::bind_method(D_METHOD("add_terrain_with_material", "position", "radius", "material"),
                          &VoxelTerrain3D::add_terrain_with_material);
     ClassDB::bind_method(D_METHOD("place_boulder", "position", "radius"), &VoxelTerrain3D::place_boulder);
     ClassDB::bind_method(D_METHOD("raycast_terrain", "from", "to"), &VoxelTerrain3D::raycast_terrain);
+    ClassDB::bind_method(D_METHOD("raycast_terrain_material", "from", "to"),
+                         &VoxelTerrain3D::raycast_terrain_material);
     ClassDB::bind_method(D_METHOD("get_surface_height", "x", "z"), &VoxelTerrain3D::get_surface_height);
     ClassDB::bind_method(D_METHOD("save_world"), &VoxelTerrain3D::save_world);
     ClassDB::bind_method(D_METHOD("set_stream_focus", "position", "velocity"), &VoxelTerrain3D::set_stream_focus);
@@ -310,6 +314,44 @@ void VoxelTerrain3D::trigger_explosion(Vector3 p_position, float p_radius) {
     }
 }
 
+void VoxelTerrain3D::trigger_elemental_sphere(Vector3 p_position, float p_radius, int p_element_kind) {
+    if (p_element_kind <= 0) {
+        trigger_explosion(p_position, p_radius);
+        return;
+    }
+
+    if (!core_engine || p_radius <= 0.0f) {
+        const std::string reason = "engine not ready or radius is non-positive";
+#if defined(VOXEL_WITH_GODOT_CPP)
+        emit_signal("explosion_failed", String(reason.c_str()));
+#else
+        emitted_signals_.push_back(EmittedSignalRecord{"explosion_failed", {}, 0.0f, 0, reason, 0});
+#endif
+        return;
+    }
+
+    // Bananza-style elemental trigger volumes: 1 = Water, 2 = Frost, 3 = Lava.
+    const int clamped_kind = std::clamp(p_element_kind, 0, 3);
+    const auto elem_kind = static_cast<voxel::ElementalKind>(clamped_kind);
+    const voxel::Vec3f native_pos{p_position.x, p_position.y, p_position.z};
+
+    if (core_engine->worker_pool->enqueue_elemental_sphere(native_pos, p_radius, elem_kind)) {
+#if defined(VOXEL_WITH_GODOT_CPP)
+        emit_signal("explosion_requested", p_position, p_radius);
+#else
+        emitted_signals_.push_back(
+            EmittedSignalRecord{"explosion_requested", p_position, p_radius, 0, {}, 0});
+#endif
+    } else {
+        const std::string reason = "edit queue full, engine shutting down, or out of bounds";
+#if defined(VOXEL_WITH_GODOT_CPP)
+        emit_signal("explosion_failed", String(reason.c_str()));
+#else
+        emitted_signals_.push_back(EmittedSignalRecord{"explosion_failed", {}, 0.0f, 0, reason, 0});
+#endif
+    }
+}
+
 void VoxelTerrain3D::add_terrain(Vector3 p_position, float p_radius) {
     _enqueue_fill(p_position, p_radius, voxel::MaterialHardness::kMaterialSoil);
 }
@@ -365,6 +407,20 @@ Vector3 VoxelTerrain3D::raycast_terrain(Vector3 p_from, Vector3 p_to) const {
         return Vector3(kInf, kInf, kInf);
     }
     return Vector3(hit->x, hit->y, hit->z);
+}
+
+int VoxelTerrain3D::raycast_terrain_material(Vector3 p_from, Vector3 p_to) const {
+    if (!core_engine) {
+        return -1;
+    }
+    const std::optional<voxel::TerrainMaterialHit> hit = voxel::raycast_terrain_material(
+        core_engine->store,
+        voxel::Vec3f{p_from.x, p_from.y, p_from.z},
+        voxel::Vec3f{p_to.x, p_to.y, p_to.z});
+    if (!hit.has_value()) {
+        return -1;
+    }
+    return static_cast<int>(hit->material_id);
 }
 
 float VoxelTerrain3D::get_surface_height(float p_x, float p_z) const {

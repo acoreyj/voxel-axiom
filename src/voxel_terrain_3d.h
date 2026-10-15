@@ -54,9 +54,14 @@ public:
 
     // Core GDScript-exposed API (Section 4.2)
     void trigger_explosion(Vector3 p_position, float p_radius);
+    /// Fires an elemental reaction sphere: `p_element_kind` 1 = Water quench
+    /// (Lava -> 3-hit Obsidian, cools crack damage), 2 = Frost (Air/Water -> Ice,
+    /// Lava -> Obsidian), 3 = Lava (Soil -> Lava, melts Ice, Water -> Obsidian).
+    /// Kind 0 falls through to trigger_explosion(); kinds are clamped to [0, 3].
+    void trigger_elemental_sphere(Vector3 p_position, float p_radius, int p_element_kind);
     void add_terrain(Vector3 p_position, float p_radius);
     /// Fills a sphere tagged with `p_material` (1 = soil, 2 = 3-hit hard rock,
-    /// 3 = 5-hit boulder). Values outside [0, 255] are clamped.
+    /// 5 = 3-hit obsidian, 7 = 5-hit boulder). Values outside [0, 255] are clamped.
     void add_terrain_with_material(Vector3 p_position, float p_radius, int p_material);
     /// Places a 5-hit boulder: fills a sphere of MaterialHardness::kMaterialBoulder
     /// that shatters only after 5 explosions.
@@ -65,6 +70,11 @@ public:
     /// interpolated surface point, or a Vector3 of +INF when nothing is hit
     /// (ray starts inside solid, ends in air, or crosses only unloaded space).
     [[nodiscard]] Vector3 raycast_terrain(Vector3 p_from, Vector3 p_to) const;
+    /// Engine-side voxel raycast that also reports what the ray hit: the material ID
+    /// of the first solid sample behind the surface (MaterialHardness::kMaterial* —
+    /// 0 air, 1 soil, 2 hard rock, 3 lava, 4 water, 5 obsidian, 6 ice, 7 boulder),
+    /// or -1 when nothing is hit (same miss conditions as raycast_terrain).
+    [[nodiscard]] int raycast_terrain_material(Vector3 p_from, Vector3 p_to) const;
     /// Top-most terrain surface height at world (x, z); main thread only. Casts the
     /// vertical surface ray first (edited terrain) and falls back to the procedural
     /// generator when no crossing is found (column not streamed).

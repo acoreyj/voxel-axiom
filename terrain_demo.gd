@@ -3,8 +3,12 @@ extends Node3D
 ## Streams 32^3 chunks around the active Camera3D and applies terrain tools on
 ## left-click: keys 1-6 select add / explode / large-explode / paint / paint-delete /
 ## place-boulder, where paint and paint-delete are hold-and-drag brushes. R toggles
-## the add/paint material between soil and 3-hit rock. Right-click queries 3D cave
-## navigation paths.
+## the add/paint material between soil and 3-hit rock. Keys 7-9 fire Bananza-style
+## elemental reaction spheres:
+##   Key 7: Water Quench (turns Lava -> 3-hit Obsidian on contact & cools cracks)
+##   Key 8: Frost / Ice Bridge (flips Air/Water -> solid Ice & quenches Lava -> Obsidian)
+##   Key 9: Lava / Magma (injects Lava, melts Ice -> Air, reacts with Water -> Obsidian)
+## Right-click queries 3D cave navigation paths.
 
 @export var move_speed: float = 24.0
 @export var fast_multiplier: float = 3.0
@@ -15,6 +19,7 @@ extends Node3D
 @export var paint_radius: float = 3.5
 @export var paint_delete_radius: float = 3.5
 @export var boulder_radius: float = 4.0
+@export var elemental_radius: float = 8.5
 @export var brush_spacing_factor: float = 0.6
 @export var brush_interval: float = 0.05
 @export var max_ray_distance: float = 250.0
@@ -27,12 +32,20 @@ extends Node3D
 @export var boom_snap_depth_factor: float = 0.5
 @export var boom_snap_lateral: float = 0.75
 
-enum Tool { ADD_TERRAIN, EXPLODE, LARGE_EXPLODE, PAINT, PAINT_DELETE, BOULDER }
+enum Tool { ADD_TERRAIN, EXPLODE, LARGE_EXPLODE, PAINT, PAINT_DELETE, BOULDER, WATER_QUENCH, FROST_ICE, LAVA_MAGMA }
 
-const TOOL_NAMES := ["Add terrain", "Explode", "Large explode", "Paint terrain", "Paint delete", "Place boulder"]
+const TOOL_NAMES := ["Add terrain", "Explode", "Large explode", "Paint terrain", "Paint delete", "Place boulder", "Water quench", "Frost / Ice", "Lava / Magma"]
 const MATERIAL_NAMES := ["Soil", "Rock"]
+## MaterialHardness::kMaterial* IDs -> display names for the "Looking at" HUD readout.
+const MATERIAL_ID_NAMES := ["Air", "Soil", "Hard Rock", "Lava", "Water", "Obsidian", "Ice", "Boulder"]
+## Refresh interval for the crosshair material readout (raycast is main-thread only).
+const LOOK_AT_REFRESH_INTERVAL := 0.15
 const MATERIAL_SOIL := 1
 const MATERIAL_ROCK := 2
+## ElementalKind wire values shared with the C++ core (1 = Water, 2 = Frost, 3 = Lava).
+const ELEMENTAL_WATER := 1
+const ELEMENTAL_FROST := 2
+const ELEMENTAL_LAVA := 3
 
 @onready var terrain: VoxelTerrain3D = $VoxelTerrain3D
 @onready var ai_companion: VoxelAICompanion = $VoxelAICompanion
@@ -56,6 +69,8 @@ var _last_brush_point: Vector3 = Vector3(INF, INF, INF)
 var _last_boom_point: Vector3 = Vector3(INF, INF, INF)
 var _last_event_print_ms: int = 0
 var _last_fail_warn_ms: int = 0
+var _look_at_name: String = "Sky"
+var _look_at_accum: float = 0.0
 
 func _ready() -> void:
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
@@ -94,6 +109,12 @@ func _unhandled_input(event: InputEvent) -> void:
 				_set_tool(Tool.PAINT_DELETE)
 			KEY_6:
 				_set_tool(Tool.BOULDER)
+			KEY_7:
+				_set_tool(Tool.WATER_QUENCH)
+			KEY_8:
+				_set_tool(Tool.FROST_ICE)
+			KEY_9:
+				_set_tool(Tool.LAVA_MAGMA)
 			KEY_R:
 				_toggle_add_material()
 
@@ -168,7 +189,12 @@ func _update_hud(delta: float) -> void:
 	if _active_tool == Tool.ADD_TERRAIN or _active_tool == Tool.PAINT:
 		material_state = " | Material: %s (R)" % MATERIAL_NAMES[_add_material - 1]
 
-	stats_label.text = "FPS: %.0f  (%.2f ms)\nView dist: %d / %d chunks  (prefetch %d)\nCommitted: %d chunks  (%.0f/s)\nStreaming: %s\nTool: [%d] %s%s | 1-6 select, LMB use, RMB cave path" % [
+	_look_at_accum += delta
+	if _look_at_accum >= LOOK_AT_REFRESH_INTERVAL:
+		_look_at_accum = 0.0
+		_refresh_look_at_material()
+
+	stats_label.text = "FPS: %.0f  (%.2f ms)\nView dist: %d / %d chunks  (prefetch %d)\nCommitted: %d chunks  (%.0f/s)\nStreaming: %s\nLooking at: %s\nTool: [%d] %s%s | 1-9 select, LMB use, RMB cave path" % [
 		_fps_smoothed,
 		1000.0 / max(_fps_smoothed, 1.0),
 		terrain.get_effective_view_distance_chunks(),
@@ -177,10 +203,24 @@ func _update_hud(delta: float) -> void:
 		_committed_chunk_count,
 		_commits_per_second,
 		streaming_state,
+		_look_at_name,
 		_active_tool + 1,
 		TOOL_NAMES[_active_tool],
 		material_state,
 	]
+
+## Raycasts the crosshair ray and caches the display name of the material under the
+## reticle: "Sky" when the ray misses, otherwise the solid sample's material name.
+func _refresh_look_at_material() -> void:
+	var from := camera.global_position
+	var to := from - camera.global_transform.basis.z * max_ray_distance
+	var material_id := terrain.raycast_terrain_material(from, to)
+	if material_id < 0:
+		_look_at_name = "Sky"
+	elif material_id < MATERIAL_ID_NAMES.size():
+		_look_at_name = MATERIAL_ID_NAMES[material_id]
+	else:
+		_look_at_name = "Material %d" % material_id
 
 func _set_tool(tool: int) -> void:
 	if tool == _active_tool:
@@ -197,7 +237,12 @@ func _is_drag_tool() -> bool:
 	return _active_tool == Tool.PAINT or _active_tool == Tool.PAINT_DELETE
 
 func _is_boom_tool() -> bool:
-	return _active_tool == Tool.EXPLODE or _active_tool == Tool.LARGE_EXPLODE
+	return _active_tool == Tool.EXPLODE or _active_tool == Tool.LARGE_EXPLODE \
+		or _is_elemental_tool()
+
+func _is_elemental_tool() -> bool:
+	return _active_tool == Tool.WATER_QUENCH or _active_tool == Tool.FROST_ICE \
+		or _active_tool == Tool.LAVA_MAGMA
 
 ## Applies a discrete (click) tool. Repeat explosive clicks on the same spot
 ## reuse the previous impact point: each explosion re-raycasts from the camera,
@@ -233,6 +278,8 @@ func _active_radius() -> float:
 			return paint_delete_radius
 		Tool.BOULDER:
 			return boulder_radius
+		Tool.WATER_QUENCH, Tool.FROST_ICE, Tool.LAVA_MAGMA:
+			return elemental_radius
 		_:
 			return explosion_radius
 
@@ -268,6 +315,12 @@ func _apply_tool_at(point: Vector3) -> void:
 			terrain.trigger_explosion(point, paint_delete_radius)
 		Tool.BOULDER:
 			terrain.place_boulder(point, boulder_radius)
+		Tool.WATER_QUENCH:
+			terrain.trigger_elemental_sphere(point, elemental_radius, ELEMENTAL_WATER)
+		Tool.FROST_ICE:
+			terrain.trigger_elemental_sphere(point, elemental_radius, ELEMENTAL_FROST)
+		Tool.LAVA_MAGMA:
+			terrain.trigger_elemental_sphere(point, elemental_radius, ELEMENTAL_LAVA)
 		_:
 			terrain.trigger_explosion(point, explosion_radius)
 

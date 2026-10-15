@@ -8,11 +8,20 @@
 
 namespace voxel {
 
+/// Result of a terrain raycast that also reports what the ray hit: the
+/// interpolated surface position plus the material of the first solid lattice
+/// sample behind that surface (the voxel a character would be looking at).
+struct TerrainMaterialHit {
+    Vec3f position{};
+    uint8_t material_id = MaterialHardness::kMaterialAir;
+};
+
 /// Marches the resident TSDF chunks along a ray and returns the first
-/// interpolated air-to-solid surface crossing, or std::nullopt when the ray
-/// starts inside solid, ends without crossing a surface, or is degenerate.
+/// interpolated air-to-solid surface crossing together with the material of the
+/// solid sample behind it, or std::nullopt when the ray starts inside solid,
+/// ends without crossing a surface, or is degenerate.
 /// Sampling is Godot-free so both the extension and unit tests share it.
-[[nodiscard]] inline std::optional<Vec3f> raycast_terrain(
+[[nodiscard]] inline std::optional<TerrainMaterialHit> raycast_terrain_material(
     const ChunkStore& store,
     Vec3f origin,
     Vec3f target,
@@ -32,6 +41,7 @@ namespace voxel {
 
     struct LatticeSample {
         int16_t q = 0;
+        uint8_t material = MaterialHardness::kMaterialAir;
         int32_t x = 0;
         int32_t y = 0;
         int32_t z = 0;
@@ -42,20 +52,22 @@ namespace voxel {
         const int32_t y = static_cast<int32_t>(std::lround(wy));
         const int32_t z = static_cast<int32_t>(std::lround(wz));
         if (y < 0) {
-            return LatticeSample{TsdfFormat::kClampedSolid, x, y, z};
+            // Bedrock below the world floor: solid stone.
+            return LatticeSample{TsdfFormat::kClampedSolid,
+                                 MaterialHardness::kMaterialHardRock, x, y, z};
         }
         if (y >= store.world_height_chunks() * ChunkKey::kChunkDim) {
-            return LatticeSample{TsdfFormat::kClampedAir, x, y, z};
+            return LatticeSample{TsdfFormat::kClampedAir, MaterialHardness::kMaterialAir, x, y, z};
         }
         const ChunkKey ck = ChunkKey::from_world_sample(x, y, z);
         const ChunkSlot* slot = store.find_slot(ck);
         if (slot == nullptr || slot->state != ChunkLifecycleState::Resident) {
-            return LatticeSample{TsdfFormat::kClampedAir, x, y, z};
+            return LatticeSample{TsdfFormat::kClampedAir, MaterialHardness::kMaterialAir, x, y, z};
         }
         std::shared_lock<std::shared_mutex> lock(slot->mutex);
         const IVec3 base = ck.min_world_sample();
-        const int16_t q = slot->get_tsdf(LocalCoord{x - base.x, y - base.y, z - base.z});
-        return LatticeSample{q, x, y, z};
+        const LocalCoord lc{x - base.x, y - base.y, z - base.z};
+        return LatticeSample{slot->get_tsdf(lc), slot->get_material(lc), x, y, z};
     };
 
     LatticeSample prev = sample(origin.x, origin.y, origin.z);
@@ -73,13 +85,34 @@ namespace voxel {
             const float cur_f = static_cast<float>(cur.q);
             const float denom = prev_f - cur_f;
             const float frac = (denom > 1e-6f) ? (prev_f / denom) : 0.5f;
-            return Vec3f{static_cast<float>(prev.x) + static_cast<float>(cur.x - prev.x) * frac,
-                         static_cast<float>(prev.y) + static_cast<float>(cur.y - prev.y) * frac,
-                         static_cast<float>(prev.z) + static_cast<float>(cur.z - prev.z) * frac};
+            TerrainMaterialHit hit{};
+            hit.position = Vec3f{
+                static_cast<float>(prev.x) + static_cast<float>(cur.x - prev.x) * frac,
+                static_cast<float>(prev.y) + static_cast<float>(cur.y - prev.y) * frac,
+                static_cast<float>(prev.z) + static_cast<float>(cur.z - prev.z) * frac};
+            hit.material_id = cur.material;
+            return hit;
         }
         prev = cur;
     }
     return std::nullopt;
+}
+
+/// Marches the resident TSDF chunks along a ray and returns the first
+/// interpolated air-to-solid surface crossing, or std::nullopt when the ray
+/// starts inside solid, ends without crossing a surface, or is degenerate.
+[[nodiscard]] inline std::optional<Vec3f> raycast_terrain(
+    const ChunkStore& store,
+    Vec3f origin,
+    Vec3f target,
+    float step = 0.5f) {
+
+    const std::optional<TerrainMaterialHit> hit =
+        raycast_terrain_material(store, origin, target, step);
+    if (!hit.has_value()) {
+        return std::nullopt;
+    }
+    return hit->position;
 }
 
 } // namespace voxel

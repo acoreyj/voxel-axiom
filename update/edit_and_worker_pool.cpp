@@ -48,7 +48,7 @@ struct NavigationGroupKeyHash {
 };
 
 // ============================================================================
-// 2. Sphere CSG Primitives & Phased Edit Transaction (Sections 3.2, 3.4, 3.5)
+// 2. Sphere CSG & Elemental Trigger Primitives (Sections 3.2, 3.4, 3.5)
 // ============================================================================
 struct Vec3f {
     float x = 0.0f;
@@ -61,6 +61,7 @@ struct SphereCsgTerm {
     float radius = 0.0f;
     bool is_fill = false;
     uint8_t fill_material = MaterialHardness::kMaterialSoil;
+    ElementalKind elemental_kind = ElementalKind::None;
 };
 
 struct EditTransaction {
@@ -166,7 +167,6 @@ struct ChunkMeshPayload {
     uint64_t captured_terrain_revision = 0;
     std::vector<Vec3f> vertices;
     std::vector<Vec3f> normals;
-    // Per-vertex attributes: x = damage_ratio in [0, 1], y = is_hard_rock (0 or 1), z = 0
     std::vector<Vec3f> colors;
     std::vector<int32_t> indices;
     std::vector<Vec3f> collision_faces;
@@ -190,8 +190,106 @@ struct CompletionRecord {
 };
 
 // ============================================================================
-// 4. 26-Neighbor Closure Readiness Check & Phased CSG + Persistent Damage Executor
+// 4. Cellular Automata Elemental Step & Phased CSG + Persistent Damage Executor
 // ============================================================================
+
+inline bool step_elemental_automata_in_chunk(
+    ChunkStore& store,
+    ChunkSlot* slot,
+    SelectiveDirtyMask& dirty_mask,
+    float delta = TsdfFormat::kDefaultTruncationDelta) {
+
+    if (slot->form == ChunkStorageForm::Empty || !slot->has_material_array()) {
+        return false;
+    }
+
+    struct AutomataTransition {
+        LocalCoord lc;
+        uint8_t new_material;
+        bool melt_to_air;
+    };
+    std::vector<AutomataTransition> transitions;
+
+    static constexpr std::array<IVec3, 6> kOffsets6 = {{
+        {-1, 0, 0}, {+1, 0, 0},
+        {0, -1, 0}, {0, +1, 0},
+        {0, 0, -1}, {0, 0, +1}
+    }};
+
+    for (int32_t lz = 0; lz < 32; ++lz) {
+        for (int32_t ly = 0; ly < 32; ++ly) {
+            for (int32_t lx = 0; lx < 32; ++lx) {
+                const LocalCoord lc{lx, ly, lz};
+                if (slot->get_tsdf(lc) >= 0) {
+                    continue;
+                }
+                const uint8_t mat = slot->get_material(lc);
+                if (mat != MaterialHardness::kMaterialLava &&
+                    mat != MaterialHardness::kMaterialIce) {
+                    continue;
+                }
+
+                bool touches_water_or_ice = false;
+                bool touches_lava = false;
+
+                for (const IVec3& off : kOffsets6) {
+                    const int32_t nx = lx + off.x;
+                    const int32_t ny = ly + off.y;
+                    const int32_t nz = lz + off.z;
+                    if (nx < 0 || nx >= 32 || ny < 0 || ny >= 32 || nz < 0 || nz >= 32) {
+                        continue;
+                    }
+                    const LocalCoord nlc{nx, ny, nz};
+                    if (slot->get_tsdf(nlc) >= 0) {
+                        continue;
+                    }
+                    const uint8_t nmat = slot->get_material(nlc);
+                    if (nmat == MaterialHardness::kMaterialWater ||
+                        nmat == MaterialHardness::kMaterialIce) {
+                        touches_water_or_ice = true;
+                    } else if (nmat == MaterialHardness::kMaterialLava) {
+                        touches_lava = true;
+                    }
+                }
+
+                if (mat == MaterialHardness::kMaterialLava && touches_water_or_ice) {
+                    transitions.push_back(AutomataTransition{
+                        lc, MaterialHardness::kMaterialObsidian, /*melt_to_air=*/false});
+                } else if (mat == MaterialHardness::kMaterialIce && touches_lava) {
+                    transitions.push_back(AutomataTransition{
+                        lc, MaterialHardness::kMaterialAir, /*melt_to_air=*/true});
+                }
+            }
+        }
+    }
+
+    if (transitions.empty()) {
+        return false;
+    }
+
+    bool modified = false;
+    for (const AutomataTransition& tr : transitions) {
+        if (tr.melt_to_air) {
+            bool changed = false;
+            const int16_t q_melted = TsdfFormat::encode(+1.0f, delta);
+            if (slot->set_tsdf(tr.lc, q_melted, store.tsdf_pool(), &changed) && changed) {
+                modified = true;
+                dirty_mask.record_mutated_sample(tr.lc);
+            }
+            (void)slot->set_material(tr.lc, MaterialHardness::kMaterialAir, store.material_pool());
+            (void)slot->clear_damage(tr.lc);
+        } else {
+            if (slot->get_material(tr.lc) != tr.new_material) {
+                (void)slot->set_material(tr.lc, tr.new_material, store.material_pool());
+                (void)slot->clear_damage(tr.lc);
+                modified = true;
+                dirty_mask.record_mutated_sample(tr.lc);
+            }
+        }
+    }
+
+    return modified;
+}
 
 [[nodiscard]] inline bool are_all_in_bounds_neighbors_resident(
     const ChunkStore& store,
@@ -206,7 +304,11 @@ struct CompletionRecord {
             for (int32_t dx = -1; dx <= 1; ++dx) {
                 const ChunkKey nk = center.offset(dx, dy, dz);
                 const ChunkSlot* slot = store.find_slot(nk);
-                if (!slot || slot->state != ChunkLifecycleState::Resident) {
+                if (!slot) {
+                    return false;
+                }
+                std::shared_lock<std::shared_mutex> lock(slot->mutex);
+                if (slot->state != ChunkLifecycleState::Resident) {
                     return false;
                 }
             }
@@ -254,11 +356,13 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
             std::max(tx.max_locks_acquired_in_any_phase, phase_lock.size());
 
         const float delta = tx.truncation_delta;
-        bool has_any_fill = false;
+        bool has_any_fill_or_elemental = false;
+        bool has_any_carve = false;
         for (const SphereCsgTerm& s : tx.spheres) {
-            if (s.is_fill) {
-                has_any_fill = true;
-                break;
+            if (s.is_fill || s.elemental_kind != ElementalKind::None) {
+                has_any_fill_or_elemental = true;
+            } else {
+                has_any_carve = true;
             }
         }
 
@@ -266,15 +370,13 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
             float d_blast = -1e30f;
             int hits = 0;
             for (const SphereCsgTerm& s : tx.spheres) {
-                if (s.is_fill) continue;
+                if (s.is_fill || s.elemental_kind != ElementalKind::None) continue;
                 const float dx = px - s.center.x;
                 const float dy = py - s.center.y;
                 const float dz = pz - s.center.z;
                 const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
                 const float d = s.radius - dist;
                 d_blast = std::max(d_blast, d);
-                // Strictly count hits inside the sphere radius R (d >= 0.0f) for damage,
-                // NEVER in the outer (-delta, 0) TSDF wall smoothing band.
                 if (d >= 0.0f) {
                     ++hits;
                 }
@@ -286,7 +388,7 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
         };
 
         for (ChunkSlot* slot : phase_lock.slots()) {
-            if (slot->form == ChunkStorageForm::Empty && !has_any_fill) {
+            if (slot->form == ChunkStorageForm::Empty && !has_any_fill_or_elemental) {
                 continue;
             }
 
@@ -302,15 +404,10 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
             bool chunk_modified = false;
             SelectiveDirtyMask local_dirty_mask{};
 
-            // Per-voxel mask of hard-rock samples in this chunk that reached break_threshold (255)
-            // on this transaction. Using a per-voxel mask instead of a sphere-wide boolean ensures
-            // that when a 3rd click partially overlaps a 2-hit region, ONLY the 3-hit intersection
-            // carves to air while the 1-hit and 2-hit parts of the 3rd click stay solid.
             std::array<uint8_t, TsdfFormat::kChunkSamples> hard_rock_carved{};
             bool any_hard_rock_carved = false;
 
-            // Pass 1: Apply fills, carve soft terrain immediately, and accumulate per-voxel hard-rock
-            // damage strictly inside d >= 0.0f (radius R).
+            // Pass 1: Apply fills, elemental trigger volumes, and CSG blasts
             for (int32_t lz = lz0; lz <= lz1; ++lz) {
                 const float pz = static_cast<float>(chunk_min.z + lz);
                 for (int32_t ly = ly0; ly <= ly1; ++ly) {
@@ -326,12 +423,12 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                         bool touched_by_fill = false;
 
                         for (const SphereCsgTerm& s : tx.spheres) {
-                            if (!s.is_fill) continue;
+                            if (!s.is_fill || s.elemental_kind != ElementalKind::None) continue;
                             const float dx = px - s.center.x;
                             const float dy = py - s.center.y;
                             const float dz = pz - s.center.z;
                             const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
-                            const float d_fill = dist - s.radius; // Negative inside sphere (solid)
+                            const float d_fill = dist - s.radius;
                             if (d_fill < delta) {
                                 touched_by_fill = true;
                                 if (d_fill < d_fill_min) {
@@ -361,7 +458,107 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                             }
                         }
 
+                        // 1b. Handle Bananza-style Elemental Trigger Volumes (Water, Frost, Lava)
+                        for (const SphereCsgTerm& s : tx.spheres) {
+                            if (s.elemental_kind == ElementalKind::None) continue;
+                            const float dx = px - s.center.x;
+                            const float dy = py - s.center.y;
+                            const float dz = pz - s.center.z;
+                            const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+                            const float d_elem = dist - s.radius;
+
+                            if (d_elem >= delta) {
+                                continue;
+                            }
+
+                            const int16_t q_cur = slot->get_tsdf(lc);
+                            const uint8_t cur_mat = slot->get_material(lc);
+
+                            if (s.elemental_kind == ElementalKind::Water) {
+                                if (d_elem <= 0.0f && q_cur < 0) {
+                                    if (cur_mat == MaterialHardness::kMaterialLava) {
+                                        if (slot->set_material(
+                                                lc, MaterialHardness::kMaterialObsidian, store.material_pool())) {
+                                            chunk_modified = true;
+                                            local_dirty_mask.record_mutated_sample(lc);
+                                        }
+                                    }
+                                    if (slot->clear_damage(lc)) {
+                                        chunk_modified = true;
+                                        local_dirty_mask.record_mutated_sample(lc);
+                                    }
+                                }
+                            } else if (s.elemental_kind == ElementalKind::Frost) {
+                                if (q_cur < 0 && d_elem <= 0.0f) {
+                                    if (cur_mat == MaterialHardness::kMaterialLava) {
+                                        (void)slot->set_material(
+                                            lc, MaterialHardness::kMaterialObsidian, store.material_pool());
+                                        (void)slot->clear_damage(lc);
+                                        chunk_modified = true;
+                                        local_dirty_mask.record_mutated_sample(lc);
+                                    } else if (cur_mat == MaterialHardness::kMaterialWater) {
+                                        (void)slot->set_material(
+                                            lc, MaterialHardness::kMaterialIce, store.material_pool());
+                                        (void)slot->clear_damage(lc);
+                                        chunk_modified = true;
+                                        local_dirty_mask.record_mutated_sample(lc);
+                                    }
+                                } else {
+                                    const int16_t q_ice = TsdfFormat::encode(d_elem, delta);
+                                    const int16_t q_new = std::min(q_cur, q_ice);
+                                    if (q_new != q_cur) {
+                                        bool changed = false;
+                                        if (slot->set_tsdf(lc, q_new, store.tsdf_pool(), &changed) && changed) {
+                                            chunk_modified = true;
+                                            local_dirty_mask.record_mutated_sample(lc);
+                                        }
+                                    }
+                                    if (d_elem <= 0.0f && q_new < 0) {
+                                        (void)slot->set_material(
+                                            lc, MaterialHardness::kMaterialIce, store.material_pool());
+                                        (void)slot->clear_damage(lc);
+                                    }
+                                }
+                            } else if (s.elemental_kind == ElementalKind::Lava) {
+                                if (q_cur < 0) {
+                                    if (cur_mat == MaterialHardness::kMaterialIce) {
+                                        const int16_t q_melt = TsdfFormat::encode(-d_elem, delta);
+                                        const int16_t q_new = std::max(q_cur, q_melt);
+                                        if (q_new != q_cur) {
+                                            bool changed = false;
+                                            if (slot->set_tsdf(lc, q_new, store.tsdf_pool(), &changed) && changed) {
+                                                chunk_modified = true;
+                                                local_dirty_mask.record_mutated_sample(lc);
+                                            }
+                                        }
+                                        if (q_new >= 0) {
+                                            (void)slot->set_material(
+                                                lc, MaterialHardness::kMaterialAir, store.material_pool());
+                                        }
+                                        (void)slot->clear_damage(lc);
+                                    } else if (d_elem <= 0.0f) {
+                                        if (cur_mat == MaterialHardness::kMaterialWater) {
+                                            (void)slot->set_material(
+                                                lc, MaterialHardness::kMaterialObsidian, store.material_pool());
+                                            (void)slot->clear_damage(lc);
+                                            chunk_modified = true;
+                                            local_dirty_mask.record_mutated_sample(lc);
+                                        } else if (cur_mat == MaterialHardness::kMaterialSoil) {
+                                            (void)slot->set_material(
+                                                lc, MaterialHardness::kMaterialLava, store.material_pool());
+                                            (void)slot->clear_damage(lc);
+                                            chunk_modified = true;
+                                            local_dirty_mask.record_mutated_sample(lc);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         // 2. Handle Carve / Blast terms
+                        if (!has_any_carve) {
+                            continue;
+                        }
                         int spheres_hitting_interior = 0;
                         const float d_blast = eval_carve_spheres(px, py, pz, &spheres_hitting_interior);
 
@@ -377,8 +574,6 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
 
                             const uint8_t mat_id = slot->get_material(lc);
 
-                            // Soft terrain (soil/grass) breaks in 1 hit: never write persistent damage to the
-                            // R + delta influence band (which leaves the (-delta, 0) wall skin solid).
                             if (!MaterialHardness::supports_persistent_damage(mat_id)) {
                                 if (slot->clear_damage(lc)) {
                                     chunk_modified = true;
@@ -396,8 +591,6 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                                 continue;
                             }
 
-                            // Multi-hit Hard Rock (kMaterialHardRock):
-                            // Only samples inside the actual sphere radius (d >= 0.0f) accumulate damage.
                             if (spheres_hitting_interior > 0) {
                                 const uint8_t threshold = MaterialHardness::break_threshold(mat_id);
                                 const uint32_t added_dmg = std::min<uint32_t>(
@@ -412,9 +605,6 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                                     local_dirty_mask.record_mutated_sample(lc);
                                 }
 
-                                // Strictly per-voxel break check: ONLY voxels whose own cumulative damage
-                                // reaches 255 break. Voxels in the same click that only have 85 (1 hit) or
-                                // 170 (2 hits) stay solid!
                                 if (total_dmg >= threshold) {
                                     hard_rock_carved[lc.to_linear_index()] = 1U;
                                     any_hard_rock_carved = true;
@@ -440,8 +630,7 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                 }
             }
 
-            // Pass 2: If any hard-rock voxels broke on this hit, update the TSDF for the carved subset
-            // and smooth the negative TSDF wall gradient on surviving solid neighbors within delta.
+            // Pass 2: Smooth TSDF around carved hard-rock/obsidian subset
             if (any_hard_rock_carved) {
                 struct PendingTsdfUpdate {
                     LocalCoord lc;
@@ -477,9 +666,6 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                                 if (q_cur >= 0) {
                                     continue;
                                 }
-                                // Carved hard-rock voxel (becomes air): if an uncarved 1-hit/2-hit solid voxel
-                                // inside the sphere is adjacent to this voxel, taper the positive air TSDF toward
-                                // the boundary between the 3-hit carved pocket and the surviving solid rock.
                                 float min_dist_sq_to_interior_solid = 1e30f;
                                 for (int32_t dz = -search_r; dz <= search_r; ++dz) {
                                     const int32_t nz = lz + dz;
@@ -520,9 +706,6 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                                     updates.push_back(PendingTsdfUpdate{lc, q_new, false});
                                 }
                             } else if (q_cur < 0) {
-                                // Surviving solid hard-rock voxel (either outside the sphere in (-delta, 0),
-                                // or inside the sphere with only 1 or 2 hits): check distance to the nearest
-                                // newly carved hard-rock voxel.
                                 float min_dist_sq_to_carved = 1e30f;
                                 for (int32_t dz = -search_r; dz <= search_r; ++dz) {
                                     const int32_t nz = lz + dz;
@@ -548,14 +731,9 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                                     const float d_grid_wall = -std::max(0.05f, dist_to_carved - 0.5f);
                                     const float d_wall =
                                         (d_blast < 0.0f) ? d_blast : d_grid_wall;
-                                    // Strictly negative (<= -1) so surviving 1-hit/2-hit rock NEVER turns into air!
                                     const int16_t q_wall =
                                         std::min<int16_t>(-1, TsdfFormat::encode(d_wall, delta));
                                     const int16_t q_new = std::max(q_cur, q_wall);
-                                    // If this voxel was deep underground (kClampedSolid) before the carve and is
-                                    // now exposed as the new crater floor, clear any underground damage so the
-                                    // rock underneath a 3-hit crater starts fresh at 0 hits; surface rock
-                                    // (q_cur > kClampedSolid) keeps its 1-hit and 2-hit cracks!
                                     const bool was_deep_underground = (q_cur == TsdfFormat::kClampedSolid);
                                     if (q_new != q_cur || was_deep_underground) {
                                         updates.push_back(
@@ -580,6 +758,11 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                         local_dirty_mask.record_mutated_sample(u.lc);
                     }
                 }
+            }
+
+            // Pass 3: Cellular Automata Elemental Contact Pass
+            if (step_elemental_automata_in_chunk(store, slot, local_dirty_mask, delta)) {
+                chunk_modified = true;
             }
 
             if (chunk_modified) {
@@ -672,7 +855,12 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                         for (int32_t dx = -1; dx <= 1; ++dx) {
                             const ChunkKey nk = dk.offset(dx, dy, dz);
                             const ChunkSlot* nslot = store.find_slot(nk);
-                            if (!nslot || nslot->state != ChunkLifecycleState::Resident) {
+                            bool is_res = false;
+                            if (nslot) {
+                                std::shared_lock<std::shared_mutex> nlock(nslot->mutex);
+                                is_res = (nslot->state == ChunkLifecycleState::Resident);
+                            }
+                            if (!is_res) {
                                 generate_fn(store, nk);
                             }
                         }
@@ -778,7 +966,18 @@ public:
     }
 
     [[nodiscard]] bool enqueue_explosion(Vec3f position, float radius) {
-        if (radius <= 0.0f ||
+        return enqueue_sphere_term(SphereCsgTerm{position, radius, false, MaterialHardness::kMaterialSoil, ElementalKind::None});
+    }
+
+    [[nodiscard]] bool enqueue_elemental_sphere(Vec3f position, float radius, ElementalKind kind) {
+        if (kind == ElementalKind::None) {
+            return enqueue_explosion(position, radius);
+        }
+        return enqueue_sphere_term(SphereCsgTerm{position, radius, false, MaterialHardness::kMaterialSoil, kind});
+    }
+
+    [[nodiscard]] bool enqueue_sphere_term(SphereCsgTerm term) {
+        if (term.radius <= 0.0f ||
             !running_.load(std::memory_order_acquire) ||
             shutting_down_.load(std::memory_order_acquire)) {
             return false;
@@ -793,7 +992,7 @@ public:
                 edit_queue_.back().next_phase_index == 0 &&
                 edit_queue_.back().spheres.size() < EditTransaction::kMaxCoalescedSpheres) {
                 std::vector<SphereCsgTerm> combined = edit_queue_.back().spheres;
-                combined.push_back(SphereCsgTerm{position, radius});
+                combined.push_back(term);
                 edit_queue_.back() = EditTransaction::create_from_spheres(
                     std::move(combined),
                     TsdfFormat::kDefaultTruncationDelta,
@@ -803,7 +1002,7 @@ public:
                     return false;
                 }
                 edit_queue_.push_back(EditTransaction::create_from_spheres(
-                    {SphereCsgTerm{position, radius}},
+                    {term},
                     TsdfFormat::kDefaultTruncationDelta,
                     store_.world_height_chunks()));
             }

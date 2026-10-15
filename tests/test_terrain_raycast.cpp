@@ -13,10 +13,12 @@ using voxel::ChunkSlot;
 using voxel::ChunkStorageForm;
 using voxel::ChunkStore;
 using voxel::LocalCoord;
+using voxel::MaterialHardness;
 using voxel::MemoryLedger;
 using voxel::TsdfFormat;
 using voxel::Vec3f;
 using voxel::raycast_terrain;
+using voxel::raycast_terrain_material;
 
 int g_tests_run = 0;
 int g_assertions_checked = 0;
@@ -139,6 +141,50 @@ void test_ray_starting_inside_solid_misses() {
     std::printf("[PASS] test_ray_starting_inside_solid_misses (no self-hit from inside rock)\n");
 }
 
+void test_raycast_reports_solid_material() {
+    ++g_tests_run;
+
+    MemoryLedger ledger;
+    ChunkStore store(ledger, /*world_height_chunks=*/8);
+    const ChunkKey ck = ChunkKey::from_coords(0, 0, 0);
+    build_flat_ground_chunk(store, ck, /*surface_local_y=*/16);
+
+    const Vec3f from{16.0f, 24.0f, 16.0f};
+    const Vec3f to{16.0f, 8.0f, 16.0f};
+
+    // The flat ground chunk was seeded with the default soil material.
+    {
+        const auto hit = raycast_terrain_material(store, from, to);
+        REQUIRE(hit.has_value());
+        REQUIRE(hit->material_id == MaterialHardness::kMaterialSoil);
+        REQUIRE(std::abs(hit->position.y - 15.3333f) < 0.05f);
+    }
+
+    // Tagging the first solid sample under the ray re-labels what the ray reports.
+    ChunkSlot* slot = store.find_slot(ck);
+    REQUIRE(slot != nullptr);
+    {
+        std::unique_lock<std::shared_mutex> lock(slot->mutex);
+        (void)slot->set_material(LocalCoord{16, 15, 16},
+                                 MaterialHardness::kMaterialHardRock, store.material_pool());
+    }
+    REQUIRE(raycast_terrain_material(store, from, to)->material_id ==
+            MaterialHardness::kMaterialHardRock);
+
+    {
+        std::unique_lock<std::shared_mutex> lock(slot->mutex);
+        (void)slot->set_material(LocalCoord{16, 15, 16},
+                                 MaterialHardness::kMaterialBoulder, store.material_pool());
+    }
+    REQUIRE(raycast_terrain_material(store, from, to)->material_id ==
+            MaterialHardness::kMaterialBoulder);
+
+    // A ray into the sky reports no hit at all (not even the air material).
+    REQUIRE(!raycast_terrain_material(store, from, Vec3f{16.0f, 40.0f, 16.0f}).has_value());
+
+    std::printf("[PASS] test_raycast_reports_solid_material (soil, hard rock, boulder, sky miss)\n");
+}
+
 } // namespace
 
 int main() {
@@ -147,6 +193,7 @@ int main() {
     test_ray_into_sky_misses();
     test_ray_crosses_chunk_boundary();
     test_ray_starting_inside_solid_misses();
+    test_raycast_reports_solid_material();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",
                 g_tests_run, g_assertions_checked);
     return EXIT_SUCCESS;

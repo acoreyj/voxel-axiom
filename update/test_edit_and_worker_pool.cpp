@@ -19,6 +19,7 @@ using voxel::CompletionKind;
 using voxel::CoreWorkerPool;
 using voxel::DualDirtyScheduler;
 using voxel::EditTransaction;
+using voxel::ElementalKind;
 using voxel::LocalCoord;
 using voxel::MaterialHardness;
 using voxel::MemoryLedger;
@@ -132,7 +133,6 @@ void test_r_plus_delta_crater_wall_continuity() {
                     const int16_t expected_q = TsdfFormat::encode(expected_sdf, delta);
 
                     REQUIRE(actual_q == expected_q);
-                    // Verify the (-delta, 0) crater wall skin in kMaterialSoil retains ZERO crack damage!
                     REQUIRE(slot->get_damage(mapped.local) == 0U);
                     if (dist < radius + delta - 0.05f) {
                         REQUIRE(actual_q > TsdfFormat::kClampedSolid);
@@ -205,8 +205,6 @@ void test_persistent_damage_3_hit_hard_rock() {
     DualDirtyScheduler scheduler;
     WorkerScratchWindow36 scratch(ledger);
 
-    // Create a chunk containing a Hard Rock (kMaterialHardRock = 2) boulder of radius 5.0
-    // centered at (16, 16, 16).
     const ChunkKey ck = ChunkKey::from_coords(0, 0, 0);
     ChunkSlot* slot = store.get_or_create_slot(ck);
     {
@@ -233,9 +231,9 @@ void test_persistent_damage_3_hit_hard_rock() {
     const LocalCoord boulder_core{16, 16, 16};
     REQUIRE(slot->get_tsdf(boulder_core) < 0);
     REQUIRE(slot->get_damage(boulder_core) == 0U);
-    REQUIRE(!slot->has_damage_array()); // 0 bytes allocated before damage
+    REQUIRE(!slot->has_damage_array());
 
-    // --- EXPLOSION 1 (radius = 9.5 covers the 5.0 boulder + both 2.0 delta bands) ---
+    // --- EXPLOSION 1 ---
     {
         EditTransaction tx1 = EditTransaction::create_from_spheres(
             {SphereCsgTerm{Vec3f{16.0f, 16.0f, 16.0f}, /*radius=*/9.5f}}, 2.0f, 8);
@@ -243,7 +241,6 @@ void test_persistent_damage_3_hit_hard_rock() {
             (void)execute_next_edit_phase(store, scheduler, tx1);
         }
     }
-    // After Hit 1: Hard Rock must STILL be solid (TSDF < 0), damage == 85, and mesh shows Stage 1 cracks!
     REQUIRE(slot->has_damage_array());
     REQUIRE(slot->get_damage(boulder_core) == 85U);
     REQUIRE(slot->get_tsdf(boulder_core) < 0);
@@ -252,7 +249,6 @@ void test_persistent_damage_3_hit_hard_rock() {
         const auto mesh1 = SurfaceNetsMesher::mesh_chunk_from_scratch_36(ck, scratch, 1, stamp.captured_terrain_revision);
         REQUIRE(!mesh1.vertices.empty());
         REQUIRE(mesh1.colors.size() == mesh1.vertices.size());
-        // Verify vertices carry damage_ratio = 85 / 255 (~0.333) and is_hard_rock = 1.0
         REQUIRE(std::abs(mesh1.colors.front().x - (85.0f / 255.0f)) < 1e-3f);
         REQUIRE(std::abs(mesh1.colors.front().y - 1.0f) < 1e-3f);
     }
@@ -265,7 +261,6 @@ void test_persistent_damage_3_hit_hard_rock() {
             (void)execute_next_edit_phase(store, scheduler, tx2);
         }
     }
-    // After Hit 2: Hard Rock must STILL be solid (TSDF < 0), damage == 170, and mesh shows Stage 2 cracks!
     REQUIRE(slot->get_damage(boulder_core) == 170U);
     REQUIRE(slot->get_tsdf(boulder_core) < 0);
     {
@@ -283,14 +278,13 @@ void test_persistent_damage_3_hit_hard_rock() {
             (void)execute_next_edit_phase(store, scheduler, tx3);
         }
     }
-    // After Hit 3: Cumulative damage reaches 255 >= 255 -> Hard Rock boulder SHATTERS to air!
     REQUIRE(slot->get_tsdf(boulder_core) == TsdfFormat::kClampedAir);
-    REQUIRE(slot->form == ChunkStorageForm::Empty); // Auto-demoted to 0-byte Empty chunk!
-    REQUIRE(!slot->has_damage_array());             // Damage slab automatically returned to pool!
+    REQUIRE(slot->form == ChunkStorageForm::Empty);
+    REQUIRE(!slot->has_damage_array());
     {
         const auto stamp = gather_scratch_window_36(store, ck, scratch);
         const auto mesh3 = SurfaceNetsMesher::mesh_chunk_from_scratch_36(ck, scratch, 1, stamp.captured_terrain_revision);
-        REQUIRE(mesh3.vertices.empty()); // Boulder completely destroyed (0 triangles left)
+        REQUIRE(mesh3.vertices.empty());
     }
 
     std::printf("[PASS] test_persistent_damage_3_hit_hard_rock (Hit 1: dmg=85 solid; Hit 2: dmg=170 solid; Hit 3: shattered!)\n");
@@ -318,7 +312,6 @@ void test_hard_rock_partial_crater_clears_wall_damage_after_3_hits() {
         slot->version.store(1, std::memory_order_release);
     }
 
-    // Fire 3 explosions of radius 6.0 at the EXACT same spot (16, 16, 16) inside solid Hard Rock
     const Vec3f blast_pos{16.0f, 16.0f, 16.0f};
     const float blast_r = 6.0f;
     for (int hit = 1; hit <= 3; ++hit) {
@@ -329,16 +322,11 @@ void test_hard_rock_partial_crater_clears_wall_damage_after_3_hits() {
         }
     }
 
-    // After Hit 3 at the exact same spot:
-    // 1. Center (16, 16, 16) is carved to air (q > 0)
     REQUIRE(slot->get_tsdf(LocalCoord{16, 16, 16}) > 0);
-    // 2. Concave crater wall in [R, R+delta) (e.g. x=23, dist=7.0 in [6.0, 8.0)) has smooth negative TSDF
-    //    AND 0 residual damage (damage slab is completely freed!)
     const int16_t wall_q = slot->get_tsdf(LocalCoord{23, 16, 16});
     REQUIRE(wall_q == TsdfFormat::encode(6.0f - 7.0f, 2.0f));
     REQUIRE(!slot->has_damage_array());
 
-    // 3. Every vertex on the newly carved concave hard-rock crater wall has 0.0 damage_ratio!
     const auto stamp = gather_scratch_window_36(store, ck, scratch);
     const auto mesh = SurfaceNetsMesher::mesh_chunk_from_scratch_36(ck, scratch, 1, stamp.captured_terrain_revision);
     REQUIRE(!mesh.vertices.empty());
@@ -370,7 +358,6 @@ void test_offset_overlapping_clicks_only_carve_3_hit_intersection() {
         slot->state = ChunkLifecycleState::Resident;
         slot->version.store(1, std::memory_order_release);
 
-        // Flat hard-rock surface at y = 16
         for (int32_t z = 0; z < 32; ++z) {
             for (int32_t y = 0; y < 32; ++y) {
                 for (int32_t x = 0; x < 32; ++x) {
@@ -394,35 +381,25 @@ void test_offset_overlapping_clicks_only_carve_3_hit_intersection() {
     const Vec3f c2{14.0f, 16.0f, 16.0f};
     const Vec3f c3{18.0f, 16.0f, 16.0f};
 
-    // Click 1 at x=10 and Click 2 at x=14 create a 2-hit overlap in x=[9..15]
     fire(c1, R);
     fire(c2, R);
 
-    // Verify no voxels broke after 2 clicks, and x=13..15 has 2 hits (170) while x=17 has 1 hit (85)
     REQUIRE(slot->get_tsdf(LocalCoord{14, 15, 16}) < 0);
     REQUIRE(slot->get_damage(LocalCoord{14, 15, 16}) == 170U);
     REQUIRE(slot->get_damage(LocalCoord{17, 15, 16}) == 85U);
     REQUIRE(slot->get_damage(LocalCoord{21, 15, 16}) == 0U);
 
-    // Click 3 at x=18 (radius 5.0 spans x=[13..23]):
-    // - x=14, y=15, z=16 is inside c1 (dist=4.12<=5), c2 (dist=1.0<=5), AND c3 (dist=4.12<=5) -> 3 hits -> MUST CARVE!
-    // - x=17, y=15, z=16 is inside c2 and c3 ONLY (2 hits total) -> MUST NOT CARVE (stays solid with damage=170)!
-    // - x=21, y=15, z=16 is inside c3 ONLY (1 hit total) -> MUST NOT CARVE (stays solid with damage=85)!
     fire(c3, R);
 
-    // 1. 3-hit intersection voxel (14, 15, 16) carved to air and reset damage to 0
     REQUIRE(slot->get_tsdf(LocalCoord{14, 15, 16}) > 0);
     REQUIRE(slot->get_damage(LocalCoord{14, 15, 16}) == 0U);
 
-    // 2. 2-hit voxel (17, 15, 16) inside Click 3's sphere stayed SOLID and advanced from 85 -> 170
     REQUIRE(slot->get_tsdf(LocalCoord{17, 15, 16}) < 0);
     REQUIRE(slot->get_damage(LocalCoord{17, 15, 16}) == 170U);
 
-    // 3. 1-hit voxel (21, 15, 16) inside Click 3's sphere stayed SOLID and advanced from 0 -> 85
     REQUIRE(slot->get_tsdf(LocalCoord{21, 15, 16}) < 0);
     REQUIRE(slot->get_damage(LocalCoord{21, 15, 16}) == 85U);
 
-    // 4. Exhaustive check across the entire chunk: NO voxel with < 3 hits was carved to air!
     std::size_t carved_count = 0;
     for (int32_t z = 0; z < 32; ++z) {
         for (int32_t y = 0; y <= 16; ++y) {
@@ -532,7 +509,120 @@ void test_soil_never_accumulates_or_bleeds_cracks_and_fill_resets_damage() {
 }
 
 // ============================================================================
-// 5. Multi-Threaded Worker Pool, Coalesced Blasts & Ordered Teardown (Section 5.3)
+// 5. Bananza-Style Elemental / Environmental Simulation:
+//    - Water Trigger Quenches 1-Hit Lava -> 3-Hit Obsidian
+//    - Frost Trigger Flips Air -> Solid Ice
+//    - 6-Neighbor Cellular Automata: Lava + Water/Ice -> Obsidian & Melts Ice
+// ============================================================================
+void test_elemental_simulation_lava_to_obsidian_and_air_to_ice() {
+    ++g_tests_run;
+
+    MemoryLedger ledger;
+    ChunkStore store(ledger, /*world_height_chunks=*/8);
+    DualDirtyScheduler scheduler;
+    WorkerScratchWindow36 scratch(ledger);
+
+    const ChunkKey ck = ChunkKey::from_coords(0, 0, 0);
+    ChunkSlot* slot = store.get_or_create_slot(ck);
+    {
+        std::unique_lock<std::shared_mutex> lock(slot->mutex);
+        slot->reset_to_uniform(
+            ChunkStorageForm::Empty, MaterialHardness::kMaterialLava, store.tsdf_pool(), store.material_pool());
+        slot->state = ChunkLifecycleState::Resident;
+        slot->version.store(1, std::memory_order_release);
+
+        for (int32_t z = 0; z < 32; ++z) {
+            for (int32_t y = 0; y < 32; ++y) {
+                for (int32_t x = 0; x < 32; ++x) {
+                    const float dx = static_cast<float>(x) - 16.0f;
+                    const float dy = static_cast<float>(y) - 16.0f;
+                    const float dz = static_cast<float>(z) - 16.0f;
+                    const float sdf = std::sqrt(dx * dx + dy * dy + dz * dz) - 5.0f;
+                    const int16_t q = TsdfFormat::encode(std::clamp(sdf, -2.0f, +2.0f), 2.0f);
+                    REQUIRE(slot->set_tsdf(LocalCoord{x, y, z}, q, store.tsdf_pool()));
+                }
+            }
+        }
+    }
+
+    const LocalCoord core{16, 16, 16};
+    REQUIRE(slot->get_material(core) == MaterialHardness::kMaterialLava);
+    REQUIRE(!MaterialHardness::supports_persistent_damage(MaterialHardness::kMaterialLava));
+
+    {
+        SphereCsgTerm water_term{};
+        water_term.center = Vec3f{16.0f, 16.0f, 16.0f};
+        water_term.radius = 8.0f;
+        water_term.elemental_kind = ElementalKind::Water;
+
+        EditTransaction tx = EditTransaction::create_from_spheres({water_term}, 2.0f, 8);
+        while (!tx.is_finished()) {
+            (void)execute_next_edit_phase(store, scheduler, tx);
+        }
+    }
+    REQUIRE(slot->get_material(core) == MaterialHardness::kMaterialObsidian);
+    REQUIRE(MaterialHardness::supports_persistent_damage(slot->get_material(core)));
+
+    {
+        const auto stamp = gather_scratch_window_36(store, ck, scratch);
+        const auto mesh_obs = SurfaceNetsMesher::mesh_chunk_from_scratch_36(ck, scratch, 1, stamp.captured_terrain_revision);
+        REQUIRE(!mesh_obs.vertices.empty());
+        REQUIRE(std::abs(mesh_obs.colors.front().y - 1.0f) < 1e-3f);
+        REQUIRE(std::abs(mesh_obs.colors.front().z - 0.75f) < 1e-3f);
+    }
+
+    {
+        EditTransaction hit1 = EditTransaction::create_from_spheres(
+            {SphereCsgTerm{Vec3f{16.0f, 16.0f, 16.0f}, /*radius=*/8.0f}}, 2.0f, 8);
+        while (!hit1.is_finished()) {
+            (void)execute_next_edit_phase(store, scheduler, hit1);
+        }
+    }
+    REQUIRE(slot->get_tsdf(core) < 0);
+    REQUIRE(slot->get_damage(core) == 85U);
+
+    const LocalCoord air_pt{25, 25, 25};
+    REQUIRE(slot->get_tsdf(air_pt) > 0);
+    {
+        SphereCsgTerm frost_term{};
+        frost_term.center = Vec3f{25.0f, 25.0f, 25.0f};
+        frost_term.radius = 3.5f;
+        frost_term.elemental_kind = ElementalKind::Frost;
+
+        EditTransaction frost_tx = EditTransaction::create_from_spheres({frost_term}, 2.0f, 8);
+        while (!frost_tx.is_finished()) {
+            (void)execute_next_edit_phase(store, scheduler, frost_tx);
+        }
+    }
+    REQUIRE(slot->get_tsdf(air_pt) < 0);
+    REQUIRE(slot->get_material(air_pt) == MaterialHardness::kMaterialIce);
+
+    {
+        std::unique_lock<std::shared_mutex> lock(slot->mutex);
+        REQUIRE(slot->set_tsdf(LocalCoord{5, 5, 5}, TsdfFormat::kClampedSolid, store.tsdf_pool()));
+        REQUIRE(slot->set_material(LocalCoord{5, 5, 5}, MaterialHardness::kMaterialLava, store.material_pool()));
+        REQUIRE(slot->set_tsdf(LocalCoord{6, 5, 5}, TsdfFormat::kClampedSolid, store.tsdf_pool()));
+        REQUIRE(slot->set_material(LocalCoord{6, 5, 5}, MaterialHardness::kMaterialIce, store.material_pool()));
+    }
+    {
+        SphereCsgTerm touch_term{};
+        touch_term.center = Vec3f{2.0f, 2.0f, 2.0f};
+        touch_term.radius = 1.5f;
+        touch_term.elemental_kind = ElementalKind::Water;
+
+        EditTransaction ca_tx = EditTransaction::create_from_spheres({touch_term}, 2.0f, 8);
+        while (!ca_tx.is_finished()) {
+            (void)execute_next_edit_phase(store, scheduler, ca_tx);
+        }
+    }
+    REQUIRE(slot->get_material(LocalCoord{5, 5, 5}) == MaterialHardness::kMaterialObsidian);
+    REQUIRE(slot->get_tsdf(LocalCoord{6, 5, 5}) > 0);
+
+    std::printf("[PASS] test_elemental_simulation_lava_to_obsidian_and_air_to_ice (Lava+Water->3-Hit Obsidian, Air+Frost->Solid Ice, CA Lava+Ice reaction)\n");
+}
+
+// ============================================================================
+// 6. Multi-Threaded Worker Pool, Coalesced Blasts & Ordered Teardown (Section 5.3)
 // ============================================================================
 void test_worker_pool_concurrent_execution_and_teardown() {
     ++g_tests_run;
@@ -572,8 +662,8 @@ void test_worker_pool_concurrent_execution_and_teardown() {
     pool.start(/*num_workers=*/3);
 
     REQUIRE(pool.enqueue_explosion(Vec3f{16.0f, 16.0f, 16.0f}, 6.0f));
-    REQUIRE(pool.enqueue_explosion(Vec3f{24.0f, 16.0f, 16.0f}, 6.0f));
-    REQUIRE(pool.enqueue_explosion(Vec3f{48.0f, 16.0f, 16.0f}, 8.0f));
+    REQUIRE(pool.enqueue_elemental_sphere(Vec3f{24.0f, 16.0f, 16.0f}, 6.0f, ElementalKind::Water));
+    REQUIRE(pool.enqueue_elemental_sphere(Vec3f{48.0f, 16.0f, 16.0f}, 8.0f, ElementalKind::Frost));
     REQUIRE(pool.enqueue_explosion(Vec3f{64.0f, 32.0f, 64.0f}, 10.0f));
 
     std::size_t edit_completions = 0;
@@ -610,7 +700,7 @@ void test_worker_pool_concurrent_execution_and_teardown() {
 } // namespace
 
 int main() {
-    std::printf("=== Running M0/M2 Step 4 Unit Test Suite: Phased R+delta CSG, Hard-Rock Damage & Worker Pool ===\n");
+    std::printf("=== Running M0/M2 Step 4 Unit Test Suite: Phased R+delta CSG, Hard-Rock Damage, Elemental Sim & Worker Pool ===\n");
     test_large_explosion_32_lock_cap_and_no_tearing();
     test_r_plus_delta_crater_wall_continuity();
     test_anti_crumb_kernel();
@@ -618,6 +708,7 @@ int main() {
     test_hard_rock_partial_crater_clears_wall_damage_after_3_hits();
     test_offset_overlapping_clicks_only_carve_3_hit_intersection();
     test_soil_never_accumulates_or_bleeds_cracks_and_fill_resets_damage();
+    test_elemental_simulation_lava_to_obsidian_and_air_to_ice();
     test_worker_pool_concurrent_execution_and_teardown();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",
                 g_tests_run, g_assertions_checked);

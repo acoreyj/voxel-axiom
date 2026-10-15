@@ -861,6 +861,187 @@ void test_fill_and_carve_do_not_coalesce() {
     std::printf("[PASS] test_fill_and_carve_do_not_coalesce (1 carve + 1 fill transaction, 0 B leaked)\n");
 }
 
+// ============================================================================
+// 4g. Elemental Reactions (Bananza-style Water / Frost / Lava trigger volumes)
+// ============================================================================
+void test_elemental_water_quenches_lava_to_obsidian() {
+    ++g_tests_run;
+
+    MemoryLedger ledger;
+    ChunkStore store(ledger, /*world_height_chunks=*/8);
+    DualDirtyScheduler scheduler;
+
+    const ChunkKey ck = ChunkKey::from_coords(0, 0, 0);
+    ChunkSlot* slot = store.get_or_create_slot(ck);
+    {
+        std::unique_lock<std::shared_mutex> lock(slot->mutex);
+        slot->reset_to_uniform(ChunkStorageForm::Solid, MaterialHardness::kMaterialLava,
+                               store.tsdf_pool(), store.material_pool());
+        slot->state = ChunkLifecycleState::Resident;
+        slot->version.store(1, std::memory_order_release);
+    }
+
+    SphereCsgTerm water{};
+    water.center = Vec3f{16.0f, 16.0f, 16.0f};
+    water.radius = 6.0f;
+    water.elemental_kind = voxel::ElementalKind::Water;
+
+    EditTransaction tx = EditTransaction::create_from_spheres({water}, /*delta=*/2.0f, /*world_height_chunks=*/8);
+    while (!tx.is_finished()) {
+        (void)execute_next_edit_phase(store, scheduler, tx);
+    }
+
+    // Inside the water sphere the molten lava quenches into 3-hit obsidian.
+    REQUIRE(slot->get_material(LocalCoord{16, 16, 16}) == MaterialHardness::kMaterialObsidian);
+    REQUIRE(slot->get_material(LocalCoord{13, 16, 16}) == MaterialHardness::kMaterialObsidian);
+    // Outside the trigger volume the lava is untouched.
+    REQUIRE(slot->get_material(LocalCoord{30, 30, 30}) == MaterialHardness::kMaterialLava);
+
+    std::printf("[PASS] test_elemental_water_quenches_lava_to_obsidian\n");
+}
+
+void test_elemental_frost_builds_ice_dome_in_air() {
+    ++g_tests_run;
+
+    MemoryLedger ledger;
+    ChunkStore store(ledger, /*world_height_chunks=*/8);
+    DualDirtyScheduler scheduler;
+
+    const ChunkKey ck = ChunkKey::from_coords(0, 0, 0);
+    ChunkSlot* slot = store.get_or_create_slot(ck);
+    {
+        std::unique_lock<std::shared_mutex> lock(slot->mutex);
+        slot->reset_to_uniform(ChunkStorageForm::Empty, MaterialHardness::kMaterialAir,
+                               store.tsdf_pool(), store.material_pool());
+        slot->state = ChunkLifecycleState::Resident;
+        slot->version.store(1, std::memory_order_release);
+    }
+
+    SphereCsgTerm frost{};
+    frost.center = Vec3f{16.0f, 16.0f, 16.0f};
+    frost.radius = 5.0f;
+    frost.elemental_kind = voxel::ElementalKind::Frost;
+
+    EditTransaction tx = EditTransaction::create_from_spheres({frost}, /*delta=*/2.0f, /*world_height_chunks=*/8);
+    while (!tx.is_finished()) {
+        (void)execute_next_edit_phase(store, scheduler, tx);
+    }
+
+    // The frost volume flips air into a solid ice dome with a smooth R + delta TSDF surface.
+    REQUIRE(slot->get_tsdf(LocalCoord{16, 16, 16}) < 0);
+    REQUIRE(slot->get_material(LocalCoord{16, 16, 16}) == MaterialHardness::kMaterialIce);
+    REQUIRE(slot->get_material(LocalCoord{13, 16, 16}) == MaterialHardness::kMaterialIce);
+    // Outside the sphere the air is untouched.
+    REQUIRE(slot->get_tsdf(LocalCoord{30, 30, 30}) > 0);
+    REQUIRE(slot->get_material(LocalCoord{30, 30, 30}) == MaterialHardness::kMaterialAir);
+
+    std::printf("[PASS] test_elemental_frost_builds_ice_dome_in_air\n");
+}
+
+void test_elemental_lava_transmutes_soil_and_melts_ice() {
+    ++g_tests_run;
+
+    const ChunkKey ck = ChunkKey::from_coords(0, 0, 0);
+
+    // (a) Solid soil inside the lava sphere is transmuted into glowing molten lava.
+    {
+        MemoryLedger ledger;
+        ChunkStore store(ledger, /*world_height_chunks=*/8);
+        DualDirtyScheduler scheduler;
+
+        ChunkSlot* slot = store.get_or_create_slot(ck);
+        {
+            std::unique_lock<std::shared_mutex> lock(slot->mutex);
+            slot->reset_to_uniform(ChunkStorageForm::Solid, MaterialHardness::kMaterialSoil,
+                                   store.tsdf_pool(), store.material_pool());
+            slot->state = ChunkLifecycleState::Resident;
+            slot->version.store(1, std::memory_order_release);
+        }
+
+        SphereCsgTerm lava{};
+        lava.center = Vec3f{16.0f, 16.0f, 16.0f};
+        lava.radius = 5.0f;
+        lava.elemental_kind = voxel::ElementalKind::Lava;
+
+        EditTransaction tx = EditTransaction::create_from_spheres({lava}, /*delta=*/2.0f, /*world_height_chunks=*/8);
+        while (!tx.is_finished()) {
+            (void)execute_next_edit_phase(store, scheduler, tx);
+        }
+
+        REQUIRE(slot->get_material(LocalCoord{16, 16, 16}) == MaterialHardness::kMaterialLava);
+        REQUIRE(slot->get_material(LocalCoord{30, 30, 30}) == MaterialHardness::kMaterialSoil);
+    }
+
+    // (b) Solid ice inside the lava sphere melts back into air.
+    {
+        MemoryLedger ledger;
+        ChunkStore store(ledger, /*world_height_chunks=*/8);
+        DualDirtyScheduler scheduler;
+
+        ChunkSlot* slot = store.get_or_create_slot(ck);
+        {
+            std::unique_lock<std::shared_mutex> lock(slot->mutex);
+            slot->reset_to_uniform(ChunkStorageForm::Solid, MaterialHardness::kMaterialIce,
+                                   store.tsdf_pool(), store.material_pool());
+            slot->state = ChunkLifecycleState::Resident;
+            slot->version.store(1, std::memory_order_release);
+        }
+
+        SphereCsgTerm lava{};
+        lava.center = Vec3f{16.0f, 16.0f, 16.0f};
+        lava.radius = 5.0f;
+        lava.elemental_kind = voxel::ElementalKind::Lava;
+
+        EditTransaction tx = EditTransaction::create_from_spheres({lava}, /*delta=*/2.0f, /*world_height_chunks=*/8);
+        while (!tx.is_finished()) {
+            (void)execute_next_edit_phase(store, scheduler, tx);
+        }
+
+        REQUIRE(slot->get_tsdf(LocalCoord{16, 16, 16}) >= 0);
+        REQUIRE(slot->get_material(LocalCoord{16, 16, 16}) == MaterialHardness::kMaterialAir);
+        REQUIRE(slot->get_tsdf(LocalCoord{30, 30, 30}) < 0);
+    }
+
+    std::printf("[PASS] test_elemental_lava_transmutes_soil_and_melts_ice\n");
+}
+
+void test_elemental_ca_quenches_exposed_lava() {
+    ++g_tests_run;
+
+    MemoryLedger ledger;
+    ChunkStore store(ledger, /*world_height_chunks=*/8);
+    DualDirtyScheduler scheduler;
+
+    const ChunkKey ck = ChunkKey::from_coords(0, 0, 0);
+    ChunkSlot* slot = store.get_or_create_slot(ck);
+    {
+        std::unique_lock<std::shared_mutex> lock(slot->mutex);
+        slot->reset_to_uniform(ChunkStorageForm::Solid, MaterialHardness::kMaterialWater,
+                               store.tsdf_pool(), store.material_pool());
+        // Two exposed lava samples deep in the water body, far outside the trigger volume below.
+        (void)slot->set_material(LocalCoord{16, 16, 16}, MaterialHardness::kMaterialLava, store.material_pool());
+        (void)slot->set_material(LocalCoord{16, 16, 17}, MaterialHardness::kMaterialLava, store.material_pool());
+        slot->state = ChunkLifecycleState::Resident;
+        slot->version.store(1, std::memory_order_release);
+    }
+
+    SphereCsgTerm water{};
+    water.center = Vec3f{6.0f, 6.0f, 6.0f};
+    water.radius = 2.0f;
+    water.elemental_kind = voxel::ElementalKind::Water;
+
+    EditTransaction tx = EditTransaction::create_from_spheres({water}, /*delta=*/2.0f, /*world_height_chunks=*/8);
+    while (!tx.is_finished()) {
+        (void)execute_next_edit_phase(store, scheduler, tx);
+    }
+
+    // The 6-neighbor cellular automata pass quenches lava touching water anywhere in the chunk.
+    REQUIRE(slot->get_material(LocalCoord{16, 16, 16}) == MaterialHardness::kMaterialObsidian);
+    REQUIRE(slot->get_material(LocalCoord{16, 16, 17}) == MaterialHardness::kMaterialObsidian);
+
+    std::printf("[PASS] test_elemental_ca_quenches_exposed_lava\n");
+}
+
 } // namespace
 
 int main() {
@@ -877,6 +1058,10 @@ int main() {
     test_persistent_damage_5_hit_boulder();
     test_worker_pool_concurrent_execution_and_teardown();
     test_fill_and_carve_do_not_coalesce();
+    test_elemental_water_quenches_lava_to_obsidian();
+    test_elemental_frost_builds_ice_dome_in_air();
+    test_elemental_lava_transmutes_soil_and_melts_ice();
+    test_elemental_ca_quenches_exposed_lava();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",
                 g_tests_run, g_assertions_checked);
     return EXIT_SUCCESS;

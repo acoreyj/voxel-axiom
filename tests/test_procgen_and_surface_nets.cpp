@@ -274,9 +274,10 @@ void test_procgen_caves_toggle() {
                     wx * 0.03f, wy * 0.03f, wz * 0.03f, gen_off.seed + 101U);
                 const float d_surf = (wy - h_2d) + overhang;
 
-                // The Hard Rock boulder is part of the terrain regardless of the caves
-                // toggle, so the disabled path is min(pure surface term, boulder SDF).
-                const float expected_d_off = std::min(d_surf, gen_off.hard_boulder_sdf(wx, wy, wz));
+                // The Hard Rock boulder and the Lava showcase dome are part of the terrain
+                // regardless of the caves toggle, so the disabled path is
+                // min(pure surface term, props SDF).
+                const float expected_d_off = std::min(d_surf, gen_off.props_sdf(wx, wy, wz));
                 const float d_off = gen_off.evaluate_composite_density(wx, wy, wz);
                 REQUIRE(std::abs(d_off - expected_d_off) < 1e-3f);
 

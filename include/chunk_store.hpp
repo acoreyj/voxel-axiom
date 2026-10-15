@@ -24,13 +24,25 @@
 namespace voxel {
 
 // ============================================================================
-// Material IDs & Persistent Damage Hardness Thresholds
+// Material IDs, Elemental Reactions & Persistent Damage Hardness Thresholds
 // ============================================================================
+enum class ElementalKind : uint8_t {
+    None  = 0,
+    Water = 1, // Quenches Lava -> 3-hit Obsidian; cools accumulated thermal/crack damage
+    Frost = 2, // Flips Air -> solid Ice; quenches Lava -> 3-hit Obsidian
+    Lava  = 3  // Injects molten Lava; melts Ice -> Air; reacts with Water -> Obsidian
+};
+
 struct MaterialHardness {
     static constexpr uint8_t kMaterialAir      = 0;
     static constexpr uint8_t kMaterialSoil     = 1; // Soft terrain / standard rock: breaks in 1 explosion
     static constexpr uint8_t kMaterialHardRock = 2; // Hard Rock: takes 3 explosions to break, shows progressive cracks
-    static constexpr uint8_t kMaterialBoulder  = 3; // Placed boulder: takes 5 explosions to break
+    static constexpr uint8_t kMaterialLava     = 3; // Molten Lava: breaks in 1 hit unless quenched to Obsidian by Water
+    static constexpr uint8_t kMaterialWater    = 4; // Water volume: reacts with Lava -> Obsidian, Frost -> Ice
+    static constexpr uint8_t kMaterialObsidian = 5; // Obsidian (Lava + Water): takes 3 explosions to break, shows cracks
+    static constexpr uint8_t kMaterialIce      = 6; // Solid Ice (Air/Water + Frost): breaks in 1 explosion, melts on Lava
+    // Placed boulder moved from 3 to 7 so the elemental material block (3..6) stays stable.
+    static constexpr uint8_t kMaterialBoulder  = 7; // Placed boulder: takes 5 explosions to break
 
     static constexpr uint8_t kDamagePerExplosionHit = 85; // soil / hard rock: 3 * 85 = 255
     static constexpr uint8_t kBoulderDamagePerHit = 51;   // boulder: 5 * 51 = 255
@@ -44,18 +56,21 @@ struct MaterialHardness {
     }
 
     /// Returns true only for materials that accumulate multi-hit persistent crack damage
-    /// (Hard Rock: 3 hits, Boulder: 5 hits). Soft terrain (soil/grass) breaks in a single
-    /// hit and must never retain crack damage in its (-delta, 0) crater-wall skin.
+    /// (Hard Rock: 3 hits, Obsidian: 3 hits, Boulder: 5 hits). Soft materials (soil/grass,
+    /// lava, water, ice) break in a single hit and must never retain crack damage in their
+    /// (-delta, 0) crater-wall skin.
     [[nodiscard]] static constexpr bool supports_persistent_damage(uint8_t material_id) noexcept {
-        return material_id == kMaterialHardRock || material_id == kMaterialBoulder;
+        return material_id == kMaterialHardRock || material_id == kMaterialObsidian ||
+               material_id == kMaterialBoulder;
     }
 
     /// Returns the cumulative damage threshold in [0, 255] required before TSDF carving occurs.
-    ///   - kMaterialSoil (1): threshold = 85  (1 hit  * 85 = 85  >= 85  -> breaks on 1st explosion)
-    ///   - kMaterialHardRock (2): threshold = 255 (1st hit = 85, 2nd hit = 170, 3rd hit = 255 -> breaks on 3rd explosion)
-    ///   - kMaterialBoulder (3): threshold = 255 (51 damage/hit -> cracks on hits 1-4, shatters on the 5th)
+    ///   - Soft materials (Soil, Lava, Water, Ice): threshold = 85 (breaks on the 1st explosion)
+    ///   - Hard Rock (2), Obsidian (5) & Boulder (7): threshold = 255
+    ///     (1st hit = 85/51, 2nd = 170/102, 3rd = 255/153 ... -> 3 hits for rock, 5 for boulders)
     [[nodiscard]] static constexpr uint8_t break_threshold(uint8_t material_id) noexcept {
-        if (material_id == kMaterialSoil) {
+        if (material_id == kMaterialSoil || material_id == kMaterialLava ||
+            material_id == kMaterialWater || material_id == kMaterialIce) {
             return kDamagePerExplosionHit;
         }
         return 255U;
@@ -64,12 +79,27 @@ struct MaterialHardness {
     /// Number of explosion hits required to break the material:
     ///   - kMaterialSoil (1): 1 hit
     ///   - kMaterialHardRock (2): 3 hits
-    ///   - kMaterialBoulder (3): 5 hits
+    ///   - kMaterialBoulder (7): 5 hits
+    ///   - Elemental materials (Lava/Water/Obsidian/Ice): 1, 1, 3 and 1 hit respectively
     /// The mesher packs this into a vertex color channel so the terrain shader can key its
     /// damage ramp off hits remaining instead of raw damage, making the hit before destruction
     /// read as the same bright red regardless of material hit count.
     [[nodiscard]] static constexpr uint8_t hits_to_break(uint8_t material_id) noexcept {
         return static_cast<uint8_t>(break_threshold(material_id) / damage_per_hit(material_id));
+    }
+
+    /// Encodes an elemental material ID into [0, 1] for vertex COLOR.b so the triplanar shader
+    /// can shade Lava, Water, Obsidian, and Ice alongside Soil/Grass and Hard Rock. Rock
+    /// materials return 0.0; their COLOR.b keeps carrying hits_to_break / 255 instead, and the
+    /// two domains never collide because every elemental code is >= 0.25 while hits <= 5/255.
+    [[nodiscard]] static constexpr float shader_material_code(uint8_t material_id) noexcept {
+        switch (material_id) {
+            case kMaterialLava:     return 0.25f;
+            case kMaterialWater:    return 0.50f;
+            case kMaterialObsidian: return 0.75f;
+            case kMaterialIce:      return 1.00f;
+            default:                return 0.00f;
+        }
     }
 };
 

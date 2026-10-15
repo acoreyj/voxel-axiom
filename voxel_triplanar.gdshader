@@ -6,6 +6,11 @@ uniform vec3 dirt_color  : source_color = vec3(0.45, 0.34, 0.23);
 uniform vec3 rock_color  : source_color = vec3(0.39, 0.40, 0.43);
 uniform vec3 hard_rock_color : source_color = vec3(0.22, 0.25, 0.33);
 uniform vec3 boulder_color : source_color = vec3(0.55, 0.48, 0.40);
+uniform vec3 lava_color     : source_color = vec3(1.00, 0.32, 0.04);
+uniform vec3 water_color    : source_color = vec3(0.10, 0.45, 0.85);
+uniform vec3 obsidian_color : source_color = vec3(0.08, 0.06, 0.14);
+uniform vec3 ice_color      : source_color = vec3(0.62, 0.88, 0.98);
+uniform vec3 crack_glow_color : source_color = vec3(1.0, 0.42, 0.08);
 // Debug overlay: tints accumulated damage light-yellow -> bright red and glows along
 // fracture lines. Uncheck for the realistic crack-only look used in normal play.
 uniform bool debug_damage_indicator = true;
@@ -16,7 +21,11 @@ varying vec3 v_world_pos;
 varying vec3 v_world_normal;
 varying float v_damage_ratio;
 varying float v_is_hard_rock;
+// COLOR.b carries two disjoint domains: elemental materials use shader_material_code
+// >= 0.25 (Lava 0.25, Water 0.50, Obsidian 0.75, Ice 1.00), while rock materials stay
+// below 0.25 carrying hits-to-break / 255 (1/255, 3/255, 5/255).
 varying float v_hits_to_break;
+varying float v_material_code;
 
 float hash31(vec3 p) {
 	p = fract(p * 0.1031);
@@ -115,6 +124,7 @@ void vertex() {
 	v_damage_ratio = COLOR.r;
 	v_is_hard_rock = COLOR.g;
 	v_hits_to_break = COLOR.b * 255.0;
+	v_material_code = (COLOR.b >= 0.2) ? COLOR.b : 0.0;
 }
 
 void fragment() {
@@ -138,10 +148,14 @@ void fragment() {
 		base_col = mix(base_col, hr_col, hard_rock_weight);
 	}
 
+	// Rock-domain flag: v_hits_to_break is only meaningful below the elemental band.
+	float is_elemental = step(0.2, v_material_code);
+
 	// Placed 5-hit boulders ride the same persistent-damage ramp as 3-hit Hard Rock, so they
 	// are separated here by hits-to-break (COLOR.b): a lighter, warmer speckled granite instead
-	// of dark metallic basalt. Boulder weighs 1 only where the 5-hit material was tagged.
-	float boulder_weight = hard_rock_weight * step(3.5, v_hits_to_break);
+	// of dark metallic basalt. Boulder weighs 1 only where the 5-hit material was tagged, and
+	// never on elemental materials (their COLOR.b is a material code, not a hit count).
+	float boulder_weight = hard_rock_weight * step(3.5, v_hits_to_break) * (1.0 - is_elemental);
 	if (boulder_weight > 0.01) {
 		float speck_coarse = value_noise3d(v_world_pos * 1.6);
 		float speck_fine   = value_noise3d(v_world_pos * 7.3);
@@ -150,13 +164,56 @@ void fragment() {
 		base_col = mix(base_col, boulder_col, boulder_weight);
 	}
 
+	// Elemental Material Shading (v_material_code: 0.25 = Lava, 0.50 = Water,
+	// 0.75 = Obsidian, 1.00 = Ice). Weights come from the disjoint COLOR.b band.
+	float lava_w     = 1.0 - smoothstep(0.04, 0.12, abs(v_material_code - 0.25));
+	float water_w    = 1.0 - smoothstep(0.04, 0.12, abs(v_material_code - 0.50));
+	float obsidian_w = 1.0 - smoothstep(0.04, 0.12, abs(v_material_code - 0.75));
+	float ice_w      = 1.0 - smoothstep(0.04, 0.12, abs(v_material_code - 1.00));
+	vec3 emission_col = vec3(0.0);
+	float roughness_val = mix(0.90, mix(mix(0.75, 0.52, hard_rock_weight * (1.0 - boulder_weight)),
+		0.88, boulder_weight), flat_mask);
+	float metallic_val = 0.18 * hard_rock_weight * (1.0 - boulder_weight);
+	if (is_elemental > 0.5) {
+		if (lava_w > 0.01) {
+			float magma_crust = crack_voronoi_edge(v_world_pos * 0.55);
+			float molten_vein = 1.0 - smoothstep(0.0, 0.28, magma_crust);
+			vec3 crust_col = mix(vec3(0.18, 0.05, 0.03), lava_color, molten_vein);
+			base_col = mix(base_col, crust_col, lava_w);
+			emission_col += lava_color * (0.65 + 1.35 * molten_vein) * lava_w;
+			roughness_val = mix(roughness_val, 0.65, lava_w);
+			metallic_val = mix(metallic_val, 0.0, lava_w);
+		}
+		if (water_w > 0.01) {
+			base_col = mix(base_col, water_color * tint, water_w);
+			roughness_val = mix(roughness_val, 0.15, water_w);
+			metallic_val = mix(metallic_val, 0.10, water_w);
+		}
+		if (obsidian_w > 0.01) {
+			float glass_sheen = value_noise3d(v_world_pos * 0.90);
+			vec3 obs_col = obsidian_color * mix(0.80, 1.35, glass_sheen);
+			base_col = mix(base_col, obs_col, obsidian_w);
+			roughness_val = mix(roughness_val, 0.18, obsidian_w);
+			metallic_val = mix(metallic_val, 0.45, obsidian_w);
+		}
+		if (ice_w > 0.01) {
+			float frost_crystal = value_noise3d(v_world_pos * 1.40);
+			vec3 frost_col = mix(ice_color, vec3(0.88, 0.96, 1.0), frost_crystal * 0.5);
+			base_col = mix(base_col, frost_col, ice_w);
+			emission_col += vec3(0.08, 0.22, 0.30) * ice_w;
+			roughness_val = mix(roughness_val, 0.12, ice_w);
+			metallic_val = mix(metallic_val, 0.25, ice_w);
+		}
+	}
+
 	// Gate the progressive crack network strictly to Hard Rock and placed boulders
 	// (v_is_hard_rock) so grass and dirt never render rock cracks.
 	float crack_mask = 0.0;
 	float rock_damage = v_damage_ratio * hard_rock_weight;
 	// Damage level from hits remaining: 3-hit rocks and 5-hit boulders traverse the same
 	// five-step ramp and both reach their final cracked state with one hit left to shatter.
-	float max_hits = max(floor(v_hits_to_break + 0.5), 1.0);
+	// Obsidian rides the 3-hit ramp (its COLOR.b carries the 0.75 material code, not a count).
+	float max_hits = mix(max(floor(v_hits_to_break + 0.5), 1.0), 3.0, step(0.5, obsidian_w));
 	float hits_left = max_hits * (1.0 - rock_damage);
 	float dmg_level = clamp(floor(6.0 - hits_left + 0.5) - 1.0, 0.0, 4.0);
 	float level01 = clamp((dmg_level + 1.0) / 5.0, 0.0, 1.0);
@@ -226,18 +283,18 @@ void fragment() {
 		}
 	}
 
-	// Boulders are matte and non-metallic, so they also read differently in the highlight:
-	// the dark shiny hard-rock finish never appears on a placed boulder.
-	float hard_rock_only = hard_rock_weight * (1.0 - boulder_weight);
-	float rock_rough = mix(0.75, 0.52, hard_rock_only);
-	rock_rough = mix(rock_rough, 0.88, boulder_weight);
-
 	ALBEDO = base_col;
-	EMISSION = debug_damage_indicator
-		? damage_col * (crack_mask * damage_presence * (0.65 + 0.34 * dmg_level))
-		: vec3(0.0);
-	// Freshly fractured rock is rougher than the intact finish.
-	float crack_rough = debug_damage_indicator ? 0.0 : damage_presence * hard_rock_weight * 0.35;
-	ROUGHNESS = mix(mix(0.90, rock_rough, flat_mask), 0.97, crack_rough);
-	METALLIC = 0.18 * hard_rock_only;
+	EMISSION = emission_col
+		+ (debug_damage_indicator
+			? damage_col * (crack_mask * damage_presence * (0.65 + 0.34 * dmg_level))
+			: vec3(0.0))
+		// Fractured obsidian smoulders along its crack network (elemental glow, always on).
+		+ crack_glow_color * (crack_mask * smoothstep(0.25, 0.75, rock_damage) * 1.6 * obsidian_w);
+	// Freshly fractured rock is rougher than the intact finish; elemental surfaces keep
+	// their own finish (shiny obsidian stays shiny, molten lava governs its own roughness).
+	float crack_rough = debug_damage_indicator
+		? 0.0
+		: damage_presence * hard_rock_weight * 0.35 * (1.0 - is_elemental);
+	ROUGHNESS = clamp(mix(roughness_val, 0.97, crack_rough), 0.02, 1.0);
+	METALLIC = metallic_val;
 }
