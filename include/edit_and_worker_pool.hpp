@@ -299,7 +299,7 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                         const float px = static_cast<float>(chunk_min.x + lx);
 
                         float d_blast = -1e30f;
-                        int spheres_hitting_sample = 0;
+                        int spheres_hitting_interior = 0;
                         for (const SphereCsgTerm& s : tx.spheres) {
                             const float dx = px - s.center.x;
                             const float dy = py - s.center.y;
@@ -307,8 +307,10 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                             const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
                             const float d = s.radius - dist;
                             d_blast = std::max(d_blast, d);
-                            if (d > -delta) {
-                                ++spheres_hitting_sample;
+                            // Count only hits inside the actual blast radius (d >= 0) for damage,
+                            // NOT the outer (-delta, 0) TSDF wall-smoothing shell.
+                            if (d >= 0.0f) {
+                                ++spheres_hitting_interior;
                             }
                         }
 
@@ -333,33 +335,73 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                                         }
                                     }
                                 }
-                            } else {
-                                const uint8_t mat_id = slot->get_material(lc);
-                                const uint8_t threshold = MaterialHardness::break_threshold(mat_id);
-
-                                // Accumulate persistent damage from each sphere term intersecting this sample
-                                const uint32_t added_dmg = std::min<uint32_t>(
-                                    255U,
-                                    static_cast<uint32_t>(spheres_hitting_sample) *
-                                        static_cast<uint32_t>(MaterialHardness::damage_per_hit(mat_id)));
-                                bool dmg_changed = false;
-                                const uint8_t total_dmg = slot->add_damage(
-                                    lc, static_cast<uint8_t>(added_dmg), store.material_pool(), &dmg_changed);
-                                if (dmg_changed) {
+                                // The fill path must reset any stale damage so re-placed dirt/rock
+                                // never inherits cracks left by an earlier blast.
+                                if (slot->clear_damage(lc)) {
                                     chunk_modified = true;
                                     local_dirty_mask.record_mutated_sample(lc);
                                 }
+                            } else if (q_cur == TsdfFormat::kClampedAir) {
+                                // Air never retains damage; clear anything stranded by earlier blasts
+                                // so it cannot surface as cracks if this space is filled later.
+                                if (slot->clear_damage(lc)) {
+                                    chunk_modified = true;
+                                    local_dirty_mask.record_mutated_sample(lc);
+                                }
+                            } else {
+                                const uint8_t mat_id = slot->get_material(lc);
 
-                                // Only carve TSDF once cumulative damage reaches the material's hardness threshold!
-                                // (For kMaterialSoil=1, threshold=85 -> carves on 1st hit;
-                                //  For kMaterialHardRock=2, threshold=255 -> cracks on hits 1 & 2, shatters on 3rd hit!)
-                                if (total_dmg >= threshold) {
+                                if (!MaterialHardness::supports_persistent_damage(mat_id)) {
+                                    // Soft terrain (soil/grass) breaks in a single hit: never write
+                                    // persistent damage into the R + delta influence band (which would
+                                    // strand a solid, cracked (-delta, 0) crater-wall skin). Carve
+                                    // immediately and clear any lingering damage.
+                                    if (slot->clear_damage(lc)) {
+                                        chunk_modified = true;
+                                        local_dirty_mask.record_mutated_sample(lc);
+                                    }
                                     const int16_t q_blast = TsdfFormat::encode(d_blast, delta);
                                     const int16_t q_new = std::max(q_cur, q_blast);
-
                                     if (q_new != q_cur) {
                                         bool changed = false;
                                         if (slot->set_tsdf(lc, q_new, store.tsdf_pool(), &changed) && changed) {
+                                            chunk_modified = true;
+                                            local_dirty_mask.record_mutated_sample(lc);
+                                        }
+                                    }
+                                } else {
+                                    // Multi-hit Hard Rock / Boulder: accumulate persistent crack
+                                    // damage per interior hit before carving.
+                                    const uint8_t threshold = MaterialHardness::break_threshold(mat_id);
+                                    uint8_t total_dmg = slot->get_damage(lc);
+                                    if (spheres_hitting_interior > 0) {
+                                        const uint32_t added_dmg = std::min<uint32_t>(
+                                            255U,
+                                            static_cast<uint32_t>(spheres_hitting_interior) *
+                                                static_cast<uint32_t>(MaterialHardness::damage_per_hit(mat_id)));
+                                        bool dmg_changed = false;
+                                        total_dmg = slot->add_damage(
+                                            lc, static_cast<uint8_t>(added_dmg), store.material_pool(), &dmg_changed);
+                                        if (dmg_changed) {
+                                            chunk_modified = true;
+                                            local_dirty_mask.record_mutated_sample(lc);
+                                        }
+                                    }
+
+                                    // Only carve once cumulative damage reaches the material's threshold
+                                    // (Hard Rock: 255 on the 3rd hit; Boulder: 255 after 5 hits). Clear
+                                    // damage on the carved sample so the crater skin never keeps cracks.
+                                    if (total_dmg >= threshold) {
+                                        const int16_t q_blast = TsdfFormat::encode(d_blast, delta);
+                                        const int16_t q_new = std::max(q_cur, q_blast);
+                                        if (q_new != q_cur) {
+                                            bool changed = false;
+                                            if (slot->set_tsdf(lc, q_new, store.tsdf_pool(), &changed) && changed) {
+                                                chunk_modified = true;
+                                                local_dirty_mask.record_mutated_sample(lc);
+                                            }
+                                        }
+                                        if (slot->clear_damage(lc)) {
                                             chunk_modified = true;
                                             local_dirty_mask.record_mutated_sample(lc);
                                         }
@@ -427,6 +469,7 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
             if (!crumbs_to_prune.empty()) {
                 for (const LocalCoord& lc : crumbs_to_prune) {
                     (void)slot->set_tsdf(lc, TsdfFormat::kClampedAir, store.tsdf_pool());
+                    (void)slot->clear_damage(lc);
                     dirty_mask.record_mutated_sample(lc);
                 }
                 slot->try_demote_if_uniform(store.tsdf_pool(), store.material_pool());

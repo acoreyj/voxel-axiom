@@ -146,6 +146,8 @@ void test_r_plus_delta_crater_wall_continuity() {
                     // Must match smooth negative TSDF value and not remain clamped at kClampedSolid (-32767)
                     // unless expected_q itself rounds to -32767 at the very outer edge of the shell.
                     REQUIRE(actual_q == expected_q);
+                    // The (-delta, 0) crater-wall skin in kMaterialSoil must retain ZERO crack damage.
+                    REQUIRE(slot->get_damage(mapped.local) == 0U);
                     if (dist < radius + delta - 0.05f) {
                         REQUIRE(actual_q > TsdfFormat::kClampedSolid);
                         REQUIRE(actual_q <= 0);
@@ -412,6 +414,90 @@ void test_persistent_damage_5_hit_boulder() {
 }
 
 // ============================================================================
+// 6b. Regression: Soil Never Retains Cracks, Damage Never Bleeds Across a
+//     Rock -> Soil Boundary, and the Fill Path Resets Stale Damage
+// ============================================================================
+void test_soil_never_accumulates_or_bleeds_cracks_and_fill_resets_damage() {
+    ++g_tests_run;
+
+    MemoryLedger ledger;
+    ChunkStore store(ledger, /*world_height_chunks=*/8);
+    DualDirtyScheduler scheduler;
+    WorkerScratchWindow36 scratch(ledger);
+
+    const ChunkKey ck = ChunkKey::from_coords(0, 0, 0);
+    ChunkSlot* slot = store.get_or_create_slot(ck);
+    {
+        std::unique_lock<std::shared_mutex> lock(slot->mutex);
+        slot->reset_to_uniform(
+            ChunkStorageForm::Solid, MaterialHardness::kMaterialSoil, store.tsdf_pool(), store.material_pool());
+        slot->state = ChunkLifecycleState::Resident;
+        slot->version.store(1, std::memory_order_release);
+
+        // Flat ground solid for y <= 16, with a Hard Rock pocket on x >= 16 so dual cells
+        // straddle a rock -> soil boundary.
+        for (int32_t z = 0; z < 32; ++z) {
+            for (int32_t y = 0; y < 32; ++y) {
+                for (int32_t x = 0; x < 32; ++x) {
+                    const float sdf = static_cast<float>(y) - 16.2f;
+                    const int16_t q = TsdfFormat::encode(std::clamp(sdf, -2.0f, +2.0f), 2.0f);
+                    REQUIRE(slot->set_tsdf(LocalCoord{x, y, z}, q, store.tsdf_pool()));
+                    if (x >= 16 && y <= 16) {
+                        REQUIRE(slot->set_material(
+                            LocalCoord{x, y, z}, MaterialHardness::kMaterialHardRock, store.material_pool()));
+                    }
+                }
+            }
+        }
+    }
+
+    // Blast the boundary: soil (x < 16) must carve immediately and keep 0 damage; hard rock
+    // (x >= 16) survives Hit 1 with damage == 85.
+    {
+        EditTransaction tx = EditTransaction::create_from_spheres(
+            {SphereCsgTerm{Vec3f{16.0f, 16.0f, 16.0f}, /*radius=*/6.0f}}, 2.0f, 8);
+        while (!tx.is_finished()) {
+            (void)execute_next_edit_phase(store, scheduler, tx);
+        }
+    }
+
+    for (int32_t z = 0; z < 32; ++z) {
+        for (int32_t y = 0; y < 32; ++y) {
+            for (int32_t x = 0; x < 16; ++x) {
+                const LocalCoord lc{x, y, z};
+                REQUIRE(slot->get_material(lc) == MaterialHardness::kMaterialSoil);
+                REQUIRE(slot->get_damage(lc) == 0U);
+            }
+        }
+    }
+
+    // The mesher must never emit a non-zero damage ratio on a soil vertex (no boundary bleed).
+    const auto stamp = gather_scratch_window_36(store, ck, scratch);
+    const auto mesh = SurfaceNetsMesher::mesh_chunk_from_scratch_36(
+        ck, scratch, 1, stamp.captured_terrain_revision);
+    REQUIRE(!mesh.vertices.empty());
+    for (const Vec3f& col : mesh.colors) {
+        if (col.y < 0.5f) {
+            REQUIRE(col.x == 0.0f);
+        }
+    }
+
+    // Fill soil over the previously damaged hard rock: stale damage must be reset to 0.
+    {
+        EditTransaction fill_tx = EditTransaction::create_from_spheres(
+            {SphereCsgTerm{Vec3f{18.0f, 15.0f, 16.0f}, /*radius=*/4.0f}}, 2.0f,
+            /*world_height_chunks=*/8, EditOperation::Fill, MaterialHardness::kMaterialSoil);
+        while (!fill_tx.is_finished()) {
+            (void)execute_next_edit_phase(store, scheduler, fill_tx);
+        }
+    }
+    REQUIRE(slot->get_material(LocalCoord{18, 15, 16}) == MaterialHardness::kMaterialSoil);
+    REQUIRE(slot->get_damage(LocalCoord{18, 15, 16}) == 0U);
+
+    std::printf("[PASS] test_soil_never_accumulates_or_bleeds_cracks_and_fill_resets_damage\n");
+}
+
+// ============================================================================
 // 7. Multi-Threaded Worker Pool, Coalesced Blasts & Ordered Teardown (Section 5.3)
 // ============================================================================
 void test_worker_pool_concurrent_execution_and_teardown() {
@@ -633,6 +719,7 @@ int main() {
     test_persistent_damage_3_hit_hard_rock();
     test_fill_tags_selected_material();
     test_persistent_damage_5_hit_boulder();
+    test_soil_never_accumulates_or_bleeds_cracks_and_fill_resets_damage();
     test_worker_pool_concurrent_execution_and_teardown();
     test_fill_add_terrain_union_semantics();
     test_fill_and_carve_do_not_coalesce();

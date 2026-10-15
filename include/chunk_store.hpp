@@ -43,6 +43,13 @@ struct MaterialHardness {
         return kDamagePerExplosionHit;
     }
 
+    /// Returns true only for materials that accumulate multi-hit persistent crack damage
+    /// (Hard Rock: 3 hits, Boulder: 5 hits). Soft terrain (soil/grass) breaks in a single
+    /// hit and must never retain crack damage in its (-delta, 0) crater-wall skin.
+    [[nodiscard]] static constexpr bool supports_persistent_damage(uint8_t material_id) noexcept {
+        return material_id == kMaterialHardRock || material_id == kMaterialBoulder;
+    }
+
     /// Returns the cumulative damage threshold in [0, 255] required before TSDF carving occurs.
     ///   - kMaterialSoil (1): threshold = 85  (1 hit  * 85 = 85  >= 85  -> breaks on 1st explosion)
     ///   - kMaterialHardRock (2): threshold = 255 (1st hit = 85, 2nd hit = 170, 3rd hit = 255 -> breaks on 3rd explosion)
@@ -452,6 +459,11 @@ struct ChunkSlot {
 
     [[nodiscard]] bool set_material_linear(uint32_t idx, uint8_t mat_id, MaterialSlabPool& mat_pool) noexcept {
         assert(idx < TsdfFormat::kChunkSamples);
+        // Writing a non-hard material must never leave stale crack damage behind (e.g. re-placed
+        // dirt, or a hard-rock sample re-tagged as soil), so zero the damage channel in place.
+        if (!MaterialHardness::supports_persistent_damage(mat_id) && damage_data != nullptr) {
+            damage_data[idx] = 0U;
+        }
         if (!material_data) {
             if (mat_id == base_material_id) {
                 return true; // Remains uniform with 0 bytes allocated
@@ -487,6 +499,18 @@ struct ChunkSlot {
             damage_data = slab;
         }
         damage_data[idx] = dmg;
+        return true;
+    }
+
+    /// Clears any accumulated damage at `local` without allocating a slab if none exists.
+    /// Returns true if a non-zero damage value was actually reset.
+    bool clear_damage(LocalCoord local) noexcept {
+        const uint32_t idx = local.to_linear_index();
+        assert(idx < TsdfFormat::kChunkSamples);
+        if (!damage_data || damage_data[idx] == 0U) {
+            return false;
+        }
+        damage_data[idx] = 0U;
         return true;
     }
 

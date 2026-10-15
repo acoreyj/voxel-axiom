@@ -471,7 +471,7 @@ public:
                     uint8_t mask = 0;
                     int16_t best_solid_q = INT16_MIN;
                     uint8_t best_material = 0;
-                    uint8_t max_solid_damage = 0;
+                    uint8_t max_hard_rock_damage = 0;
 
                     for (int c = 0; c < 8; ++c) {
                         const int32_t cx = i + (c & 1);
@@ -481,10 +481,14 @@ public:
                         corner_q[c] = q;
                         if (q < 0) {
                             mask |= static_cast<uint8_t>(1U << c);
-                            max_solid_damage = std::max(max_solid_damage, scratch.get_damage(cx, cy, cz));
+                            const uint8_t mat = scratch.get_material(cx, cy, cz);
+                            if (MaterialHardness::supports_persistent_damage(mat)) {
+                                max_hard_rock_damage =
+                                    std::max(max_hard_rock_damage, scratch.get_damage(cx, cy, cz));
+                            }
                             if (q > best_solid_q) {
                                 best_solid_q = q;
-                                best_material = scratch.get_material(cx, cy, cz);
+                                best_material = mat;
                             }
                         }
                     }
@@ -562,7 +566,11 @@ public:
                     };
                     cell.normal = n;
                     cell.material_id = best_material;
-                    cell.damage = max_solid_damage;
+                    // Gate cell damage by the winning material so damage never bleeds across
+                    // a rock -> soil dual-cell boundary (grass/dirt vertices stay at 0 cracks).
+                    cell.damage = MaterialHardness::supports_persistent_damage(best_material)
+                                      ? max_hard_rock_damage
+                                      : 0U;
                 }
             }
         }
@@ -574,11 +582,12 @@ public:
                 out.vertices.push_back(cell.local_pos);
                 out.normals.push_back(cell.normal);
                 // Pack damage ratio in [0, 1] into colors.x (R) and the rock flag into colors.y (G).
-                // Placed boulders share the hard-rock tint and progressive crack visuals.
-                const float dmg_ratio = static_cast<float>(cell.damage) / 255.0f;
-                const float is_rock =
-                    (cell.material_id == MaterialHardness::kMaterialHardRock ||
-                     cell.material_id == MaterialHardness::kMaterialBoulder) ? 1.0f : 0.0f;
+                // Placed boulders share the hard-rock tint and progressive crack visuals. Only
+                // persistent-damage materials carry a non-zero damage ratio; grass/dirt emit 0.0.
+                const bool is_hard_rock_mat = MaterialHardness::supports_persistent_damage(cell.material_id);
+                const float dmg_ratio =
+                    is_hard_rock_mat ? (static_cast<float>(cell.damage) / 255.0f) : 0.0f;
+                const float is_rock = is_hard_rock_mat ? 1.0f : 0.0f;
                 out.colors.push_back(Vec3f{dmg_ratio, is_rock, 0.0f});
             }
             return cell.vertex_index;

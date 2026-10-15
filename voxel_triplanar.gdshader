@@ -78,16 +78,19 @@ void fragment() {
     float metal = mix(0.04, 0.28, clamp(v_is_hard_rock, 0.0, 1.0));
     vec3 emission = vec3(0.0);
 
-    // Progressive crack rendering when damaged (Hit 1: ~0.33, Hit 2: ~0.67)
-    if (v_damage_ratio > 0.02) {
+    // Gate progressive cracks and magma glow strictly to Hard Rock / Boulder
+    // (v_is_hard_rock) so grass and dirt never render hard-rock cracks or glow.
+    float hard_rock_weight = smoothstep(0.35, 0.75, clamp(v_is_hard_rock, 0.0, 1.0));
+    float rock_damage = v_damage_ratio * hard_rock_weight;
+    if (rock_damage > 0.02) {
         float ridge = crack_pattern_3d(v_world_pos);
-        float crack_width = mix(0.08, 0.24, v_damage_ratio);
+        float crack_width = mix(0.08, 0.24, rock_damage);
         float crack_mask = 1.0 - smoothstep(0.0, crack_width, ridge);
 
         // Darken fractured crevices and emit glowing stress lines that intensify from Hit 1 -> Hit 2
-        albedo = mix(albedo * (1.0 - 0.35 * v_damage_ratio), vec3(0.05, 0.03, 0.02), crack_mask);
-        vec3 glow_col = mix(crack_glow_stage1, crack_glow_stage2, clamp((v_damage_ratio - 0.30) * 2.5, 0.0, 1.0));
-        emission = glow_col * crack_mask * (1.5 * v_damage_ratio);
+        albedo = mix(albedo * (1.0 - 0.35 * rock_damage), vec3(0.05, 0.03, 0.02), crack_mask);
+        vec3 glow_col = mix(crack_glow_stage1, crack_glow_stage2, clamp((rock_damage - 0.30) * 2.5, 0.0, 1.0));
+        emission = glow_col * crack_mask * (1.5 * rock_damage);
         rough = mix(rough, 0.95, crack_mask);
     }
 
