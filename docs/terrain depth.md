@@ -19,5 +19,6 @@ Terrain depth is controlled by the distance between **bedrock (`y = 0`)** and th
 
 - **`world_height_chunks`** (`1..12`) — vertical chunk ceiling. Baked into `ChunkStore` when the node enters the tree, so set it before the node starts (i.e. in the scene/Inspector before running).
 - **`surface_base_height`** (`16.0..256.0` m) — forwarded to `CaveNoiseGenerator::surface_base_height` at startup and on change; new chunks pick up the new value.
+- **`world_seed`** (`0..4294967295`) — forwarded to `CaveNoiseGenerator::seed` at startup and on change (default `1337`). Changing it reshapes terrain for chunks generated afterwards; already-streamed chunks keep their generated/edited data. The `get_surface_height` procedural fallback reads the live seed.
 
 The `surface_height_threshold` shader uniform and the demo camera `Y` still need to be matched manually per the table above.

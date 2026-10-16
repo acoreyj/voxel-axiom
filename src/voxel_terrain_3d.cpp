@@ -69,6 +69,8 @@ void VoxelTerrain3D::_bind_methods() {
     ClassDB::bind_method(D_METHOD("set_world_height_chunks", "height"), &VoxelTerrain3D::set_world_height_chunks);
     ClassDB::bind_method(D_METHOD("get_surface_base_height"), &VoxelTerrain3D::get_surface_base_height);
     ClassDB::bind_method(D_METHOD("set_surface_base_height", "height"), &VoxelTerrain3D::set_surface_base_height);
+    ClassDB::bind_method(D_METHOD("get_world_seed"), &VoxelTerrain3D::get_world_seed);
+    ClassDB::bind_method(D_METHOD("set_world_seed", "seed"), &VoxelTerrain3D::set_world_seed);
     ClassDB::bind_method(D_METHOD("get_generate_caves"), &VoxelTerrain3D::get_generate_caves);
     ClassDB::bind_method(D_METHOD("set_generate_caves", "enabled"), &VoxelTerrain3D::set_generate_caves);
     ClassDB::bind_method(D_METHOD("get_instrumentation_enabled"), &VoxelTerrain3D::get_instrumentation_enabled);
@@ -90,6 +92,8 @@ void VoxelTerrain3D::_bind_methods() {
                  "set_world_height_chunks", "get_world_height_chunks");
     ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "surface_base_height", PROPERTY_HINT_RANGE, "16.0,256.0,1.0"),
                  "set_surface_base_height", "get_surface_base_height");
+    ADD_PROPERTY(PropertyInfo(Variant::INT, "world_seed", PROPERTY_HINT_RANGE, "0,4294967295,1"),
+                 "set_world_seed", "get_world_seed");
     ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "terrain_material", PROPERTY_HINT_RESOURCE_TYPE, "Material"),
                  "set_terrain_material", "get_terrain_material");
     ADD_PROPERTY(PropertyInfo(Variant::BOOL, "generate_caves"),
@@ -154,6 +158,13 @@ void VoxelTerrain3D::set_surface_base_height(float p_height) {
     surface_base_height = p_height;
     if (core_engine) {
         core_engine->procgen.surface_base_height = p_height;
+    }
+}
+
+void VoxelTerrain3D::set_world_seed(int p_seed) {
+    world_seed = p_seed;
+    if (core_engine) {
+        core_engine->procgen.seed = static_cast<uint32_t>(p_seed);
     }
 }
 
@@ -243,6 +254,7 @@ void VoxelTerrain3D::_enter_tree() {
         &collision_subsample_stride);
     core_engine->procgen.caves_enabled = generate_caves;
     core_engine->procgen.surface_base_height = surface_base_height;
+    core_engine->procgen.seed = static_cast<uint32_t>(world_seed);
 
     // Cap worker count to physical core budget (at most 6 workers) so SMT hyperthreads
     // never starve Godot's main, render, physics, or NavigationServer threads.

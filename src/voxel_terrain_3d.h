@@ -120,6 +120,13 @@ public:
     void set_surface_base_height(float p_height);
     [[nodiscard]] float get_surface_base_height() const { return surface_base_height; }
 
+    /// Forwarded to `CaveNoiseGenerator::seed` at startup and on change. Only chunks
+    /// generated after the change pick up the new seed; already-streamed chunks keep
+    /// their generated/edited data. Also drives `get_surface_height`'s procedural
+    /// fallback, which reads the live value.
+    void set_world_seed(int p_seed);
+    [[nodiscard]] int get_world_seed() const { return world_seed; }
+
     void set_save_on_exit(bool p_save) { save_on_exit = p_save; }
     [[nodiscard]] bool get_save_on_exit() const { return save_on_exit; }
 
@@ -212,6 +219,7 @@ private:
     float upload_budget_ms = 2.0f;
     int world_height_chunks = 4;
     float surface_base_height = 68.0f;
+    int world_seed = 1337;
     bool save_on_exit = true;
     bool generate_caves = true;
 

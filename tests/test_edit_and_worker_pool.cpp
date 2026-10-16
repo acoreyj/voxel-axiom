@@ -1042,6 +1042,57 @@ void test_elemental_ca_quenches_exposed_lava() {
     std::printf("[PASS] test_elemental_ca_quenches_exposed_lava\n");
 }
 
+void test_elemental_ca_lava_ice_contact_quench_and_melt() {
+    ++g_tests_run;
+
+    MemoryLedger ledger;
+    ChunkStore store(ledger, /*world_height_chunks=*/8);
+    DualDirtyScheduler scheduler;
+    WorkerScratchWindow36 scratch(ledger);
+
+    const ChunkKey ck = ChunkKey::from_coords(0, 0, 0);
+    ChunkSlot* slot = store.get_or_create_slot(ck);
+    {
+        std::unique_lock<std::shared_mutex> lock(slot->mutex);
+        slot->reset_to_uniform(ChunkStorageForm::Empty, MaterialHardness::kMaterialAir,
+                               store.tsdf_pool(), store.material_pool());
+        // Two adjacent solid samples: Lava at (5,5,5) touching Ice at (6,5,5), far from the trigger below.
+        (void)slot->set_tsdf(LocalCoord{5, 5, 5}, TsdfFormat::kClampedSolid, store.tsdf_pool());
+        (void)slot->set_material(LocalCoord{5, 5, 5}, MaterialHardness::kMaterialLava, store.material_pool());
+        (void)slot->set_tsdf(LocalCoord{6, 5, 5}, TsdfFormat::kClampedSolid, store.tsdf_pool());
+        (void)slot->set_material(LocalCoord{6, 5, 5}, MaterialHardness::kMaterialIce, store.material_pool());
+        slot->state = ChunkLifecycleState::Resident;
+        slot->version.store(1, std::memory_order_release);
+    }
+
+    // A small Water trigger far away only exists to run the edit phase; the CA pass then
+    // reacts the adjacent Lava/Ice contact samples anywhere in the chunk.
+    SphereCsgTerm touch{};
+    touch.center = Vec3f{2.0f, 2.0f, 2.0f};
+    touch.radius = 1.5f;
+    touch.elemental_kind = voxel::ElementalKind::Water;
+
+    EditTransaction ca_tx = EditTransaction::create_from_spheres({touch}, /*delta=*/2.0f, /*world_height_chunks=*/8);
+    while (!ca_tx.is_finished()) {
+        (void)execute_next_edit_phase(store, scheduler, ca_tx);
+    }
+
+    // 6-neighbor CA: Lava touching Ice quenches into 3-hit Obsidian while the Ice melts to air.
+    REQUIRE(slot->get_material(LocalCoord{5, 5, 5}) == MaterialHardness::kMaterialObsidian);
+    REQUIRE(MaterialHardness::supports_persistent_damage(slot->get_material(LocalCoord{5, 5, 5})));
+    REQUIRE(slot->get_tsdf(LocalCoord{6, 5, 5}) > 0);
+
+    // The mesher packs obsidian as COLOR.g = 1 (multi-hit) and COLOR.b = 0.75 (obsidian shader code).
+    const auto stamp = gather_scratch_window_36(store, ck, scratch);
+    const auto mesh = SurfaceNetsMesher::mesh_chunk_from_scratch_36(
+        ck, scratch, 1, stamp.captured_terrain_revision);
+    REQUIRE(!mesh.vertices.empty());
+    REQUIRE(std::abs(mesh.colors.front().y - 1.0f) < 1e-3f);
+    REQUIRE(std::abs(mesh.colors.front().z - 0.75f) < 1e-3f);
+
+    std::printf("[PASS] test_elemental_ca_lava_ice_contact_quench_and_melt (CA Lava+Ice -> 3-Hit Obsidian & Ice melts to air)\n");
+}
+
 } // namespace
 
 int main() {
@@ -1062,6 +1113,7 @@ int main() {
     test_elemental_frost_builds_ice_dome_in_air();
     test_elemental_lava_transmutes_soil_and_melts_ice();
     test_elemental_ca_quenches_exposed_lava();
+    test_elemental_ca_lava_ice_contact_quench_and_melt();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",
                 g_tests_run, g_assertions_checked);
     return EXIT_SUCCESS;

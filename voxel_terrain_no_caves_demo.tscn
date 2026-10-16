@@ -1,8 +1,7 @@
-[gd_scene load_steps=11 format=3 uid="uid://voxel_terrain_nocaves_demo"]
+[gd_scene load_steps=6 format=3 uid="uid://voxel_terrain_nocaves_demo"]
 
 [ext_resource type="Script" path="res://terrain_demo.gd" id="1_demo_script"]
 [ext_resource type="Shader" path="res://voxel_triplanar.gdshader" id="2_triplanar_shader"]
-[ext_resource type="Script" path="res://ai_companion_patrol.gd" id="3_pill_patrol"]
 
 [sub_resource type="ProceduralSkyMaterial" id="ProceduralSkyMaterial_1"]
 
@@ -18,23 +17,6 @@ ssao_enabled = true
 [sub_resource type="ShaderMaterial" id="ShaderMaterial_Terrain"]
 render_priority = 0
 shader = ExtResource("2_triplanar_shader")
-
-[sub_resource type="CapsuleMesh" id="CapsuleMesh_pill"]
-radius = 0.6
-height = 2.6
-
-[sub_resource type="CylinderMesh" id="CylinderMesh_pill_band"]
-top_radius = 0.62
-bottom_radius = 0.62
-height = 0.36
-
-[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_pill_body"]
-albedo_color = Color(0.94, 0.42, 0.32, 1)
-roughness = 0.35
-
-[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_pill_band"]
-albedo_color = Color(0.96, 0.96, 0.93, 1)
-roughness = 0.3
 
 [node name="VoxelTerrainNoCavesDemo" type="Node3D"]
 script = ExtResource("1_demo_script")
@@ -56,17 +38,6 @@ terrain_material = SubResource("ShaderMaterial_Terrain")
 
 [node name="VoxelAICompanion" type="VoxelAICompanion" parent="."]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 16, 48, 16)
-script = ExtResource("3_pill_patrol")
-
-[node name="PillBody" type="MeshInstance3D" parent="VoxelAICompanion"]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.3, 0)
-mesh = SubResource("CapsuleMesh_pill")
-surface_material_override/0 = SubResource("StandardMaterial3D_pill_body")
-
-[node name="PillBand" type="MeshInstance3D" parent="VoxelAICompanion"]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.3, 0)
-mesh = SubResource("CylinderMesh_pill_band")
-surface_material_override/0 = SubResource("StandardMaterial3D_pill_band")
 
 [node name="Camera3D" type="Camera3D" parent="."]
 transform = Transform3D(1, 0, 0, 0, 0.968912, 0.247404, 0, -0.247404, 0.968912, 16, 84, 48)

@@ -8,7 +8,9 @@ extends Node3D
 ##   Key 7: Water Quench (turns Lava -> 3-hit Obsidian on contact & cools cracks)
 ##   Key 8: Frost / Ice Bridge (flips Air/Water -> solid Ice & quenches Lava -> Obsidian)
 ##   Key 9: Lava / Magma (injects Lava, melts Ice -> Air, reacts with Water -> Obsidian)
-## Right-click queries 3D cave navigation paths.
+## Right-click queries a 3D cave navigation path to the crosshair hit point and draws
+## it as a green 3D ribbon that the cyan companion marker walks along. P (or Shift + RMB)
+## places / teleports the AI Companion start marker at the crosshair hit point.
 
 @export var move_speed: float = 24.0
 @export var fast_multiplier: float = 3.0
@@ -23,6 +25,8 @@ extends Node3D
 @export var brush_spacing_factor: float = 0.6
 @export var brush_interval: float = 0.05
 @export var max_ray_distance: float = 250.0
+## Speed the cyan companion marker walks along the computed waypoints.
+@export var companion_walk_speed: float = 10.0
 ## A repeat explosive click whose re-raycast impact point has merely receded
 ## along the view ray (soft ground in front of the rock was blown away by the
 ## previous hit) by up to this fraction of the blast radius still counts as the
@@ -72,6 +76,17 @@ var _last_fail_warn_ms: int = 0
 var _look_at_name: String = "Sky"
 var _look_at_accum: float = 0.0
 
+var _companion_initialized: bool = false
+var _pending_path_goal: Vector3 = Vector3.ZERO
+var _has_pending_path_query: bool = false
+var _active_waypoints: PackedVector3Array = PackedVector3Array()
+var _current_waypoint_idx: int = 0
+
+var _companion_mesh_inst: MeshInstance3D = null
+var _goal_mesh_inst: MeshInstance3D = null
+var _path_mesh_inst: MeshInstance3D = null
+var _path_immediate_mesh: ImmediateMesh = null
+
 func _ready() -> void:
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 	terrain.explosion_requested.connect(_on_explosion_requested)
@@ -82,7 +97,47 @@ func _ready() -> void:
 	terrain.terrain_add_failed.connect(_on_terrain_add_failed)
 	terrain.chunk_committed.connect(_on_chunk_committed)
 
+	_setup_path_debug_visuals()
 	_update_stream_focus(true)
+
+func _setup_path_debug_visuals() -> void:
+	# 1. Cyan capsule marker on VoxelAICompanion so you can see it walk along the path
+	_companion_mesh_inst = MeshInstance3D.new()
+	var cap := CapsuleMesh.new()
+	cap.radius = 0.6
+	cap.height = 1.8
+	var cap_mat := StandardMaterial3D.new()
+	cap_mat.albedo_color = Color(0.1, 0.95, 1.0)
+	cap_mat.emission_enabled = true
+	cap_mat.emission = Color(0.1, 0.85, 1.0) * 0.6
+	cap.material = cap_mat
+	_companion_mesh_inst.mesh = cap
+	_companion_mesh_inst.position = Vector3(0.0, 0.9, 0.0)
+	ai_companion.add_child(_companion_mesh_inst)
+
+	# 2. Gold sphere marker at the path Goal
+	_goal_mesh_inst = MeshInstance3D.new()
+	var sph := SphereMesh.new()
+	sph.radius = 0.55
+	sph.height = 1.1
+	var sph_mat := StandardMaterial3D.new()
+	sph_mat.albedo_color = Color(1.0, 0.85, 0.1)
+	sph_mat.emission_enabled = true
+	sph_mat.emission = Color(1.0, 0.75, 0.1) * 0.8
+	sph.material = sph_mat
+	_goal_mesh_inst.mesh = sph
+	_goal_mesh_inst.visible = false
+	add_child(_goal_mesh_inst)
+
+	# 3. 3D Line Strip (ImmediateMesh) for rendering the computed waypoint path
+	_path_mesh_inst = MeshInstance3D.new()
+	_path_immediate_mesh = ImmediateMesh.new()
+	var line_mat := StandardMaterial3D.new()
+	line_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	line_mat.albedo_color = Color(0.2, 1.0, 0.4)
+	_path_mesh_inst.mesh = _path_immediate_mesh
+	_path_mesh_inst.material_override = line_mat
+	add_child(_path_mesh_inst)
 
 func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
@@ -117,6 +172,8 @@ func _unhandled_input(event: InputEvent) -> void:
 				_set_tool(Tool.LAVA_MAGMA)
 			KEY_R:
 				_toggle_add_material()
+			KEY_P:
+				_place_companion_at_crosshair()
 
 	elif event is InputEventMouseButton:
 		if event.button_index == MOUSE_BUTTON_LEFT:
@@ -129,7 +186,10 @@ func _unhandled_input(event: InputEvent) -> void:
 				else:
 					_apply_click_tool()
 		elif event.button_index == MOUSE_BUTTON_RIGHT and event.pressed:
-			_query_companion_cave_path()
+			if Input.is_key_pressed(KEY_SHIFT):
+				_place_companion_at_crosshair()
+			else:
+				_query_companion_cave_path_to_crosshair()
 
 func _process(delta: float) -> void:
 	var input_dir := Vector3.ZERO
@@ -154,6 +214,8 @@ func _process(delta: float) -> void:
 		_process_brush(delta)
 
 	_update_stream_focus(false)
+	_poll_pending_path_query()
+	_step_companion_along_path(delta)
 	_update_hud(delta)
 
 func _update_stream_focus(force: bool) -> void:
@@ -194,7 +256,7 @@ func _update_hud(delta: float) -> void:
 		_look_at_accum = 0.0
 		_refresh_look_at_material()
 
-	stats_label.text = "FPS: %.0f  (%.2f ms)\nView dist: %d / %d chunks  (prefetch %d)\nCommitted: %d chunks  (%.0f/s)\nStreaming: %s\nLooking at: %s\nTool: [%d] %s%s | 1-9 select, LMB use, RMB cave path" % [
+	stats_label.text = "FPS: %.0f  (%.2f ms)\nView dist: %d / %d chunks  (prefetch %d)\nCommitted: %d chunks  (%.0f/s)\nStreaming: %s\nLooking at: %s\nTool: [%d] %s%s | 1-9 select, LMB use, RMB path, P place" % [
 		_fps_smoothed,
 		1000.0 / max(_fps_smoothed, 1.0),
 		terrain.get_effective_view_distance_chunks(),
@@ -324,13 +386,78 @@ func _apply_tool_at(point: Vector3) -> void:
 		_:
 			terrain.trigger_explosion(point, explosion_radius)
 
-func _query_companion_cave_path() -> void:
-	var target_pos := camera.global_position
-	if not ai_companion.is_path_region_synced(target_pos):
-		print("[Nav3D] 3D 4x2x4 cave navigation group still baking async...")
+func _raycast_crosshair() -> Dictionary:
+	var space_state := get_world_3d().direct_space_state
+	var from := camera.global_position
+	var to := from - camera.global_transform.basis.z * max_ray_distance
+	var query := PhysicsRayQueryParameters3D.create(from, to)
+	return space_state.intersect_ray(query)
+
+func _place_companion_at_crosshair() -> void:
+	var hit := _raycast_crosshair()
+	if hit.is_empty():
+		print("[Nav3D] Aim at terrain surface and press P (or Shift+RMB) to place AI Companion.")
 		return
-	var path: PackedVector3Array = ai_companion.get_voxel_path(ai_companion.global_position, target_pos)
-	print("[Nav3D] Companion 3D cave path waypoints: ", path.size())
+	ai_companion.global_position = hit.position + Vector3(0.0, 0.5, 0.0)
+	_companion_initialized = true
+	_active_waypoints.clear()
+	print("[Nav3D] Placed AI Companion start at ", ai_companion.global_position, " - now aim at another spot and press RMB to path there.")
+
+func _query_companion_cave_path_to_crosshair() -> void:
+	var hit := _raycast_crosshair()
+	var goal_pos: Vector3 = (hit.position + Vector3(0.0, 0.5, 0.0)) if not hit.is_empty() else camera.global_position
+
+	# First RMB click places the companion if it hasn't been placed on the surface yet
+	if not _companion_initialized:
+		ai_companion.global_position = goal_pos
+		_companion_initialized = true
+		print("[Nav3D] Companion placed at ", goal_pos, " - Right-click another spot to path there!")
+		return
+
+	_pending_path_goal = goal_pos
+	_goal_mesh_inst.global_position = goal_pos
+	_goal_mesh_inst.visible = true
+	_has_pending_path_query = true
+	print("[Nav3D] Goal set at ", goal_pos, " - baking nav group if needed, then drawing path...")
+	_poll_pending_path_query()
+
+func _poll_pending_path_query() -> void:
+	if not _has_pending_path_query:
+		return
+	var start_pos := ai_companion.global_position
+	var start_synced := ai_companion.is_path_region_synced(start_pos)
+	var goal_synced := ai_companion.is_path_region_synced(_pending_path_goal)
+	if not start_synced or not goal_synced:
+		return
+
+	_has_pending_path_query = false
+	var path: PackedVector3Array = ai_companion.get_voxel_path(start_pos, _pending_path_goal)
+	print("[Nav3D] Companion 3D path from ", start_pos, " to ", _pending_path_goal, " -> waypoints: ", path.size())
+	_active_waypoints = path
+	_current_waypoint_idx = 0
+	_draw_path_ribbon(path)
+
+func _draw_path_ribbon(path: PackedVector3Array) -> void:
+	_path_immediate_mesh.clear_surfaces()
+	if path.size() < 2:
+		return
+	_path_immediate_mesh.surface_begin(Mesh.PRIMITIVE_LINE_STRIP)
+	for pt in path:
+		_path_immediate_mesh.surface_add_vertex(pt + Vector3(0.0, 0.35, 0.0))
+	_path_immediate_mesh.surface_end()
+
+func _step_companion_along_path(delta: float) -> void:
+	if _current_waypoint_idx >= _active_waypoints.size():
+		return
+	var target := _active_waypoints[_current_waypoint_idx]
+	var to_target := target - ai_companion.global_position
+	var dist := to_target.length()
+	var step := companion_walk_speed * delta
+	if dist <= step or dist < 0.15:
+		ai_companion.global_position = target
+		_current_waypoint_idx += 1
+	else:
+		ai_companion.global_position += (to_target / dist) * step
 
 func _print_throttled(message: String) -> void:
 	var now := Time.get_ticks_msec()
@@ -349,6 +476,10 @@ func _on_explosion_requested(pos: Vector3, radius: float) -> void:
 
 func _on_explosion_completed(pos: Vector3, radius: float, affected_chunks: int) -> void:
 	_print_throttled("[VoxelTerrain3D] Explosion completed at %s radius=%.1f chunks=%d" % [pos, radius, affected_chunks])
+	# Automatically re-query the path if a goal is active so you can watch paths reroute
+	# around new craters or across freshly frozen Ice bridges!
+	if _companion_initialized and _goal_mesh_inst.visible:
+		_has_pending_path_query = true
 
 func _on_explosion_failed(reason: String) -> void:
 	_warn_throttled("[VoxelTerrain3D] Explosion failed: " + reason)

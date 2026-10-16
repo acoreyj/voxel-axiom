@@ -87,6 +87,21 @@ void test_terrain_depth_slider_roundtrip() {
     std::printf("[PASS] test_terrain_depth_slider_roundtrip (world_height_chunks + surface_base_height set/get)\n");
 }
 
+void test_world_seed_roundtrip() {
+    ++g_tests_run;
+
+    VoxelTerrain3D terrain;
+    REQUIRE(terrain.get_world_seed() == 1337);
+
+    terrain.set_world_seed(424242);
+    REQUIRE(terrain.get_world_seed() == 424242);
+
+    terrain.set_world_seed(0);
+    REQUIRE(terrain.get_world_seed() == 0);
+
+    std::printf("[PASS] test_world_seed_roundtrip (default 1337, set/get round-trips)\n");
+}
+
 void test_gdextension_streaming_explosion_and_nav_lifecycle() {
     ++g_tests_run;
 
@@ -299,6 +314,7 @@ int main() {
     test_generate_caves_flag_roundtrip();
     test_collision_toggles_roundtrip();
     test_terrain_depth_slider_roundtrip();
+    test_world_seed_roundtrip();
     test_gdextension_streaming_explosion_and_nav_lifecycle();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",
                 g_tests_run, g_assertions_checked);

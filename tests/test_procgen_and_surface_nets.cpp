@@ -298,7 +298,44 @@ void test_procgen_caves_toggle() {
 }
 
 // ============================================================================
-// 4. Collision Subsample Stride (HLD v4.0 Section 4.4 escape hatch)
+// 4. World-Seed Determinism (CaveNoiseGenerator::seed)
+// ============================================================================
+void test_procgen_seed_determinism() {
+    ++g_tests_run;
+
+    CaveNoiseGenerator gen_a; // seed defaults to 1337
+    CaveNoiseGenerator gen_b;
+    CaveNoiseGenerator gen_c;
+    gen_c.seed = 424242U;
+
+    std::size_t differing_points = 0;
+    std::size_t samples = 0;
+    for (float wz = 0.0f; wz <= 48.0f; wz += 6.0f) {
+        for (float wx = 0.0f; wx <= 48.0f; wx += 6.0f) {
+            for (float wy = 24.0f; wy <= 72.0f; wy += 6.0f) {
+                const float d_a = gen_a.evaluate_composite_density(wx, wy, wz);
+                const float d_b = gen_b.evaluate_composite_density(wx, wy, wz);
+                // Same seed is bit-identical sample-for-sample.
+                REQUIRE(d_a == d_b);
+
+                if (std::abs(gen_c.evaluate_composite_density(wx, wy, wz) - d_a) > 1e-4f) {
+                    ++differing_points;
+                }
+                ++samples;
+            }
+        }
+    }
+
+    // A different seed reshapes the terrain.
+    REQUIRE(differing_points > 0ULL);
+
+    std::printf("[PASS] test_procgen_seed_determinism (same seed bit-identical; %zu/%zu samples "
+                "reshaped by seed 424242)\n",
+                differing_points, samples);
+}
+
+// ============================================================================
+// 5. Collision Subsample Stride (HLD v4.0 Section 4.4 escape hatch)
 // ============================================================================
 void test_collision_subsample_stride() {
     ++g_tests_run;
@@ -354,7 +391,7 @@ void test_collision_subsample_stride() {
 }
 
 // ============================================================================
-// 5. World-Space Surface Height Query (sample_top_surface_y)
+// 6. World-Space Surface Height Query (sample_top_surface_y)
 // ============================================================================
 void test_surface_height_query() {
     ++g_tests_run;
@@ -418,6 +455,7 @@ int main() {
     test_procgen_34_regularization_and_caves();
     test_2x2x2_watertight_chunk_seams();
     test_procgen_caves_toggle();
+    test_procgen_seed_determinism();
     test_collision_subsample_stride();
     test_surface_height_query();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",

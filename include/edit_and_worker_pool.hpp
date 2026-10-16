@@ -321,7 +321,11 @@ inline bool step_elemental_automata_in_chunk(
             for (int32_t dx = -1; dx <= 1; ++dx) {
                 const ChunkKey nk = center.offset(dx, dy, dz);
                 const ChunkSlot* slot = store.find_slot(nk);
-                if (!slot || slot->state != ChunkLifecycleState::Resident) {
+                if (!slot) {
+                    return false;
+                }
+                std::shared_lock<std::shared_mutex> lock(slot->mutex);
+                if (slot->state != ChunkLifecycleState::Resident) {
                     return false;
                 }
             }
@@ -914,7 +918,12 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                         for (int32_t dx = -1; dx <= 1; ++dx) {
                             const ChunkKey nk = dk.offset(dx, dy, dz);
                             const ChunkSlot* nslot = store.find_slot(nk);
-                            if (!nslot || nslot->state != ChunkLifecycleState::Resident) {
+                            bool is_res = false;
+                            if (nslot) {
+                                std::shared_lock<std::shared_mutex> nlock(nslot->mutex);
+                                is_res = (nslot->state == ChunkLifecycleState::Resident);
+                            }
+                            if (!is_res) {
                                 generate_fn(store, nk);
                             }
                         }

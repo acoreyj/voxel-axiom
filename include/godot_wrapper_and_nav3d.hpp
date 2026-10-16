@@ -23,6 +23,7 @@
 #include <godot_cpp/classes/navigation_server3d.hpp>
 #include <godot_cpp/classes/physics_server3d.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
+#include <godot_cpp/variant/aabb.hpp>
 #include <godot_cpp/variant/array.hpp>
 #include <godot_cpp/variant/callable_method_pointer.hpp>
 #include <godot_cpp/variant/color.hpp>
@@ -328,17 +329,11 @@ struct CaveNavMeshConfig {
     float voxel_scale = 1.0f;
     float cell_size = 0.25f;   // 0.25 * s
     float cell_height = 0.20f; // 0.20 * s
-    // Agent values are exact multiples of the live NavigationMesh cell sizes
-    // (cell_size 0.5 / cell_height 0.4) so Recast never logs the
-    // "ceiled/floored ... loses precision" warnings on every bake.
-    float agent_radius = 0.5f;
-    float agent_height = 2.0f;
-    float agent_max_climb = 0.4f;
+    float agent_radius = 0.6f;
+    float agent_height = 1.8f;
+    float agent_max_climb = 0.5f;
     float agent_max_slope = 45.0f;
-    // 0.5 keeps horizontal_padding() (agent_radius + margin + 2 voxels = 3.0)
-    // an exact multiple of the live cell_size 0.5, so Recast never logs the
-    // "border_size is ceiled to cell_size voxel units" warning per bake.
-    float region_connection_margin = 0.5f;
+    float region_connection_margin = 0.4f;
     float region_min_size = 8.0f;
 
     bool filter_low_hanging_obstacles = true;
@@ -449,6 +444,22 @@ public:
         };
     }
 
+    /// Ensures the 3D `4 x 2 x 4` navigation group containing `world_pos` has been baked at least
+    /// once on demand (useful when `bake_on_stream_enabled` is false at startup and the user
+    /// requests a path before firing an explosion in that group).
+    void ensure_group_baked_for_position(Vec3f world_pos) {
+        const float s = config_.voxel_scale;
+        const int32_t px = static_cast<int32_t>(std::floor(world_pos.x / s));
+        const int32_t py = static_cast<int32_t>(std::floor(world_pos.y / s));
+        const int32_t pz = static_cast<int32_t>(std::floor(world_pos.z / s));
+        const ChunkKey ck = ChunkKey::from_world_sample(px, py, pz);
+        const NavigationGroupKey gk = NavigationGroupKey::from_chunk_key(ck);
+        NavigationGroupState& g = get_or_create_group(gk);
+        if (g.total_bakes_submitted == 0 && g.desired_source_epoch == 0) {
+            g.desired_source_epoch = 1;
+        }
+    }
+
     void note_chunk_mesh_committed(ChunkKey key,
                                    uint64_t captured_terrain_revision,
                                    const std::vector<Vec3f>& /*faces*/) {
@@ -514,13 +525,6 @@ public:
             if (g.rebuild_in_flight) {
                 continue;
             }
-#if defined(VOXEL_WITH_GODOT_CPP)
-            if (auto* ns = godot::NavigationServer3D::get_singleton();
-                ns != nullptr && g.nav_mesh.is_valid() &&
-                ns->is_baking_navigation_mesh(g.nav_mesh)) {
-                continue;
-            }
-#endif
             const bool dirty = (g.desired_terrain_revision > g.synced_terrain_revision) ||
                                (g.desired_source_epoch > g.synced_source_epoch);
             if (!dirty) {
@@ -590,11 +594,6 @@ public:
                     g.nav_mesh,
                     g.source_data,
                     godot::Callable());
-                g.bake_callback_received = true;
-                g.pending_callback_map_iteration =
-                    nav_map_rid_.native_rid.is_valid()
-                        ? ns->map_get_iteration_id(nav_map_rid_.native_rid)
-                        : map_iteration_id_;
             }
             if (++groups_submitted_this_frame >= 1ULL) {
                 break;
@@ -618,39 +617,44 @@ public:
 
     void poll_server_synchronization() {
 #if defined(VOXEL_WITH_GODOT_CPP)
-        if (auto* ns = godot::NavigationServer3D::get_singleton();
-            ns != nullptr && nav_map_rid_.native_rid.is_valid()) {
+        auto* ns = godot::NavigationServer3D::get_singleton();
+        if (ns != nullptr && nav_map_rid_.native_rid.is_valid()) {
             map_iteration_id_ = ns->map_get_iteration_id(nav_map_rid_.native_rid);
         }
-#endif
         for (auto& [gk, g] : groups_) {
-            if (!g.rebuild_in_flight) {
-                continue;
-            }
-            bool bake_done = g.bake_callback_received;
-#if defined(VOXEL_WITH_GODOT_CPP)
-            if (auto* ns = godot::NavigationServer3D::get_singleton();
-                ns != nullptr && g.nav_mesh.is_valid()) {
-                // The async bake only counts as done once the server finished
-                // rasterizing; otherwise the group would be considered synced
-                // while its navmesh is still being written and a later edit
-                // would resubmit it mid-bake ("NavigationMesh is already baking").
-                bake_done = bake_done && !ns->is_baking_navigation_mesh(g.nav_mesh);
-            }
-#endif
-            if (bake_done && map_iteration_id_ > g.pending_callback_map_iteration) {
-#if defined(VOXEL_WITH_GODOT_CPP)
-                if (auto* ns = godot::NavigationServer3D::get_singleton();
-                    ns != nullptr && g.region_rid.native_rid.is_valid() && g.nav_mesh.is_valid()) {
-                    ns->region_set_navigation_mesh(g.region_rid.native_rid, g.nav_mesh);
+            if (g.rebuild_in_flight && !g.bake_callback_received) {
+                // Step 1: Wait until the async Recast bake on WorkerThreadPool finishes, then
+                // push the freshly baked NavigationMesh to the NavigationRegion RID!
+                if (ns != nullptr && g.nav_mesh.is_valid() && !ns->is_baking_navigation_mesh(g.nav_mesh)) {
+                    if (g.region_rid.native_rid.is_valid()) {
+                        ns->region_set_navigation_mesh(g.region_rid.native_rid, g.nav_mesh);
+                    }
+                    g.bake_callback_received = true;
+                    g.pending_callback_map_iteration = map_iteration_id_;
                 }
-#endif
+            } else if (g.rebuild_in_flight && g.bake_callback_received) {
+                // Step 2: Once region_set_navigation_mesh has been called, NavigationServer3D
+                // increments map_get_iteration_id on its next sync step (or immediately if >=).
+                if (map_iteration_id_ > g.pending_callback_map_iteration) {
+                    g.synced_terrain_revision = g.submitted_terrain_revision;
+                    g.synced_source_epoch = g.submitted_source_epoch;
+                    g.rebuild_in_flight = false;
+                    g.bake_callback_received = false;
+                }
+            }
+        }
+#else
+        for (auto& [gk, g] : groups_) {
+            if (g.rebuild_in_flight &&
+                g.bake_callback_received &&
+                map_iteration_id_ > g.pending_callback_map_iteration) {
                 g.synced_terrain_revision = g.submitted_terrain_revision;
                 g.synced_source_epoch = g.submitted_source_epoch;
                 g.rebuild_in_flight = false;
                 g.bake_callback_received = false;
             }
         }
+#endif
 
         for (auto it = waiting_chunks_.begin(); it != waiting_chunks_.end();) {
             const NavigationGroupKey gk = NavigationGroupKey::from_chunk_key(*it);
@@ -749,6 +753,11 @@ private:
         g.nav_mesh->set_agent_max_slope(config_.agent_max_slope);
         g.nav_mesh->set_region_min_size(config_.region_min_size);
         g.nav_mesh->set_border_size(g.border_size);
+        g.nav_mesh->set_filter_baking_aabb(godot::AABB(
+            godot::Vector3(g.baking_aabb.min.x, g.baking_aabb.min.y, g.baking_aabb.min.z),
+            godot::Vector3(g.baking_aabb.max.x - g.baking_aabb.min.x,
+                           g.baking_aabb.max.y - g.baking_aabb.min.y,
+                           g.baking_aabb.max.z - g.baking_aabb.min.z)));
         g.nav_mesh->set_filter_low_hanging_obstacles(config_.filter_low_hanging_obstacles);
         g.nav_mesh->set_filter_ledge_spans(config_.filter_ledge_spans);
         g.nav_mesh->set_filter_walkable_low_height_spans(config_.filter_walkable_low_height_spans);

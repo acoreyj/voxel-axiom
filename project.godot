@@ -18,13 +18,17 @@ config/name="Voxel Engine v4.0 Cave & Destruction Demo"
 run/main_scene="res://voxel_terrain_demo.tscn"
 config/features=PackedStringArray("4.7", "Forward Plus")
 
+[autoload]
+
+_mcp_game_helper="*res://addons/godot_ai/runtime/game_helper.gd"
+
 [dotnet]
 
 project/assembly_name="Voxel Engine v4.0 Cave & Destruction Demo"
 
-[navigation]
+[editor_plugins]
 
-3d/merge_rasterizer_cell_scale=0.001
+enabled=PackedStringArray("res://addons/godot_ai/plugin.cfg")
 
 [rendering]
 
