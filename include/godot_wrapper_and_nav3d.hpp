@@ -744,14 +744,16 @@ private:
             }
         }
         g.nav_mesh.instantiate();
-        // Use 0.5m / 0.4m cell resolution in live Godot builds to prevent 83M-voxel Recast stalls
-        g.nav_mesh->set_cell_size(0.5f);
-        g.nav_mesh->set_cell_height(0.4f);
+        // Configure Recast heightfield so 30-45 deg ramps and narrow Ice Bridges across caverns
+        // never get disconnected by quantized height steps (walkableClimb = floor(0.90 / 0.20) = 4 cells)
+        // or eroded away on bridge edges (filter_ledge_spans = false).
+        g.nav_mesh->set_cell_size(0.4f);
+        g.nav_mesh->set_cell_height(0.2f);
         g.nav_mesh->set_agent_radius(config_.agent_radius);
         g.nav_mesh->set_agent_height(config_.agent_height);
-        g.nav_mesh->set_agent_max_climb(config_.agent_max_climb);
-        g.nav_mesh->set_agent_max_slope(config_.agent_max_slope);
-        g.nav_mesh->set_region_min_size(config_.region_min_size);
+        g.nav_mesh->set_agent_max_climb(0.9f);
+        g.nav_mesh->set_agent_max_slope(52.0f);
+        g.nav_mesh->set_region_min_size(2.0f);
         g.nav_mesh->set_border_size(g.border_size);
         g.nav_mesh->set_filter_baking_aabb(godot::AABB(
             godot::Vector3(g.baking_aabb.min.x, g.baking_aabb.min.y, g.baking_aabb.min.z),
@@ -759,7 +761,7 @@ private:
                            g.baking_aabb.max.y - g.baking_aabb.min.y,
                            g.baking_aabb.max.z - g.baking_aabb.min.z)));
         g.nav_mesh->set_filter_low_hanging_obstacles(config_.filter_low_hanging_obstacles);
-        g.nav_mesh->set_filter_ledge_spans(config_.filter_ledge_spans);
+        g.nav_mesh->set_filter_ledge_spans(false);
         g.nav_mesh->set_filter_walkable_low_height_spans(config_.filter_walkable_low_height_spans);
         g.source_data.instantiate();
 #endif

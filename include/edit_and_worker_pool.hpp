@@ -99,13 +99,15 @@ struct EditTransaction {
 
         for (const SphereCsgTerm& s : tx.spheres) {
             assert(s.radius > 0.0f);
-            const float r_eff = s.radius + delta;
-            min_x = std::min(min_x, static_cast<int32_t>(std::floor(s.center.x - r_eff)));
-            min_y = std::min(min_y, static_cast<int32_t>(std::floor(s.center.y - r_eff)));
-            min_z = std::min(min_z, static_cast<int32_t>(std::floor(s.center.z - r_eff)));
-            max_x = std::max(max_x, static_cast<int32_t>(std::ceil(s.center.x + r_eff)));
-            max_y = std::max(max_y, static_cast<int32_t>(std::ceil(s.center.y + r_eff)));
-            max_z = std::max(max_z, static_cast<int32_t>(std::ceil(s.center.z + r_eff)));
+            const float r_horiz = (s.elemental_kind == ElementalKind::Frost) ? (s.radius * 1.35f) : s.radius;
+            const float r_eff_xz = r_horiz + delta;
+            const float r_eff_y  = s.radius + delta;
+            min_x = std::min(min_x, static_cast<int32_t>(std::floor(s.center.x - r_eff_xz)));
+            min_y = std::min(min_y, static_cast<int32_t>(std::floor(s.center.y - r_eff_y)));
+            min_z = std::min(min_z, static_cast<int32_t>(std::floor(s.center.z - r_eff_xz)));
+            max_x = std::max(max_x, static_cast<int32_t>(std::ceil(s.center.x + r_eff_xz)));
+            max_y = std::max(max_y, static_cast<int32_t>(std::ceil(s.center.y + r_eff_y)));
+            max_z = std::max(max_z, static_cast<int32_t>(std::ceil(s.center.z + r_eff_xz)));
         }
 
         tx.sample_min = IVec3{min_x, min_y, min_z};
@@ -497,7 +499,23 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                             const float dy = py - s.center.y;
                             const float dz = pz - s.center.z;
                             const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
-                            const float d_elem = dist - s.radius; // <= 0 inside elemental sphere
+
+                            // For Frost / Ice Bridge, shape the SDF as a Flat-Topped 31-Degree Ramped
+                            // Bridge & Crater Plug (instead of a sphere with unwalkable 90-deg equator walls!)
+                            // so any click inside a crater or cavern forms a wide, gentle <= 31-deg ramp
+                            // that the 45-deg AI Companion can always walk onto and across!
+                            float d_elem = dist - s.radius; // <= 0 inside elemental trigger sphere
+                            if (s.elemental_kind == ElementalKind::Frost) {
+                                const float r_xz = std::sqrt(dx * dx + dz * dz);
+                                const float flat_r = 0.45f * s.radius;
+                                const float ramp_out = std::max(0.0f, r_xz - flat_r);
+                                const float y_top = (s.center.y + 0.22f * s.radius) - 0.60f * ramp_out;
+                                const float y_bot = (s.center.y - 0.90f * s.radius) + 0.64f * ramp_out;
+                                const float d_upper = (py - y_top) / ((r_xz > flat_r) ? 1.1662f : 1.0f);
+                                const float d_lower = (y_bot - py) / ((r_xz > flat_r) ? 1.1923f : 1.0f);
+                                const float d_rim   = r_xz - 1.35f * s.radius;
+                                d_elem = std::max({d_upper, d_lower, d_rim});
+                            }
 
                             if (d_elem >= delta) {
                                 continue;

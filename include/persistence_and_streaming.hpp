@@ -776,8 +776,15 @@ public:
             }
         }
         for (const ChunkKey ek : to_evict) {
-            if (const ChunkSlot* slot = store_.find_slot(ek); slot != nullptr && slot->dirty_persist) {
-                (void)save_manager_.persist_compress_chunk(store_, ek);
+            if (const ChunkSlot* slot = store_.find_slot(ek); slot != nullptr) {
+                bool is_dirty = false;
+                {
+                    std::shared_lock<std::shared_mutex> sl(slot->mutex);
+                    is_dirty = slot->dirty_persist;
+                }
+                if (is_dirty) {
+                    (void)save_manager_.persist_compress_chunk(store_, ek);
+                }
             }
             if (store_.evict_slot(ek)) {
                 tracked_resident_.erase(ek);
@@ -791,7 +798,11 @@ public:
         //    on 26-neighbor closure residency so no chunk ever meshes against Absent neighbors!
         for (const CandidateChunk& cand : candidates) {
             ChunkSlot* slot = store_.find_slot(cand.key);
-            const bool is_resident = (slot != nullptr && slot->state == ChunkLifecycleState::Resident);
+            bool is_resident = false;
+            if (slot != nullptr) {
+                std::shared_lock<std::shared_mutex> sl(slot->mutex);
+                is_resident = (slot->state == ChunkLifecycleState::Resident);
+            }
             if (is_resident) {
                 tracked_resident_.insert(cand.key);
                 if (cand.in_active_set && meshed_active_.find(cand.key) == meshed_active_.end()) {

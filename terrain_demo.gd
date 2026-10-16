@@ -6,11 +6,15 @@ extends Node3D
 ## the add/paint material between soil and 3-hit rock. Keys 7-9 fire Bananza-style
 ## elemental reaction spheres:
 ##   Key 7: Water Quench (turns Lava -> 3-hit Obsidian on contact & cools cracks)
-##   Key 8: Frost / Ice Bridge (flips Air/Water -> solid Ice & quenches Lava -> Obsidian)
+##   Key 8: Frost / Ice Bridge (builds a flat-topped 31-deg ramped Ice Bridge & crater plug; flips Air/Water -> solid Ice & quenches Lava -> Obsidian)
 ##   Key 9: Lava / Magma (injects Lava, melts Ice -> Air, reacts with Water -> Obsidian)
 ## Right-click queries a 3D cave navigation path to the crosshair hit point and draws
 ## it as a green 3D ribbon that the cyan companion marker walks along. P (or Shift + RMB)
 ## places / teleports the AI Companion start marker at the crosshair hit point.
+## The companion is gravity-grounded, so blasting the ground out from under it drops it
+## into the fresh crater instead of leaving it floating on a stale path, and the drawn
+## ribbon is surface-draped so string-pulled segments hug concave terrain instead of
+## cutting through the air.
 
 @export var move_speed: float = 24.0
 @export var fast_multiplier: float = 3.0
@@ -27,6 +31,9 @@ extends Node3D
 @export var max_ray_distance: float = 250.0
 ## Speed the cyan companion marker walks along the computed waypoints.
 @export var companion_walk_speed: float = 10.0
+## Downward acceleration (m/s^2) applied to the companion when the ground beneath it
+## is carved away, so it falls into the fresh crater instead of floating on the old path.
+@export var companion_gravity: float = 28.0
 ## A repeat explosive click whose re-raycast impact point has merely receded
 ## along the view ray (soft ground in front of the rock was blown away by the
 ## previous hit) by up to this fraction of the blast radius still counts as the
@@ -77,8 +84,10 @@ var _look_at_name: String = "Sky"
 var _look_at_accum: float = 0.0
 
 var _companion_initialized: bool = false
+var _companion_vertical_vel: float = 0.0
 var _pending_path_goal: Vector3 = Vector3.ZERO
 var _has_pending_path_query: bool = false
+var _rebake_in_progress: bool = false
 var _active_waypoints: PackedVector3Array = PackedVector3Array()
 var _current_waypoint_idx: int = 0
 
@@ -214,6 +223,7 @@ func _process(delta: float) -> void:
 		_process_brush(delta)
 
 	_update_stream_focus(false)
+	_apply_companion_gravity_and_ground_snap(delta)
 	_poll_pending_path_query()
 	_step_companion_along_path(delta)
 	_update_hud(delta)
@@ -366,6 +376,12 @@ func _process_brush(delta: float) -> void:
 	_apply_tool_at(point)
 
 func _apply_tool_at(point: Vector3) -> void:
+	# Pause walking along stale pre-explosion segments while the terrain & NavMesh update.
+	# Carve tools (explosions / elemental / paint-delete) all report via explosion_completed,
+	# which flags a fresh path query and clears _rebake_in_progress once the remesh settles.
+	if _companion_initialized and _goal_mesh_inst.visible \
+			and (_is_boom_tool() or _active_tool == Tool.PAINT_DELETE):
+		_rebake_in_progress = true
 	match _active_tool:
 		Tool.ADD_TERRAIN:
 			terrain.add_terrain_with_material(point, add_radius, _add_material)
@@ -393,36 +409,74 @@ func _raycast_crosshair() -> Dictionary:
 	var query := PhysicsRayQueryParameters3D.create(from, to)
 	return space_state.intersect_ray(query)
 
+## Downward physics raycast used for companion gravity, goal snapping and path draping.
+func _raycast_ground_at(pos: Vector3, clearance_up: float = 3.5, down_dist: float = 64.0) -> Dictionary:
+	var space_state := get_world_3d().direct_space_state
+	var from := pos + Vector3(0.0, clearance_up, 0.0)
+	var to := pos - Vector3(0.0, down_dist, 0.0)
+	var query := PhysicsRayQueryParameters3D.create(from, to)
+	return space_state.intersect_ray(query)
+
+## Every frame, checks the terrain beneath the cyan pill. If the ground was blown out
+## from under it, the companion falls with gravity onto the crater floor, pauses its
+## horizontal walk while falling or while a remesh/rebake is in progress, and re-queries
+## the path from its new landed position.
+func _apply_companion_gravity_and_ground_snap(delta: float) -> void:
+	if not _companion_initialized:
+		return
+	var cur := ai_companion.global_position
+	var hit := _raycast_ground_at(cur, 4.5, 80.0)
+	if not hit.is_empty():
+		var ground_y: float = hit.position.y + 0.15
+		if cur.y > ground_y + 0.35:
+			# Ground was carved away beneath the pill -> fall with gravity into the crater!
+			_companion_vertical_vel = min(_companion_vertical_vel + companion_gravity * delta, 40.0)
+			cur.y = max(ground_y, cur.y - _companion_vertical_vel * delta)
+			ai_companion.global_position = cur
+			# Once it lands on the new crater floor, trigger a fresh path query from its landed position
+			if cur.y <= ground_y + 0.05 and _goal_mesh_inst.visible:
+				_companion_vertical_vel = 0.0
+				_has_pending_path_query = true
+		else:
+			# Smoothly step up/down onto newly added Ice Bridges or slopes beneath the pill
+			_companion_vertical_vel = 0.0
+			cur.y = ground_y
+			ai_companion.global_position = cur
+
 func _place_companion_at_crosshair() -> void:
 	var hit := _raycast_crosshair()
 	if hit.is_empty():
 		print("[Nav3D] Aim at terrain surface and press P (or Shift+RMB) to place AI Companion.")
 		return
-	ai_companion.global_position = hit.position + Vector3(0.0, 0.5, 0.0)
+	ai_companion.global_position = hit.position + Vector3(0.0, 0.15, 0.0)
+	_companion_vertical_vel = 0.0
 	_companion_initialized = true
 	_active_waypoints.clear()
-	print("[Nav3D] Placed AI Companion start at ", ai_companion.global_position, " - now aim at another spot and press RMB to path there.")
+	_path_immediate_mesh.clear_surfaces()
+	print("[Nav3D] Placed AI Companion start at ", ai_companion.global_position)
 
 func _query_companion_cave_path_to_crosshair() -> void:
 	var hit := _raycast_crosshair()
-	var goal_pos: Vector3 = (hit.position + Vector3(0.0, 0.5, 0.0)) if not hit.is_empty() else camera.global_position
+	var goal_pos: Vector3 = (hit.position + Vector3(0.0, 0.15, 0.0)) if not hit.is_empty() else camera.global_position
 
 	# First RMB click places the companion if it hasn't been placed on the surface yet
 	if not _companion_initialized:
 		ai_companion.global_position = goal_pos
+		_companion_vertical_vel = 0.0
 		_companion_initialized = true
-		print("[Nav3D] Companion placed at ", goal_pos, " - Right-click another spot to path there!")
+		print("[Nav3D] Companion placed at ", goal_pos, " — Right-click another spot to path there!")
 		return
 
 	_pending_path_goal = goal_pos
 	_goal_mesh_inst.global_position = goal_pos
 	_goal_mesh_inst.visible = true
 	_has_pending_path_query = true
-	print("[Nav3D] Goal set at ", goal_pos, " - baking nav group if needed, then drawing path...")
 	_poll_pending_path_query()
 
 func _poll_pending_path_query() -> void:
 	if not _has_pending_path_query:
+		return
+	if not terrain.fully_committed():
 		return
 	var start_pos := ai_companion.global_position
 	var start_synced := ai_companion.is_path_region_synced(start_pos)
@@ -431,11 +485,40 @@ func _poll_pending_path_query() -> void:
 		return
 
 	_has_pending_path_query = false
-	var path: PackedVector3Array = ai_companion.get_voxel_path(start_pos, _pending_path_goal)
-	print("[Nav3D] Companion 3D path from ", start_pos, " to ", _pending_path_goal, " -> waypoints: ", path.size())
-	_active_waypoints = path
+	_rebake_in_progress = false
+	var raw_path: PackedVector3Array = ai_companion.get_voxel_path(start_pos, _pending_path_goal)
+	var draped_path: PackedVector3Array = _drape_path_onto_terrain(raw_path)
+	print("[Nav3D] Companion 3D path from ", start_pos, " to ", _pending_path_goal,
+		" -> nav waypoints: ", raw_path.size(), " (surface-draped points: ", draped_path.size(), ")")
+	_active_waypoints = draped_path
 	_current_waypoint_idx = 0
-	_draw_path_ribbon(path)
+	_draw_path_ribbon(draped_path)
+
+## Subdivides Detour's string-pulled segments every ~1.25m and snaps their Y coordinate
+## onto the physical terrain/Ice Bridge surface so the green ribbon and companion follow
+## the true 3D contour of craters, hills, and Ice Bridges without cutting through mid-air.
+func _drape_path_onto_terrain(raw_path: PackedVector3Array) -> PackedVector3Array:
+	var out := PackedVector3Array()
+	if raw_path.is_empty():
+		return out
+	for i in range(raw_path.size() - 1):
+		var a := raw_path[i]
+		var b := raw_path[i + 1]
+		var dist := a.distance_to(b)
+		var steps := maxi(1, int(ceil(dist / 1.25)))
+		for s in range(steps):
+			var t := float(s) / float(steps)
+			var sample_pt := a.lerp(b, t)
+			var hit := _raycast_ground_at(sample_pt, 6.0, 24.0)
+			if not hit.is_empty():
+				sample_pt.y = hit.position.y + 0.15
+			out.push_back(sample_pt)
+	var last_pt := raw_path[raw_path.size() - 1]
+	var last_hit := _raycast_ground_at(last_pt, 6.0, 24.0)
+	if not last_hit.is_empty():
+		last_pt.y = last_hit.position.y + 0.15
+	out.push_back(last_pt)
+	return out
 
 func _draw_path_ribbon(path: PackedVector3Array) -> void:
 	_path_immediate_mesh.clear_surfaces()
@@ -447,17 +530,26 @@ func _draw_path_ribbon(path: PackedVector3Array) -> void:
 	_path_immediate_mesh.surface_end()
 
 func _step_companion_along_path(delta: float) -> void:
+	if _rebake_in_progress or _has_pending_path_query:
+		return
 	if _current_waypoint_idx >= _active_waypoints.size():
 		return
+	# Wait until the pill has landed on the ground before walking horizontally
+	if _companion_vertical_vel > 0.5:
+		return
+
+	var cur := ai_companion.global_position
 	var target := _active_waypoints[_current_waypoint_idx]
-	var to_target := target - ai_companion.global_position
-	var dist := to_target.length()
+	var horiz_to_target := Vector3(target.x - cur.x, 0.0, target.z - cur.z)
+	var horiz_dist := horiz_to_target.length()
 	var step := companion_walk_speed * delta
-	if dist <= step or dist < 0.15:
-		ai_companion.global_position = target
+
+	if horiz_dist <= step or horiz_dist < 0.15:
+		ai_companion.global_position = Vector3(target.x, cur.y, target.z)
 		_current_waypoint_idx += 1
 	else:
-		ai_companion.global_position += (to_target / dist) * step
+		var dir := horiz_to_target / horiz_dist
+		ai_companion.global_position = Vector3(cur.x + dir.x * step, cur.y, cur.z + dir.z * step)
 
 func _print_throttled(message: String) -> void:
 	var now := Time.get_ticks_msec()
@@ -476,12 +568,19 @@ func _on_explosion_requested(pos: Vector3, radius: float) -> void:
 
 func _on_explosion_completed(pos: Vector3, radius: float, affected_chunks: int) -> void:
 	_print_throttled("[VoxelTerrain3D] Explosion completed at %s radius=%.1f chunks=%d" % [pos, radius, affected_chunks])
+	# Snap the goal sphere down if the ground under the goal was carved away
+	if _goal_mesh_inst.visible:
+		var g_hit := _raycast_ground_at(_pending_path_goal, 6.0, 32.0)
+		if not g_hit.is_empty():
+			_pending_path_goal.y = g_hit.position.y + 0.15
+			_goal_mesh_inst.global_position = _pending_path_goal
 	# Automatically re-query the path if a goal is active so you can watch paths reroute
 	# around new craters or across freshly frozen Ice bridges!
 	if _companion_initialized and _goal_mesh_inst.visible:
 		_has_pending_path_query = true
 
 func _on_explosion_failed(reason: String) -> void:
+	_rebake_in_progress = false
 	_warn_throttled("[VoxelTerrain3D] Explosion failed: " + reason)
 
 func _on_terrain_add_requested(pos: Vector3, radius: float) -> void:

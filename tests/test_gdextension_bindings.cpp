@@ -33,6 +33,20 @@ int g_assertions_checked = 0;
         }                                                                             \
     } while (0)
 
+void wait_until_terrain_fully_committed(VoxelTerrain3D& terrain) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (std::chrono::steady_clock::now() < deadline) {
+        terrain._process(0.016);
+        terrain.get_navigation_manager().complete_in_flight_async_bakes_and_advance_map_iteration();
+        terrain._process(0.016);
+        if (terrain.fully_committed() && terrain.get_server_slot_manager().active_slot_count() > 0) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(terrain.fully_committed());
+}
+
 void test_generate_caves_flag_roundtrip() {
     ++g_tests_run;
 
@@ -307,6 +321,88 @@ void test_gdextension_streaming_explosion_and_nav_lifecycle() {
     std::printf("[PASS] test_gdextension_streaming_explosion_and_nav_lifecycle (stream + blast + nav3d verified)\n");
 }
 
+// ============================================================================
+// 2. End-to-End Mid-Path Terrain Removal (Explosion Crater) & Addition (Frost
+//    Ice Bridge) While Companion Pathing Is In Progress
+// ============================================================================
+void test_gdextension_mid_path_terrain_removal_and_frost_bridge_addition() {
+    ++g_tests_run;
+
+    const std::filesystem::path save_dir = "/tmp/voxel_gdextension_midpath_test";
+    std::filesystem::remove_all(save_dir);
+
+    VoxelTerrain3D terrain;
+    terrain.set_save_directory_path(save_dir.string());
+    terrain.set_view_distance_chunks(1);
+    terrain.set_prefetch_distance_chunks(0);
+    terrain.set_world_height_chunks(3);
+    terrain.set_upload_budget_ms(8.0f);
+    terrain._enter_tree();
+
+    VoxelAICompanion companion;
+    companion.set_terrain_node(&terrain);
+
+    // 1. Stream around (16, 68, 16) and establish initial baked path from start (4, 68, 16) to goal (28, 68, 16).
+    terrain.set_stream_focus(Vector3(16.0f, 68.0f, 16.0f), Vector3(0.0f, 0.0f, 0.0f));
+    wait_until_terrain_fully_committed(terrain);
+
+    const Vector3 start_pos(4.0f, 68.0f, 16.0f);
+    const Vector3 goal_pos(28.0f, 68.0f, 16.0f);
+    REQUIRE(companion.is_path_region_synced(start_pos));
+    const PackedVector3Array initial_path = companion.get_voxel_path(start_pos, goal_pos);
+    REQUIRE(initial_path.size() == 3ULL);
+    const Vector3 initial_mid = initial_path[1];
+
+    // Simulate companion stepping partway along segment 0 -> 1 (pathing is now in progress at t = 0.5).
+    Vector3 companion_cur_pos(
+        0.5f * (initial_path[0].x + initial_path[1].x),
+        0.5f * (initial_path[0].y + initial_path[1].y),
+        0.5f * (initial_path[0].z + initial_path[1].z));
+
+    // 2. REMOVE TERRAIN MID-PATH: Fire an explosion right at the path midpoint (16, 68, 16) while walking!
+    terrain.trigger_explosion(Vector3(16.0f, 68.0f, 16.0f), 7.5f);
+    wait_until_terrain_fully_committed(terrain);
+    REQUIRE(companion.is_path_region_synced(companion_cur_pos));
+
+    // Re-query path from companion's current mid-walk position to goal after crater removal:
+    const PackedVector3Array path_after_crater = companion.get_voxel_path(companion_cur_pos, goal_pos);
+    REQUIRE(path_after_crater.size() == 3ULL);
+    const Vector3 crater_mid = path_after_crater[1];
+    // Verify the midpoint geometry changed after the crater was carved!
+    const float crater_shift = std::abs(crater_mid.x - initial_mid.x) +
+                               std::abs(crater_mid.y - initial_mid.y) +
+                               std::abs(crater_mid.z - initial_mid.z);
+    REQUIRE(crater_shift > 0.01f);
+
+    // Advance companion another step along the rerouted path.
+    companion_cur_pos = Vector3(
+        0.5f * (path_after_crater[0].x + path_after_crater[1].x),
+        0.5f * (path_after_crater[0].y + path_after_crater[1].y),
+        0.5f * (path_after_crater[0].z + path_after_crater[1].z));
+
+    // 3. ADD TERRAIN MID-PATH: Fire a Frost elemental sphere (`element_kind = 2`) at the carved midpoint
+    //    to solidify air into a walkable Ice bridge while the companion is still pathing toward goal_pos!
+    terrain.trigger_elemental_sphere(
+        Vector3(crater_mid.x, crater_mid.y + 4.0f, crater_mid.z),
+        6.5f,
+        static_cast<int>(voxel::ElementalKind::Frost));
+    wait_until_terrain_fully_committed(terrain);
+    REQUIRE(companion.is_path_region_synced(companion_cur_pos));
+
+    const PackedVector3Array path_after_ice_bridge = companion.get_voxel_path(companion_cur_pos, goal_pos);
+    REQUIRE(path_after_ice_bridge.size() == 3ULL);
+    const Vector3 ice_mid = path_after_ice_bridge[1];
+    const float bridge_shift = std::abs(ice_mid.x - crater_mid.x) +
+                               std::abs(ice_mid.y - crater_mid.y) +
+                               std::abs(ice_mid.z - crater_mid.z);
+    REQUIRE(bridge_shift > 0.01f);
+
+    terrain._exit_tree();
+    std::filesystem::remove_all(save_dir);
+
+    std::printf("[PASS] test_gdextension_mid_path_terrain_removal_and_frost_bridge_addition (mid-walk crater & Ice bridge reroute verified)\n");
+}
+
 } // namespace
 
 int main() {
@@ -316,6 +412,7 @@ int main() {
     test_terrain_depth_slider_roundtrip();
     test_world_seed_roundtrip();
     test_gdextension_streaming_explosion_and_nav_lifecycle();
+    test_gdextension_mid_path_terrain_removal_and_frost_bridge_addition();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",
                 g_tests_run, g_assertions_checked);
     return EXIT_SUCCESS;

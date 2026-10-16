@@ -320,6 +320,136 @@ void test_collision_distance_gating_on_slot_manager() {
     std::printf("[PASS] test_collision_distance_gating_on_slot_manager (visual-only commit, enable/disable, faces retained)\n");
 }
 
+// ============================================================================
+// 5. Mid-Path Terrain Removal (Crater) & Addition (Frost Ice Bridge) While
+//    Pathing Is In Progress + Overlapping Edit During In-Flight Async Rebake
+// ============================================================================
+void test_terrain_added_and_removed_while_pathing_in_progress() {
+    ++g_tests_run;
+
+    ServerSlotManager slot_mgr;
+    slot_mgr.initialize(ServerRid{1}, ServerRid{2});
+
+    VoxelNavigationManager nav_mgr;
+    nav_mgr.initialize(ServerRid{3});
+
+    const ChunkKey path_chunk_a = ChunkKey::from_coords(0, 0, 0);
+    const ChunkKey path_chunk_b = ChunkKey::from_coords(1, 0, 0);
+    const NavigationGroupKey gk = NavigationGroupKey::from_chunk_key(path_chunk_a);
+
+    // Step 1: Initial flat walkway across chunks (0,0,0) and (1,0,0) at y = 16.0.
+    for (const ChunkKey ck : {path_chunk_a, path_chunk_b}) {
+        ChunkMeshPayload m{};
+        m.key = ck;
+        m.captured_version = 1;
+        m.captured_terrain_revision = 0;
+        m.collision_faces = {
+            Vec3f{14.0f, 16.0f, 14.0f}, Vec3f{18.0f, 16.0f, 14.0f}, Vec3f{16.0f, 16.0f, 18.0f}};
+        slot_mgr.commit_chunk_mesh_and_collision(m);
+        nav_mgr.note_chunk_mesh_committed(ck, 0, slot_mgr.get_cached_nav_faces(ck));
+    }
+    nav_mgr.submit_ready_groups_to_server(slot_mgr);
+    nav_mgr.complete_in_flight_async_bakes_and_advance_map_iteration();
+    REQUIRE(nav_mgr.is_path_region_synced(Vec3f{16.0f, 16.0f, 16.0f}));
+
+    const NavigationGroupState* group = nav_mgr.find_group(gk);
+    REQUIRE(group != nullptr);
+    REQUIRE(group->total_bakes_submitted == 1ULL);
+    REQUIRE(group->assembled_source_faces.size() == 6ULL);
+
+    // Companion starts walking along the path from x=2 to x=48 and reaches x=10 (pathing in progress).
+    Vec3f companion_pos{10.0f, 16.0f, 16.0f};
+    REQUIRE(nav_mgr.is_path_region_synced(companion_pos));
+
+    // Step 2: TERRAIN REMOVED mid-path! An explosion (revision 1) carves a crater across BOTH chunks
+    // (0,0,0) and (1,0,0) ahead of the companion.
+    EditTransactionCompletedPayload crater_tx{};
+    crater_tx.position = Vec3f{32.0f, 16.0f, 16.0f};
+    crater_tx.radius = 8.0f;
+    crater_tx.terrain_revision = 1;
+    crater_tx.total_affected_chunks = 2;
+    crater_tx.dirtied_chunks = {path_chunk_a, path_chunk_b};
+    crater_tx.affected_nav_groups = {gk};
+    nav_mgr.apply_edit_transaction(crater_tx);
+
+    // Immediately after explosion: region MUST report unsynced so the companion does not trust stale waypoints.
+    REQUIRE(!nav_mgr.is_path_region_synced(companion_pos));
+
+    // Partial chunk commit: only path_chunk_a finishes meshing at revision 1; path_chunk_b is still meshing!
+    // Verify submit_ready_groups_to_server DOES NOT start a premature bake on half-updated chunks!
+    {
+        ChunkMeshPayload m_a{};
+        m_a.key = path_chunk_a;
+        m_a.captured_version = 2;
+        m_a.captured_terrain_revision = 1;
+        m_a.collision_faces = {
+            Vec3f{14.0f, 12.0f, 14.0f}, Vec3f{18.0f, 12.0f, 14.0f}, Vec3f{16.0f, 12.0f, 18.0f}};
+        slot_mgr.commit_chunk_mesh_and_collision(m_a);
+        nav_mgr.note_chunk_mesh_committed(path_chunk_a, 1, slot_mgr.get_cached_nav_faces(path_chunk_a));
+    }
+    nav_mgr.submit_ready_groups_to_server(slot_mgr);
+    REQUIRE(!group->rebuild_in_flight);
+    REQUIRE(group->total_bakes_submitted == 1ULL);
+    REQUIRE(!nav_mgr.is_path_region_synced(companion_pos));
+
+    // Now path_chunk_b finishes meshing at revision 1 -> group is ready and submits async bake #2!
+    {
+        ChunkMeshPayload m_b{};
+        m_b.key = path_chunk_b;
+        m_b.captured_version = 2;
+        m_b.captured_terrain_revision = 1;
+        m_b.collision_faces = {
+            Vec3f{34.0f, 12.0f, 14.0f}, Vec3f{38.0f, 12.0f, 14.0f}, Vec3f{36.0f, 12.0f, 18.0f}};
+        slot_mgr.commit_chunk_mesh_and_collision(m_b);
+        nav_mgr.note_chunk_mesh_committed(path_chunk_b, 1, slot_mgr.get_cached_nav_faces(path_chunk_b));
+    }
+    nav_mgr.submit_ready_groups_to_server(slot_mgr);
+    REQUIRE(group->rebuild_in_flight);
+    REQUIRE(group->total_bakes_submitted == 2ULL);
+
+    // Step 3: TERRAIN ADDED (Frost Ice Bridge, revision 2) arrives WHILE bake #2 (revision 1) is STILL IN FLIGHT!
+    EditTransactionCompletedPayload ice_bridge_tx{};
+    ice_bridge_tx.position = Vec3f{16.0f, 20.0f, 16.0f};
+    ice_bridge_tx.radius = 6.0f;
+    ice_bridge_tx.terrain_revision = 2;
+    ice_bridge_tx.total_affected_chunks = 1;
+    ice_bridge_tx.dirtied_chunks = {path_chunk_a};
+    ice_bridge_tx.affected_nav_groups = {gk};
+    nav_mgr.apply_edit_transaction(ice_bridge_tx);
+
+    // Even when in-flight bake #2 (revision 1) finishes, the group MUST STILL report unsynced
+    // because desired_terrain_revision is now 2 (the newly added Frost Ice Bridge)!
+    nav_mgr.complete_in_flight_async_bakes_and_advance_map_iteration();
+    REQUIRE(group->synced_terrain_revision == 1ULL);
+    REQUIRE(group->desired_terrain_revision == 2ULL);
+    REQUIRE(!nav_mgr.is_path_region_synced(companion_pos));
+
+    // Commit the new Frost Ice Bridge mesh (adding elevated walkable triangles at y = 20.0) at revision 2.
+    {
+        ChunkMeshPayload m_ice{};
+        m_ice.key = path_chunk_a;
+        m_ice.captured_version = 3;
+        m_ice.captured_terrain_revision = 2;
+        m_ice.collision_faces = {
+            Vec3f{14.0f, 12.0f, 14.0f}, Vec3f{18.0f, 12.0f, 14.0f}, Vec3f{16.0f, 12.0f, 18.0f},
+            Vec3f{14.0f, 20.0f, 14.0f}, Vec3f{18.0f, 20.0f, 14.0f}, Vec3f{16.0f, 20.0f, 18.0f}};
+        slot_mgr.commit_chunk_mesh_and_collision(m_ice);
+        nav_mgr.note_chunk_mesh_committed(path_chunk_a, 2, slot_mgr.get_cached_nav_faces(path_chunk_a));
+    }
+
+    nav_mgr.submit_ready_groups_to_server(slot_mgr);
+    REQUIRE(group->rebuild_in_flight);
+    REQUIRE(group->total_bakes_submitted == 3ULL);
+
+    nav_mgr.complete_in_flight_async_bakes_and_advance_map_iteration();
+    REQUIRE(nav_mgr.is_path_region_synced(companion_pos));
+    REQUIRE(group->synced_terrain_revision == 2ULL);
+    // Assembled faces now include the crater floor + the newly added Ice bridge (9 vertices = 3 triangles)!
+    REQUIRE(group->assembled_source_faces.size() == 9ULL);
+
+    std::printf("[PASS] test_terrain_added_and_removed_while_pathing_in_progress (mid-path crater + in-flight Frost Ice bridge verified)\n");
+}
+
 } // namespace
 
 int main() {
@@ -328,6 +458,7 @@ int main() {
     test_3d_cave_navigation_vertical_isolation();
     test_sloped_cave_vertical_boundary_halo_gathering();
     test_collision_distance_gating_on_slot_manager();
+    test_terrain_added_and_removed_while_pathing_in_progress();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",
                 g_tests_run, g_assertions_checked);
     return EXIT_SUCCESS;
