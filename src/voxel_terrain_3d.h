@@ -153,6 +153,18 @@ public:
     void set_generate_caves(bool p_enabled);
     [[nodiscard]] bool get_generate_caves() const { return generate_caves; }
 
+    /// Maximum walkable terrain angle in degrees baked into each navigation group.
+    /// Raise it to keep steep Surface Nets hillsides walkable instead of eroding
+    /// barriers across them; changes trigger a live rebake of resident groups.
+    void set_agent_max_slope(float p_degrees);
+    [[nodiscard]] float get_agent_max_slope() const { return agent_max_slope; }
+
+    /// Maximum vertical step in meters Recast accepts between heightfield cells.
+    /// Keep it above cell_size * tan(agent_max_slope) on steep grades, otherwise
+    /// rasterized steps are filtered out as ledges. Triggers a live rebake.
+    void set_agent_max_climb(float p_meters);
+    [[nodiscard]] float get_agent_max_climb() const { return agent_max_climb; }
+
     // Instrumentation (HLD v4.0 Section 7.3): per-operation wall-clock logging.
     void set_instrumentation_enabled(bool p_enabled);
     [[nodiscard]] bool get_instrumentation_enabled() const { return instrumentation_enabled; }
@@ -248,6 +260,8 @@ private:
     int world_seed = 1337;
     bool save_on_exit = true;
     bool generate_caves = true;
+    float agent_max_slope = 70.0f;
+    float agent_max_climb = 1.5f;
 
 #if defined(VOXEL_WITH_GODOT_CPP)
     Ref<Material> terrain_material;

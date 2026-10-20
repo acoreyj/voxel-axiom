@@ -79,6 +79,10 @@ void VoxelTerrain3D::_bind_methods() {
     ClassDB::bind_method(D_METHOD("set_world_seed", "seed"), &VoxelTerrain3D::set_world_seed);
     ClassDB::bind_method(D_METHOD("get_generate_caves"), &VoxelTerrain3D::get_generate_caves);
     ClassDB::bind_method(D_METHOD("set_generate_caves", "enabled"), &VoxelTerrain3D::set_generate_caves);
+    ClassDB::bind_method(D_METHOD("get_agent_max_slope"), &VoxelTerrain3D::get_agent_max_slope);
+    ClassDB::bind_method(D_METHOD("set_agent_max_slope", "degrees"), &VoxelTerrain3D::set_agent_max_slope);
+    ClassDB::bind_method(D_METHOD("get_agent_max_climb"), &VoxelTerrain3D::get_agent_max_climb);
+    ClassDB::bind_method(D_METHOD("set_agent_max_climb", "meters"), &VoxelTerrain3D::set_agent_max_climb);
     ClassDB::bind_method(D_METHOD("get_instrumentation_enabled"), &VoxelTerrain3D::get_instrumentation_enabled);
     ClassDB::bind_method(D_METHOD("set_instrumentation_enabled", "enabled"), &VoxelTerrain3D::set_instrumentation_enabled);
 
@@ -106,6 +110,10 @@ void VoxelTerrain3D::_bind_methods() {
                  "set_terrain_material", "get_terrain_material");
     ADD_PROPERTY(PropertyInfo(Variant::BOOL, "generate_caves"),
                  "set_generate_caves", "get_generate_caves");
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "agent_max_slope", PROPERTY_HINT_RANGE, "1.0,89.0,0.5"),
+                 "set_agent_max_slope", "get_agent_max_slope");
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "agent_max_climb", PROPERTY_HINT_RANGE, "0.05,4.0,0.05"),
+                 "set_agent_max_climb", "get_agent_max_climb");
     ADD_PROPERTY(PropertyInfo(Variant::BOOL, "instrumentation_enabled"),
                  "set_instrumentation_enabled", "get_instrumentation_enabled");
 
@@ -201,6 +209,20 @@ void VoxelTerrain3D::set_generate_caves(bool p_enabled) {
     generate_caves = p_enabled;
     if (core_engine) {
         core_engine->procgen.caves_enabled = p_enabled;
+    }
+}
+
+void VoxelTerrain3D::set_agent_max_slope(float p_degrees) {
+    agent_max_slope = std::clamp(p_degrees, 1.0f, 89.0f);
+    if (core_engine) {
+        navigation_manager.set_agent_limits(agent_max_slope, agent_max_climb);
+    }
+}
+
+void VoxelTerrain3D::set_agent_max_climb(float p_meters) {
+    agent_max_climb = std::clamp(p_meters, 0.05f, 4.0f);
+    if (core_engine) {
+        navigation_manager.set_agent_limits(agent_max_slope, agent_max_climb);
     }
 }
 
@@ -317,6 +339,8 @@ void VoxelTerrain3D::_enter_tree() {
 
     voxel::CaveNavMeshConfig nav_cfg{};
     nav_cfg.voxel_scale = voxel_scale;
+    nav_cfg.agent_max_slope = agent_max_slope;
+    nav_cfg.agent_max_climb = agent_max_climb;
     navigation_manager.initialize(nav_map_rid, nav_cfg);
     server_slot_manager.initialize(scenario_rid, space_rid);
 

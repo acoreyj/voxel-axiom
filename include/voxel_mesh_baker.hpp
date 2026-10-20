@@ -594,6 +594,7 @@ public:
         uint8_t material_id = MaterialHardness::kMaterialHardRock;
         uint16_t baked_color = VoxelColor::kUnpainted;
         uint32_t triangle_index = 0;
+        bool found = false; // False when no triangle lies within max_dist
     };
 
     [[nodiscard]] QueryResult query_closest(Vec3f p, float max_dist = 1e30f) const noexcept {
@@ -647,6 +648,7 @@ public:
 
         if (found) {
             res.distance = std::sqrt(best_d2);
+            res.found = true;
             const Triangle3f& best_tri = (*triangles_)[res.triangle_index];
             if (texture_ && texture_->valid() && best_tri.has_uvs) {
                 const float tu = best_u * best_tri.uv0.u + best_v * best_tri.uv1.u + best_w * best_tri.uv2.u;
@@ -661,6 +663,52 @@ public:
             }
         }
         return res;
+    }
+
+    /// Generalized winding number of the triangle soup around `p`.
+    ///
+    /// Returns 1.0 for points inside a consistently wound closed mesh and 0.0 for
+    /// points outside, regardless of whether the mesh is strictly watertight. Small
+    /// cracks, non-manifold seams and T-junctions barely perturb the sum, so this is
+    /// the tie-breaker used when ray parity and the closest-triangle pseudo-normal
+    /// disagree (which is exactly what happens at a cracked seam).
+    ///
+    /// Each triangle contributes its signed solid angle (Van Oosterom & Strackee),
+    /// so the cost is O(triangle_count). Callers must only use this for the few
+    /// samples where the cheap tests are ambiguous.
+    [[nodiscard]] float winding_number(Vec3f p) const noexcept {
+        if (!triangles_ || triangles_->empty()) {
+            return 0.0f;
+        }
+        double sum = 0.0;
+        for (const Triangle3f& tri : *triangles_) {
+            const double ax = static_cast<double>(tri.v0.x) - static_cast<double>(p.x);
+            const double ay = static_cast<double>(tri.v0.y) - static_cast<double>(p.y);
+            const double az = static_cast<double>(tri.v0.z) - static_cast<double>(p.z);
+            const double bx = static_cast<double>(tri.v1.x) - static_cast<double>(p.x);
+            const double by = static_cast<double>(tri.v1.y) - static_cast<double>(p.y);
+            const double bz = static_cast<double>(tri.v1.z) - static_cast<double>(p.z);
+            const double cx = static_cast<double>(tri.v2.x) - static_cast<double>(p.x);
+            const double cy = static_cast<double>(tri.v2.y) - static_cast<double>(p.y);
+            const double cz = static_cast<double>(tri.v2.z) - static_cast<double>(p.z);
+
+            const double la = std::sqrt(ax * ax + ay * ay + az * az);
+            const double lb = std::sqrt(bx * bx + by * by + bz * bz);
+            const double lc = std::sqrt(cx * cx + cy * cy + cz * cz);
+            if (la < 1e-12 || lb < 1e-12 || lc < 1e-12) {
+                continue; // Point coincides with a vertex; contribution is undefined but negligible.
+            }
+
+            const double num = ax * (by * cz - bz * cy) +
+                               ay * (bz * cx - bx * cz) +
+                               az * (bx * cy - by * cx);
+            const double den = la * lb * lc +
+                               (ax * bx + ay * by + az * bz) * lc +
+                               (bx * cx + by * cy + bz * cz) * la +
+                               (cx * ax + cy * ay + cz * az) * lb;
+            sum += std::atan2(num, den);
+        }
+        return static_cast<float>(sum / (2.0 * 3.14159265358979323846));
     }
 
 private:
@@ -758,6 +806,172 @@ public:
         std::vector<uint8_t> col_low_plane(TsdfFormat::kChunkSamples);
         std::vector<uint8_t> col_high_plane(TsdfFormat::kChunkSamples);
 
+        // --- Watertight interior classification ---------------------------------
+        // A single +Z ray-parity test misclassifies whole sample columns when the
+        // source mesh has cracks or non-manifold seams (very common in decimated
+        // GLB/OBJ exports): the missing crossing flips parity and the error then
+        // propagates along the ray, extruding one-voxel-wide solid "needles" out of
+        // the asset. Instead:
+        //   1. Within the narrow band (distance <= delta) the sign comes from two
+        //      independent tests: +Z ray parity and the pseudo-normal of the closest
+        //      triangle. Agreement is trusted; disagreements happen exactly at a
+        //      cracked seam, where the generalized winding number decides.
+        //   2. Outside the band, air is flood-filled inward from the sample-box
+        //      boundary. The band seals cracks thinner than its thickness, so the
+        //      fill cannot leak through them: enclosed volume stays solid and no
+        //      parity error can extrude spikes.
+        struct RegionSample {
+            float distance = -1.0f; // < 0 => no triangle within max_query_dist
+            uint8_t material = MaterialHardness::kMaterialHardRock;
+            uint16_t color = VoxelColor::kUnpainted;
+            // 0 = non-band (fill decides), 1 = band air, 2 = band solid,
+            // 3 = flood-filled air, 4 = flood-filled solid.
+            uint8_t state = 0U;
+        };
+
+        std::vector<RegionSample> region_samples;
+        int32_t sample_lo[3] = {0, 0, 0};
+        int32_t sample_dim[3] = {0, 0, 0};
+
+        if (cfg.mode == VoxelizationMode::WatertightSolid && !mesh.triangles.empty()) {
+            const float margin = delta + 2.0f * cfg.voxel_scale;
+            const float mesh_min[3] = {mesh.aabb_min.x, mesh.aabb_min.y, mesh.aabb_min.z};
+            const float mesh_max[3] = {mesh.aabb_max.x, mesh.aabb_max.y, mesh.aabb_max.z};
+            const float region_max = 255.0f * cfg.voxel_scale;
+            const bool mesh_in_region =
+                mesh_max[0] + margin >= 0.0f && mesh_min[0] - margin <= region_max &&
+                mesh_max[1] + margin >= 0.0f && mesh_min[1] - margin <= region_max &&
+                mesh_max[2] + margin >= 0.0f && mesh_min[2] - margin <= region_max;
+            if (mesh_in_region) {
+                for (int32_t a = 0; a < 3; ++a) {
+                    sample_lo[a] = std::max(0, static_cast<int32_t>(
+                        std::floor((mesh_min[a] - margin) / cfg.voxel_scale)));
+                    const int32_t hi = std::min(255, static_cast<int32_t>(
+                        std::ceil((mesh_max[a] + margin) / cfg.voxel_scale)));
+                    sample_dim[a] = hi - sample_lo[a] + 1;
+                }
+            }
+
+            const std::size_t sample_count =
+                static_cast<std::size_t>(sample_dim[0]) *
+                static_cast<std::size_t>(sample_dim[1]) *
+                static_cast<std::size_t>(sample_dim[2]);
+            region_samples.assign(sample_count, RegionSample{});
+
+            auto sample_index = [&](int32_t x, int32_t y, int32_t z) noexcept -> std::size_t {
+                return static_cast<std::size_t>(x - sample_lo[0]) +
+                       static_cast<std::size_t>(sample_dim[0]) *
+                           (static_cast<std::size_t>(y - sample_lo[1]) +
+                            static_cast<std::size_t>(sample_dim[1]) *
+                                static_cast<std::size_t>(z - sample_lo[2]));
+            };
+            auto in_box = [&](int32_t x, int32_t y, int32_t z) noexcept -> bool {
+                return x >= sample_lo[0] && x < sample_lo[0] + sample_dim[0] &&
+                       y >= sample_lo[1] && y < sample_lo[1] + sample_dim[1] &&
+                       z >= sample_lo[2] && z < sample_lo[2] + sample_dim[2];
+            };
+
+            // Pass 1: closest surface sample + band sign.
+            for (int32_t z = sample_lo[2]; z < sample_lo[2] + sample_dim[2]; ++z) {
+                for (int32_t y = sample_lo[1]; y < sample_lo[1] + sample_dim[1]; ++y) {
+                    for (int32_t x = sample_lo[0]; x < sample_lo[0] + sample_dim[0]; ++x) {
+                        const Vec3f p{
+                            static_cast<float>(x) * cfg.voxel_scale,
+                            static_cast<float>(y) * cfg.voxel_scale,
+                            static_cast<float>(z) * cfg.voxel_scale
+                        };
+                        const auto q = spatial_grid.query_closest(p, max_query_dist);
+                        if (!q.found) {
+                            continue;
+                        }
+                        RegionSample& s = region_samples[sample_index(x, y, z)];
+                        s.distance = q.distance;
+                        s.material = q.material_id;
+                        s.color = q.baked_color;
+                        if (q.distance > delta) {
+                            continue; // Non-band: the flood fill decides.
+                        }
+
+                        const bool parity_inside =
+                            spatial_grid.is_point_inside_watertight_mesh(p);
+                        const float side_dot =
+                            (p.x - q.closest_point.x) * q.normal.x +
+                            (p.y - q.closest_point.y) * q.normal.y +
+                            (p.z - q.closest_point.z) * q.normal.z;
+                        const bool pseudo_inside = side_dot < 0.0f;
+
+                        bool inside = parity_inside;
+                        if (parity_inside != pseudo_inside) {
+                            // Exactly where a cracked seam defeats both cheap tests.
+                            inside = spatial_grid.winding_number(p) > 0.5f;
+                        }
+                        s.state = inside ? 2U : 1U;
+                    }
+                }
+            }
+
+            // Pass 2: flood air inward from the sample-box boundary through non-band
+            // samples. Any non-band sample the fill never reaches is enclosed and solid.
+            std::vector<std::size_t> flood_queue;
+            flood_queue.reserve(sample_count / 4ULL + 1ULL);
+            auto seed_air = [&](int32_t x, int32_t y, int32_t z) {
+                RegionSample& s = region_samples[sample_index(x, y, z)];
+                if (s.state == 0U) {
+                    s.state = 3U;
+                    flood_queue.push_back(sample_index(x, y, z));
+                }
+            };
+            for (int32_t z = sample_lo[2]; z < sample_lo[2] + sample_dim[2]; ++z) {
+                for (int32_t y = sample_lo[1]; y < sample_lo[1] + sample_dim[1]; ++y) {
+                    seed_air(sample_lo[0], y, z);
+                    seed_air(sample_lo[0] + sample_dim[0] - 1, y, z);
+                }
+            }
+            for (int32_t z = sample_lo[2]; z < sample_lo[2] + sample_dim[2]; ++z) {
+                for (int32_t x = sample_lo[0]; x < sample_lo[0] + sample_dim[0]; ++x) {
+                    seed_air(x, sample_lo[1], z);
+                    seed_air(x, sample_lo[1] + sample_dim[1] - 1, z);
+                }
+            }
+            for (int32_t y = sample_lo[1]; y < sample_lo[1] + sample_dim[1]; ++y) {
+                for (int32_t x = sample_lo[0]; x < sample_lo[0] + sample_dim[0]; ++x) {
+                    seed_air(x, y, sample_lo[2]);
+                    seed_air(x, y, sample_lo[2] + sample_dim[2] - 1);
+                }
+            }
+
+            for (std::size_t head = 0; head < flood_queue.size(); ++head) {
+                const std::size_t linear = flood_queue[head];
+                const int32_t x = sample_lo[0] + static_cast<int32_t>(linear % static_cast<std::size_t>(sample_dim[0]));
+                const std::size_t rest = linear / static_cast<std::size_t>(sample_dim[0]);
+                const int32_t y = sample_lo[1] + static_cast<int32_t>(rest % static_cast<std::size_t>(sample_dim[1]));
+                const int32_t z = sample_lo[2] + static_cast<int32_t>(rest / static_cast<std::size_t>(sample_dim[1]));
+
+                auto visit = [&](int32_t nx, int32_t ny, int32_t nz) {
+                    if (!in_box(nx, ny, nz)) {
+                        return;
+                    }
+                    RegionSample& s = region_samples[sample_index(nx, ny, nz)];
+                    if (s.state == 0U) {
+                        s.state = 3U;
+                        flood_queue.push_back(sample_index(nx, ny, nz));
+                    }
+                };
+                visit(x - 1, y, z);
+                visit(x + 1, y, z);
+                visit(x, y - 1, z);
+                visit(x, y + 1, z);
+                visit(x, y, z - 1);
+                visit(x, y, z + 1);
+            }
+
+            for (RegionSample& s : region_samples) {
+                if (s.state == 0U) {
+                    s.state = 4U; // Unreached, outside the band => enclosed solid.
+                }
+            }
+        }
+
         for (int32_t lz = 0; lz < 8; ++lz) {
             for (int32_t ly = 0; ly < 8; ++ly) {
                 for (int32_t lx = 0; lx < 8; ++lx) {
@@ -805,43 +1019,60 @@ public:
                                 const float px = static_cast<float>(chunk_origin_x + vx) * cfg.voxel_scale;
                                 const uint32_t v_idx = static_cast<uint32_t>(vx + 32 * (vy + 32 * vz));
 
-                                if (cfg.mode == VoxelizationMode::WatertightSolid &&
-                                    (px < mesh.aabb_min.x - delta || px > mesh.aabb_max.x + delta ||
-                                     py < mesh.aabb_min.y - delta || py > mesh.aabb_max.y + delta ||
-                                     pz < mesh.aabb_min.z - delta || pz > mesh.aabb_max.z + delta)) {
-                                    tsdf_buf[v_idx] = TsdfFormat::kClampedAir;
-                                    mat_buf[v_idx] = cfg.default_material;
-                                    col_buf[v_idx] = VoxelColor::kUnpainted;
-                                    has_air = true;
-                                    continue;
-                                }
-
-                                const Vec3f p_world{px, py, pz};
-                                const auto q = spatial_grid.query_closest(p_world, max_query_dist);
-                                float sdf = 0.0f;
-                                uint8_t mat = q.material_id;
-
-                                if (cfg.mode == VoxelizationMode::ShellThickness) {
-                                    sdf = q.distance - half_thick;
-                                } else {
-                                    const bool inside = spatial_grid.is_point_inside_watertight_mesh(p_world);
-                                    const float sign = inside ? -1.0f : 1.0f;
-                                    sdf = sign * q.distance;
-                                }
-
-                                const int16_t encoded_q = TsdfFormat::encode(sdf, delta);
-                                tsdf_buf[v_idx] = encoded_q;
-                                mat_buf[v_idx] = mat;
-
+                                int16_t encoded_q = TsdfFormat::kClampedAir;
+                                uint8_t mat = cfg.default_material;
                                 uint16_t v_col = VoxelColor::kUnpainted;
-                                if (cfg.bake_surface_colors &&
-                                    encoded_q < 0 &&
-                                    q.baked_color != VoxelColor::kUnpainted &&
-                                    q.distance <= cfg.color_shell_depth) {
-                                    v_col = q.baked_color;
-                                    // Shell mode paints only the outer half of the shell: the
-                                    // inner half is what a crater exposes, so it must stay raw.
-                                    if (cfg.mode == VoxelizationMode::ShellThickness) {
+
+                                if (cfg.mode == VoxelizationMode::WatertightSolid) {
+                                    const int32_t sx = chunk_origin_x + vx;
+                                    const int32_t sy = chunk_origin_y + vy;
+                                    const int32_t sz = chunk_origin_z + vz;
+                                    if (sx >= sample_lo[0] && sx < sample_lo[0] + sample_dim[0] &&
+                                        sy >= sample_lo[1] && sy < sample_lo[1] + sample_dim[1] &&
+                                        sz >= sample_lo[2] && sz < sample_lo[2] + sample_dim[2]) {
+                                        const RegionSample& s = region_samples[
+                                            static_cast<std::size_t>(sx - sample_lo[0]) +
+                                            static_cast<std::size_t>(sample_dim[0]) *
+                                                (static_cast<std::size_t>(sy - sample_lo[1]) +
+                                                 static_cast<std::size_t>(sample_dim[1]) *
+                                                     static_cast<std::size_t>(sz - sample_lo[2]))];
+                                        bool solid_sample = false;
+                                        if (s.state == 2U) {
+                                            solid_sample = true;
+                                            encoded_q = TsdfFormat::encode(-s.distance, delta);
+                                        } else if (s.state == 1U) {
+                                            // Band air keeps its +distance so the zero crossing
+                                            // stays on the source surface instead of the band edge.
+                                            encoded_q = TsdfFormat::encode(s.distance, delta);
+                                        } else if (s.state == 4U) {
+                                            solid_sample = true;
+                                            encoded_q = TsdfFormat::kClampedSolid;
+                                        }
+                                        if (s.distance >= 0.0f) {
+                                            mat = s.material;
+                                        }
+                                        if (solid_sample && cfg.bake_surface_colors &&
+                                            s.distance >= 0.0f &&
+                                            s.distance <= cfg.color_shell_depth &&
+                                            s.color != VoxelColor::kUnpainted) {
+                                            v_col = s.color;
+                                            has_painted_color = true;
+                                        }
+                                    }
+                                } else {
+                                    const Vec3f p_world{px, py, pz};
+                                    const auto q = spatial_grid.query_closest(p_world, max_query_dist);
+                                    mat = q.material_id;
+                                    const float sdf = q.distance - half_thick;
+                                    encoded_q = TsdfFormat::encode(sdf, delta);
+
+                                    if (cfg.bake_surface_colors &&
+                                        encoded_q < 0 &&
+                                        q.baked_color != VoxelColor::kUnpainted &&
+                                        q.distance <= cfg.color_shell_depth) {
+                                        v_col = q.baked_color;
+                                        // Shell mode paints only the outer half of the shell: the
+                                        // inner half is what a crater exposes, so it must stay raw.
                                         const float side_dot =
                                             (px - q.closest_point.x) * q.normal.x +
                                             (py - q.closest_point.y) * q.normal.y +
@@ -849,11 +1080,14 @@ public:
                                         if (side_dot < 0.0f) {
                                             v_col = VoxelColor::kUnpainted;
                                         }
-                                    }
-                                    if (v_col != VoxelColor::kUnpainted) {
-                                        has_painted_color = true;
+                                        if (v_col != VoxelColor::kUnpainted) {
+                                            has_painted_color = true;
+                                        }
                                     }
                                 }
+
+                                tsdf_buf[v_idx] = encoded_q;
+                                mat_buf[v_idx] = mat;
                                 col_buf[v_idx] = v_col;
 
                                 if (encoded_q < 0) {

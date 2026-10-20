@@ -307,33 +307,45 @@ The shipped `voxel_terrain_demo.tscn` uses `collision_distance_chunks = 3` and
 | **Ctrl / Q** | Fly downward |
 | **Shift** (Hold) | Sprint speed boost ($3\times$) |
 | **Mouse Motion** | Look around (first-person pitch/yaw) |
-| **1 … 5** | Select terrain tool: Add terrain / Explode / Large explode / Paint terrain / Paint delete |
-| **6 … 9** | Place boulder / Water quench / Frost-Ice bridge / Lava |
-| **C** | Select the **Small hit** chip blast (default radius 1.5 m) for fine carving |
-| **0 / -** | Stamp the configured asset at the crosshair (timed / permanent) |
-| **R** | Reset all four demo statues (remove stamps + restore pristine meshes) |
+| **1** | Add terrain |
+| **2** | Paint terrain (hold-and-drag add) |
+| **3** | Paint delete (hold-and-drag erase) |
+| **4** | Place boulder |
+| **5** | Small hit chip blast (default radius 1.5 m) for fine carving |
+| **6** | Explode |
+| **7** | Large explode |
+| **8** | Water quench |
+| **9** | Frost-Ice bridge |
+| **0** | Lava |
+| **B** | Stamp the configured asset at the crosshair with the reconstitution timer |
+| **Shift + B** | Stamp the configured asset permanently (no reconstitution timer) |
+| **R** | Reset all six demo statues (remove stamps + restore pristine meshes) |
 | **T** | Toggle the add/paint material (soil / 3-hit rock) |
+| **H** | Show / hide the grouped controls overlay |
 | **Left Click** | Apply the active tool at the crosshair (hit point, or 24 m ahead when aiming at the sky) |
-| **Left Click** (Hold) | Tools 4 and 5 stream terrain additions / deletions along the drag path |
+| **Left Click** (Hold) | Tools 2 and 3 stream terrain additions / deletions along the drag path |
 | **Right Click** | Query 3D cave navigation path for AI companion |
-| **Escape** | Toggle mouse capture |
+| **Shift + Right Click** | Place the companion marker at the crosshair |
+| **P** | Place the companion marker at the crosshair |
+| **Escape** | Release mouse capture (click to recapture) |
 
 ### Terrain Tools
 
-Keys `1 … 5` select the active tool (shown in the HUD). `1` adds a sphere of new
-terrain, `2` and `3` carve a crater at two radii, and `4` / `5` are
-hold-and-drag brushes that continuously add or remove terrain along the sweep.
-Each tool's radius is an exported knob on the demo controller, tunable live in
-the Inspector:
+Keys `1 … 0` select the active tool in HUD order: construction (`1`-`4`), then
+destruction (`5`-`7`), then elemental reactions (`8`-`0`). `1` adds a sphere of
+new terrain, `2` / `3` are hold-and-drag brushes that continuously paint or
+erase along the sweep, `4` places a boulder, and `5`-`7` carve craters at
+increasing radii. Each tool's radius is an exported knob on the demo controller,
+tunable live in the Inspector:
 
 | Export | Default | Used by |
 | --- | --- | --- |
 | `add_radius` | `6.0` | Tool 1 (Add terrain) |
-| `explosion_radius` | `8.5` | Tool 2 (Explode) |
-| `large_explosion_radius` | `18.0` | Tool 3 (Large explode) |
-| `paint_radius` | `3.5` | Tool 4 (Paint terrain, drag-add) |
-| `paint_delete_radius` | `3.5` | Tool 5 (Paint delete, drag-erase) |
-| `small_hit_radius` | `1.5` | Key C (Small hit chip blast) |
+| `explosion_radius` | `8.5` | Tool 6 (Explode) |
+| `large_explosion_radius` | `18.0` | Tool 7 (Large explode) |
+| `paint_radius` | `3.5` | Tool 2 (Paint terrain, drag-add) |
+| `paint_delete_radius` | `3.5` | Tool 3 (Paint delete, drag-erase) |
+| `small_hit_radius` | `1.5` | Tool 5 (Small hit chip blast) |
 | `brush_spacing_factor` | `0.6` | Drag-brush step distance (`radius x factor`) |
 | `brush_interval` | `0.05` | Minimum seconds between drag-brush steps |
 
@@ -389,7 +401,7 @@ their texture through carving, and deep crater walls expose raw rock. See
 [`docs/asset stamping and reconstitution.md`](docs/asset%20stamping%20and%20reconstitution.md).
 
 Stamping a baked region from GDScript (a reconstitution timer of `15.0` s here;
-pass `0.0` — or use demo Key `-` — for permanent destruction):
+pass `0.0` — or use demo Shift+B — for permanent destruction):
 
 ```gdscript
 var structure_id := $VoxelTerrain3D.stamp_asset(
@@ -407,19 +419,19 @@ TSDF, materials and damage state. Signals:
 | `structure_damaged` | `structure_id`, `name` | A stamped structure's chunks were carved; its reconstitution timer is armed. |
 | `structure_recreated` | `structure_id`, `name` | The quiet period elapsed and the exact pre-damage voxels were restored. |
 
-In the demo, **Key 0** stamps the configured `stamp_asset_path` at the crosshair
-with `stamp_recreate_delay_seconds` (default 15 s); **Key -** stamps it with no
+In the demo, **Key B** stamps the configured `stamp_asset_path` at the crosshair
+with `stamp_recreate_delay_seconds` (default 15 s); **Shift+B** stamps it with no
 timer so it stays permanently destroyed. Aim at the terrain surface first.
 
-`voxel_terrain_demo.tscn` also seeds three 48 m statue pairs: the 2x Moai pair
-at `z = 0`, the 5.33x Atlas pair at `z = -64`, and the 5.33x Ape pair at
-`z = -128`, all stamped into a `0.5 m` voxel world. Each pair shows the same two
-styles side by side:
+`voxel_terrain_demo.tscn` also seeds three 48 m statue pairs: the 16x Easter
+Island pair at `z = 0`, the 5.33x Atlas pair at `z = -64`, and the 5.33x Ape
+pair at `z = -128`, all stamped into a `0.5 m` voxel world. Each pair shows the
+same two styles side by side:
 
 | Statue | Behavior |
 | --- | --- |
-| **Option 1 �?" Pristine Mesh Swap** | Shows the textured `models/moai_statue.obj` / `models/atlas/atlas.obj` / `models/ape/ape.obj` mesh until the first blast reaches it; the hit hides the mesh and stamps the same statue as voxels (crater carved immediately). |
-| **Option 2 �?" Baked Voxel Colors** | Stamped at startup from `moai_statue.vreg` / `models/atlas/atlas_statue.vreg` / `models/ape/ape_statue.vreg` with per-voxel albedo, 3-hit cracks, raw-rock craters, and a 15 s reconstitution timer. |
+| **Option 1 �?" Pristine Mesh Swap** | Shows the textured `models/easter-island/easter_island.obj` / `models/atlas/atlas.obj` / `models/ape/ape.obj` mesh until the first blast reaches it; the hit hides the mesh and stamps the same statue as voxels (crater carved immediately). |
+| **Option 2 �?" Baked Voxel Colors** | Stamped at startup from `models/easter-island/easter_island_statue.vreg` / `models/atlas/atlas_statue.vreg` / `models/ape/ape_statue.vreg` with per-voxel albedo, 3-hit cracks, raw-rock craters, and a 15 s reconstitution timer. |
 
 The Atlas `.vreg` is baked watertight from the GLB's extracted OBJ + albedo:
 
@@ -431,11 +443,15 @@ voxel_baker models/atlas/atlas.obj models/atlas/atlas_statue.vreg \
 
 `atlas.obj` and `atlas_albedo.ppm` are derived from `models/atlas/atlas.glb`
 (the 9 m source mesh scaled 5.333x to 48 m); re-export them from the GLB before
-re-baking if the source asset changes. The Moai pair is baked the same way:
+re-baking if the source asset changes. The Easter Island pair is baked the same
+way from `models/easter-island/easter-isle-low-poly.glb` (the 3 m source scaled
+16x to 48 m):
 
 ```bash
-voxel_baker models/moai_statue.obj moai_statue.vreg \
-    --voxel-scale 0.5 --watertight --texture models/moai_albedo.ppm \
+voxel_baker models/easter-island/easter_island.obj \
+    models/easter-island/easter_island_statue.vreg \
+    --voxel-scale 0.5 --watertight \
+    --texture models/easter-island/easter_island_albedo.ppm \
     --color-depth 2.8 --center-x 160 --center-y 160 --center-z 128
 ```
 
@@ -534,7 +550,7 @@ hosts redirect the output (tests capture it instead of printing).
 │   ├── voxel_baker_main.cpp      # Standalone `voxel_baker` CLI entry point
 │   ├── voxel_ai_companion.cpp/.h # VoxelAICompanion node (3D cave pathfinding)
 │   └── voxel_terrain_3d.cpp/.h   # VoxelTerrain3D node (streaming, remeshing, physics)
-├── models/                       # Demo assets (Moai GLB/OBJ, extracted albedo, baked .vreg)
+├── models/                       # Demo statue assets (Easter Island, Atlas, Ape: GLB/OBJ, albedo, baked .vreg)
 ├── tests/                        # Milestone unit & integration tests (M0 - M4)
 ├── CMakeLists.txt                # Root CMake build configuration
 ├── project.godot                 # Godot engine project definition

@@ -348,12 +348,12 @@ private:
 
 struct CaveNavMeshConfig {
     float voxel_scale = 1.0f;
-    float cell_size = 0.25f;   // 0.25 * s
+    float cell_size = 0.35f;   // 0.35 * s
     float cell_height = 0.20f; // 0.20 * s
-    float agent_radius = 0.6f;
+    float agent_radius = 0.35f;
     float agent_height = 1.8f;
-    float agent_max_climb = 0.5f;
-    float agent_max_slope = 45.0f;
+    float agent_max_climb = 1.5f;
+    float agent_max_slope = 70.0f;
     float region_connection_margin = 0.4f;
     float region_min_size = 8.0f;
 
@@ -423,6 +423,41 @@ public:
 
     void set_bake_on_stream_enabled(bool enabled) noexcept {
         bake_on_stream_enabled_ = enabled;
+    }
+
+    /// Applies new walkable-slope and step-height limits to every existing group and
+    /// marks each one dirty so NavigationServer3D rebakes with the new limits.
+    void set_agent_limits(float max_slope_degrees, float max_climb) noexcept {
+        if (config_.agent_max_slope == max_slope_degrees &&
+            config_.agent_max_climb == max_climb) {
+            return;
+        }
+        const bool climb_changed = config_.agent_max_climb != max_climb;
+        config_.agent_max_slope = max_slope_degrees;
+        config_.agent_max_climb = max_climb;
+
+        for (auto& [gk, g] : groups_) {
+            g.nav_mesh_config.agent_max_slope = max_slope_degrees;
+            g.nav_mesh_config.agent_max_climb = max_climb;
+            if (climb_changed) {
+                g.baking_aabb = compute_baking_aabb(gk);
+            }
+#if defined(VOXEL_WITH_GODOT_CPP)
+            if (g.nav_mesh.is_valid()) {
+                g.nav_mesh->set_agent_max_slope(max_slope_degrees);
+                g.nav_mesh->set_agent_max_climb(max_climb);
+                if (climb_changed) {
+                    g.nav_mesh->set_filter_baking_aabb(godot::AABB(
+                        godot::Vector3(g.baking_aabb.min.x, g.baking_aabb.min.y,
+                                       g.baking_aabb.min.z),
+                        godot::Vector3(g.baking_aabb.max.x - g.baking_aabb.min.x,
+                                       g.baking_aabb.max.y - g.baking_aabb.min.y,
+                                       g.baking_aabb.max.z - g.baking_aabb.min.z)));
+                }
+            }
+#endif
+            g.desired_source_epoch += 1;
+        }
     }
 
     [[nodiscard]] float voxel_scale() const noexcept { return config_.voxel_scale; }
@@ -767,15 +802,15 @@ private:
             }
         }
         g.nav_mesh.instantiate();
-        // Configure Recast heightfield so 30-45 deg ramps and narrow Ice Bridges across caverns
-        // never get disconnected by quantized height steps (walkableClimb = floor(0.90 / 0.20) = 4 cells)
-        // or eroded away on bridge edges (filter_ledge_spans = false).
-        g.nav_mesh->set_cell_size(0.4f);
-        g.nav_mesh->set_cell_height(0.2f);
+        // Configure Recast heightfield so steep Surface Nets hillsides stay walkable:
+        // walkableClimb = floor(1.50 / 0.20) = 7 cells, and 70 deg keeps the exposed
+        // rock facets instead of eroding a barrier across the slope.
+        g.nav_mesh->set_cell_size(config_.cell_size);
+        g.nav_mesh->set_cell_height(config_.cell_height);
         g.nav_mesh->set_agent_radius(config_.agent_radius);
         g.nav_mesh->set_agent_height(config_.agent_height);
-        g.nav_mesh->set_agent_max_climb(0.9f);
-        g.nav_mesh->set_agent_max_slope(52.0f);
+        g.nav_mesh->set_agent_max_climb(config_.agent_max_climb);
+        g.nav_mesh->set_agent_max_slope(config_.agent_max_slope);
         g.nav_mesh->set_region_min_size(2.0f);
         g.nav_mesh->set_border_size(g.border_size);
         g.nav_mesh->set_filter_baking_aabb(godot::AABB(

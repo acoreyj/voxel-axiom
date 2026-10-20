@@ -64,30 +64,30 @@ terrain_material = SubResource("ShaderMaterial_Terrain")
 [node name="VoxelAICompanion" type="VoxelAICompanion" parent="." unique_id=1917223628]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 16, 48, 16)
 
-[node name="MoaiOption1_MeshSwap" type="Node3D" parent="." unique_id=1701159093]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -16, 96, 0)
+[node name="EasterIslandOption1_MeshSwap" type="Node3D" parent="." unique_id=1701159093]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -16, 72, 0)
 
-[node name="PristineMesh" type="MeshInstance3D" parent="MoaiOption1_MeshSwap" unique_id=562080943]
+[node name="PristineMesh" type="MeshInstance3D" parent="EasterIslandOption1_MeshSwap" unique_id=562080943]
 
-[node name="StaticBody3D" type="StaticBody3D" parent="MoaiOption1_MeshSwap" unique_id=758329704]
+[node name="StaticBody3D" type="StaticBody3D" parent="EasterIslandOption1_MeshSwap" unique_id=758329704]
 
-[node name="CollisionShape3D" type="CollisionShape3D" parent="MoaiOption1_MeshSwap/StaticBody3D" unique_id=1099841325]
+[node name="CollisionShape3D" type="CollisionShape3D" parent="EasterIslandOption1_MeshSwap/StaticBody3D" unique_id=1099841325]
 
-[node name="Label3D" type="Label3D" parent="MoaiOption1_MeshSwap" unique_id=55224615]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 26, 0)
+[node name="Label3D" type="Label3D" parent="EasterIslandOption1_MeshSwap" unique_id=55224615]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 50, 0)
 billboard = 1
-text = "Option 1 (2x Scale): Pristine Mesh -> Voxel Swap
+text = "Easter Island Option 1 (16x Scale): Pristine Mesh -> Voxel Swap
 (Shoot to fracture into voxels | Press R to Reset)"
 font_size = 42
 outline_size = 10
 
-[node name="MoaiOption2_BakedVoxel" type="Node3D" parent="." unique_id=614955450]
+[node name="EasterIslandOption2_BakedVoxel" type="Node3D" parent="." unique_id=614955450]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 16, 96, 0)
 
-[node name="Label3D" type="Label3D" parent="MoaiOption2_BakedVoxel" unique_id=261667783]
+[node name="Label3D" type="Label3D" parent="EasterIslandOption2_BakedVoxel" unique_id=261667783]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 26, 0)
 billboard = 1
-text = "Option 2: 100% Voxel + Baked RGB5551 Albedo
+text = "Easter Island Option 2: 100% Voxel + Baked RGB5551 Albedo
 (3-Hit Cracks + Raw Interior Crater | 15s Reconstitution)"
 font_size = 42
 outline_size = 10
@@ -162,6 +162,15 @@ offset_right = 460.0
 offset_bottom = 160.0
 theme_override_font_sizes/font_size = 16
 text = "FPS: --"
+
+[node name="ControlsLabel" type="Label" parent="HUD" unique_id=1900000021]
+offset_left = 12.0
+offset_top = 178.0
+offset_right = 620.0
+offset_bottom = 350.0
+theme_override_colors/font_color = Color(0.78, 0.83, 0.9, 1)
+theme_override_font_sizes/font_size = 14
+text = "CONTROLS"
 
 [node name="Reticle" type="Panel" parent="HUD" unique_id=1289745621]
 anchors_preset = 8

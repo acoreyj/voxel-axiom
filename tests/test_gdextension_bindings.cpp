@@ -62,6 +62,26 @@ void test_generate_caves_flag_roundtrip() {
     std::printf("[PASS] test_generate_caves_flag_roundtrip (default caves-on, set/get round-trips)\n");
 }
 
+void test_agent_navigation_limits_roundtrip() {
+    ++g_tests_run;
+
+    VoxelTerrain3D terrain;
+    REQUIRE(std::abs(terrain.get_agent_max_slope() - 70.0f) < 1e-6f);
+    REQUIRE(std::abs(terrain.get_agent_max_climb() - 1.5f) < 1e-6f);
+
+    terrain.set_agent_max_slope(60.0f);
+    terrain.set_agent_max_climb(1.2f);
+    REQUIRE(std::abs(terrain.get_agent_max_slope() - 60.0f) < 1e-6f);
+    REQUIRE(std::abs(terrain.get_agent_max_climb() - 1.2f) < 1e-6f);
+
+    terrain.set_agent_max_slope(120.0f);
+    terrain.set_agent_max_climb(9.0f);
+    REQUIRE(std::abs(terrain.get_agent_max_slope() - 89.0f) < 1e-6f);
+    REQUIRE(std::abs(terrain.get_agent_max_climb() - 4.0f) < 1e-6f);
+
+    std::printf("[PASS] test_agent_navigation_limits_roundtrip (defaults 70 deg / 1.5 m, clamped ranges)\n");
+}
+
 void test_collision_toggles_roundtrip() {
     ++g_tests_run;
 
@@ -574,6 +594,7 @@ void test_gdextension_moai_stamp_baked_colors_and_remove_structure() {
 int main() {
     std::printf("=== Running GDExtension End-to-End Streaming, Destruction, Moai Albedo & Nav3D Test Suite ===\n");
     test_generate_caves_flag_roundtrip();
+    test_agent_navigation_limits_roundtrip();
     test_collision_toggles_roundtrip();
     test_terrain_depth_slider_roundtrip();
     test_world_seed_roundtrip();

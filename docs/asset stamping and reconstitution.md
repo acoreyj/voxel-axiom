@@ -131,7 +131,7 @@ var structure_id := $VoxelTerrain3D.stamp_asset("res://ancient_ruin.vreg", Vecto
 - Returns the structure ID (`> 0`), or `0` on failure (engine not ready, file missing, bad magic).
 - Color data baked into the `.vreg` is stamped into the chunks in the same transaction; `remove_structure(id)` restores every affected chunk to its exact pre-stamp state (TSDF, materials, colors) and returns `true`.
 
-> The core opens the path with `fopen`, so prefer an absolute path or a project-relative path (the demo uses `easter-isle-low-poly.vreg`). A `res://` path works in the editor when the file exists on disk.
+> The core opens the path with `fopen`, so prefer an absolute path or a project-relative path (the demo uses `models/easter-island/easter_island_statue.vreg`). A `res://` path works in the editor when the file exists on disk.
 
 Placement example — to straddle the crosshair hit point with the mesh center, subtract the baked center offset (this is what the demo does):
 
@@ -189,34 +189,36 @@ Signals on `VoxelTerrain3D`:
 
 ## 4. Using it in the demo
 
-Two approaches are shown side by side in `voxel_terrain_demo.tscn` (`terrain_demo.gd`), using the 9 m `easter-isle-low-poly` Moai:
+Three two-option statue pairs are shown side by side in `voxel_terrain_demo.tscn` (`terrain_demo.gd`): the 16x Easter Island pair at `z = 0`, the 5.33x Atlas pair at `z = -64`, and the 5.33x Ape pair at `z = -128`.
 
 | Option | What it demonstrates |
 | :--- | :--- |
-| **Option 1 — Pristine Mesh Swap** (`-16, 0`) | A textured pristine mesh + StaticBody3D is shown until the first explosion/elemental hit reaches it. The hit hides the mesh and stamps the same statue into the voxel terrain, so the crater is carved into voxels from the first frame. Key **R** restores the pre-stamp chunks and the pristine mesh. |
-| **Option 2 — Baked Voxel Colors** (`+16, 0`) | The statue is stamped directly at startup from `easter-isle-low-poly.vreg` with per-voxel RGB5551 albedo, 3-hit crack damage, raw-rock crater interiors, and a 15 s reconstitution timer. Key **R** removes and re-stamps it. |
+| **Option 1 — Pristine Mesh Swap** (`-16, 0` / `-16, -64` / `-32, -128`) | A textured pristine mesh + StaticBody3D is shown until the first explosion/elemental hit reaches it. The hit hides the mesh and stamps the same statue into the voxel terrain, so the crater is carved into voxels from the first frame. Key **R** restores the pre-stamp chunks and the pristine mesh. |
+| **Option 2 — Baked Voxel Colors** (`+16, 0` / `+16, -64` / `+32, -128`) | The statue is stamped directly at startup from its `.vreg` with per-voxel RGB5551 albedo, 3-hit crack damage, raw-rock crater interiors, and a 15 s reconstitution timer. Key **R** removes and re-stamps it. |
 
 | Input | Action |
 | :--- | :--- |
-| **Key R** | Reset both statues (Option 1: remove structure + restore pristine mesh; Option 2: remove + re-stamp). |
+| **Key R** | Reset all six statues (Option 1: remove structure + restore pristine mesh; Option 2: remove + re-stamp). |
 | **Key T** | Toggle the add/paint material (soil / 3-hit rock). |
-| **Key C** | Select the **Small hit** chip blast (`small_hit_radius`, default 1.5 m) for sculpting fine craters into a statue. |
-| **Key 0** | Stamp `stamp_asset_path` at the crosshair with `stamp_recreate_delay_seconds` (default `15 s`). |
-| **Key -** (minus) | Stamp `stamp_asset_path` permanently (no reconstitution timer). |
+| **Key 5** | Select the **Small hit** chip blast (`small_hit_radius`, default 1.5 m) for sculpting fine craters into a statue. |
+| **Key B** | Stamp `stamp_asset_path` at the crosshair with `stamp_recreate_delay_seconds` (default `15 s`). |
+| **Shift + B** | Stamp `stamp_asset_path` permanently (no reconstitution timer). |
 
-Demo exports (Inspector): `stamp_asset_path`, `stamp_recreate_delay_seconds`, `moai_mesh_path`
-(`res://models/easter-isle-low-poly.obj`), `moai_albedo_path`
-(`res://models/easter-isle-low-poly_texture_0.png`), `moai_vreg_path`
-(`easter-isle-low-poly.vreg`). Bake the statue from the scaled OBJ + PPM albedo:
+Demo exports (Inspector): `stamp_asset_path`, `stamp_recreate_delay_seconds`,
+`easter_island_mesh_path` (`res://models/easter-island/easter_island.obj`),
+`easter_island_albedo_path` (`res://models/easter-island/easter_island_albedo.png`),
+`easter_island_vreg_path` (`models/easter-island/easter_island_statue.vreg`). Bake the statue from the scaled OBJ + PPM albedo:
 
 ```bash
-voxel_baker models/easter-isle-low-poly.obj easter-isle-low-poly.vreg \
-    --thickness 1.2 --color-depth 1.0 \
-    --texture models/easter-isle-low-poly_texture_0.ppm \
-    --center-x 144 --center-y 81 --center-z 128
+voxel_baker models/easter-island/easter_island.obj \
+    models/easter-island/easter_island_statue.vreg \
+    --voxel-scale 0.5 --watertight --color-depth 2.8 \
+    --texture models/easter-island/easter_island_albedo.ppm \
+    --center-x 160 --center-y 160 --center-z 128
 ```
 
-`--center-y 81` seats the 9 m model (base at local sample 76.5) on the spawn-area terrain; the demo resolves the stamp origin from `get_surface_height()` at runtime. The Moai OBJ is an open scan surface, so shell mode is used; in shell mode the baker paints only the outer half of the shell (by surface-normal side), leaving the inner half — the crater bowl — unpainted. A minimal open ruin example:
+`--center-y 160` seats the 48 m model (base at local sample 112) on the terrain; the demo resolves the stamp origin from `get_surface_height()` at runtime. All three statues are baked with `--watertight`; the `2.8 m` color shell keeps texture on the surface while craters expose raw rock. A minimal open ruin example requires shell mode:
+
 
 ```obj
 # ancient ruin shrine

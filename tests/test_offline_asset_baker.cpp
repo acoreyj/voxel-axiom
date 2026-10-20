@@ -473,6 +473,112 @@ void test_per_voxel_color_channel_and_remove_structure() {
     std::printf("[PASS] test_per_voxel_color_channel_and_remove_structure (RGB5551 outer skin, raw crater interior, .vreg color save & remove_structure verified)\n");
 }
 
+// ============================================================================
+// 6. Cracked Watertight Mesh Must Not Extrude Ray-Parity Needles
+// ============================================================================
+void test_watertight_crack_does_not_extrude_needles() {
+    ++g_tests_run;
+
+    const std::filesystem::path temp_vreg = "/tmp/test_cracked_cube.vreg";
+    std::filesystem::remove(temp_vreg);
+
+    // Closed 8 m cube with one triangle deliberately omitted from the +Z face.
+    // A +Z parity ray entering the -Z face exits through that hole, so the naive
+    // parity test sees an odd crossing count and marks the whole shadow column
+    // behind the cube solid: a one-voxel-wide spike for every affected column.
+    const std::string cracked_cube_obj =
+        "usemtl moai_hard_rock\n"
+        "v -4.0 -4.0 -4.0\n"
+        "v  4.0 -4.0 -4.0\n"
+        "v  4.0  4.0 -4.0\n"
+        "v -4.0  4.0 -4.0\n"
+        "v -4.0 -4.0  4.0\n"
+        "v  4.0 -4.0  4.0\n"
+        "v  4.0  4.0  4.0\n"
+        "v -4.0  4.0  4.0\n"
+        "# -Z face\n"
+        "f 1 3 2\n"
+        "f 1 4 3\n"
+        "# +Z face: only one of its two triangles (the other leaves a crack)\n"
+        "f 5 7 8\n"
+        "# -Y face\n"
+        "f 1 6 5\n"
+        "f 1 2 6\n"
+        "# +Y face\n"
+        "f 4 7 3\n"
+        "f 4 8 7\n"
+        "# -X face\n"
+        "f 1 8 4\n"
+        "f 1 5 8\n"
+        "# +X face\n"
+        "f 2 7 6\n"
+        "f 2 3 7\n";
+
+    std::stringstream ss(cracked_cube_obj);
+    voxel::RawObjMesh mesh{};
+    REQUIRE(voxel::ObjMeshLoader::load_from_stream(ss, mesh));
+
+    voxel::AssetBakerConfig cfg{};
+    cfg.mode = voxel::VoxelizationMode::WatertightSolid;
+    cfg.voxel_scale = 1.0f;
+    cfg.truncation_delta = 2.0f;
+    cfg.auto_center_in_region = true; // Cube center lands on sample (128, 128, 128)
+
+    const voxel::BakedRegionData baked = voxel::VoxelMeshBaker::bake_mesh_to_region(mesh, cfg);
+    REQUIRE(baked.active_chunk_count > 0);
+    REQUIRE(voxel::VoxelMeshBaker::save_baked_region_to_file(temp_vreg.string(), baked));
+
+    voxel::MemoryLedger ledger;
+    voxel::ChunkStore store(ledger, /*world_height_chunks=*/8);
+    voxel::DualDirtyScheduler dirty_scheduler;
+    voxel::VoxelNavigationManager nav_mgr;
+    nav_mgr.initialize(voxel::ServerRid{3});
+    voxel::AssetStampManager stamp_mgr;
+
+    const uint32_t struct_id = stamp_mgr.stamp_region_file(
+        store, dirty_scheduler, nav_mgr, temp_vreg.string(),
+        voxel::ChunkKey::from_coords(0, 0, 0), 5.0f,
+        voxel::StampBlendMode::Union, "CrackedCube");
+    REQUIRE(struct_id > 0);
+
+    auto tsdf_at = [&](int32_t sx, int32_t sy, int32_t sz) -> int16_t {
+        voxel::ChunkSlot* slot = store.find_slot(
+            voxel::ChunkKey::from_coords(sx / 32, sy / 32, sz / 32));
+        if (!slot) {
+            return voxel::TsdfFormat::kClampedAir;
+        }
+        return slot->get_tsdf(voxel::LocalCoord{sx % 32, sy % 32, sz % 32});
+    };
+
+    // The cube interior is still solid.
+    REQUIRE(tsdf_at(128, 128, 128) < 0);
+
+    // The two sample layers directly behind the -Z face, inside the old parity
+    // shadow of the +Z crack, must all be air. Before the crack-robust
+    // classification these columns baked as solid needles.
+    std::size_t back_samples = 0;
+    std::size_t back_air = 0;
+    for (int32_t sy = 120; sy <= 136; ++sy) {
+        for (int32_t sx = 120; sx <= 136; ++sx) {
+            for (int32_t sz : {122, 123}) {
+                ++back_samples;
+                if (tsdf_at(sx, sy, sz) >= 0) {
+                    ++back_air;
+                }
+            }
+        }
+    }
+    REQUIRE(back_samples > 0);
+    REQUIRE(back_air == back_samples);
+
+    // Just outside the intact -X face must be air too.
+    REQUIRE(tsdf_at(121, 128, 128) >= 0);
+
+    REQUIRE(stamp_mgr.remove_structure(struct_id, store, dirty_scheduler, nav_mgr));
+    std::filesystem::remove(temp_vreg);
+    std::printf("[PASS] test_watertight_crack_does_not_extrude_needles (hole in +Z face leaves no solid parity shadow)\n");
+}
+
 } // namespace
 
 int main() {
@@ -482,6 +588,7 @@ int main() {
     test_stamping_destruction_and_reconstitution();
     test_permanent_destruction_mode();
     test_per_voxel_color_channel_and_remove_structure();
+    test_watertight_crack_does_not_extrude_needles();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",
                 g_tests_run, g_assertions_checked);
     return EXIT_SUCCESS;
