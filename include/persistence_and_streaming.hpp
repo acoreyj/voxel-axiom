@@ -166,6 +166,7 @@ struct CompressedChunkBlob {
     SerializedChunkForm form = SerializedChunkForm::Empty;
     uint8_t base_material_id = 0;
     bool has_material_plane = false;
+    bool has_color_plane = false;
     uint64_t captured_version = 0;
     bool dirty_for_disk = true;
 
@@ -190,7 +191,7 @@ struct RegionTocEntry {
     uint8_t form = static_cast<uint8_t>(SerializedChunkForm::Untouched);
     uint8_t base_material_id = 0;
     uint8_t has_material_plane = 0;
-    uint8_t reserved = 0;
+    uint8_t has_color_plane = 0;
     uint32_t payload_offset = 0;
     uint32_t payload_size = 0;
 };
@@ -226,8 +227,10 @@ public:
         ChunkStorageForm form_snapshot = ChunkStorageForm::Empty;
         uint8_t base_mat = 0;
         bool has_mat_array = false;
+        bool has_col_array = false;
         std::vector<int16_t> tsdf_copy;
         std::vector<uint8_t> mat_copy;
+        std::vector<uint16_t> col_copy;
 
         {
             std::shared_lock<std::shared_mutex> read_lock(slot->mutex);
@@ -238,6 +241,7 @@ public:
             form_snapshot = slot->form;
             base_mat = slot->base_material_id;
             has_mat_array = slot->has_material_array();
+            has_col_array = slot->has_color_array();
 
             if (form_snapshot == ChunkStorageForm::Dense) {
                 tsdf_copy.assign(slot->tsdf_data, slot->tsdf_data + TsdfFormat::kChunkSamples);
@@ -245,17 +249,21 @@ public:
             if (has_mat_array) {
                 mat_copy.assign(slot->material_data, slot->material_data + TsdfFormat::kChunkSamples);
             }
+            if (has_col_array) {
+                col_copy.assign(slot->color_data, slot->color_data + TsdfFormat::kChunkSamples);
+            }
         }
 
         CompressedChunkBlob blob{};
         blob.base_material_id = base_mat;
         blob.has_material_plane = has_mat_array;
+        blob.has_color_plane = has_col_array;
         blob.captured_version = version_before;
         blob.dirty_for_disk = true;
 
-        if (form_snapshot == ChunkStorageForm::Empty && !has_mat_array) {
+        if (form_snapshot == ChunkStorageForm::Empty && !has_mat_array && !has_col_array) {
             blob.form = SerializedChunkForm::Empty;
-        } else if (form_snapshot == ChunkStorageForm::Solid && !has_mat_array) {
+        } else if (form_snapshot == ChunkStorageForm::Solid && !has_mat_array && !has_col_array) {
             blob.form = SerializedChunkForm::Solid;
         } else {
             blob.form = SerializedChunkForm::Dense;
@@ -279,22 +287,52 @@ public:
                 comp_mat = BytePlaneCodec::compress_plane(mat_copy.data(), mat_copy.size());
             }
 
+            std::vector<uint8_t> comp_col_low;
+            std::vector<uint8_t> comp_col_high;
+            if (has_col_array) {
+                std::vector<uint8_t> col_low_plane(TsdfFormat::kChunkSamples);
+                std::vector<uint8_t> col_high_plane(TsdfFormat::kChunkSamples);
+                BytePlaneCodec::split_int16_planes(
+                    reinterpret_cast<const int16_t*>(col_copy.data()),
+                    col_low_plane.data(),
+                    col_high_plane.data());
+                comp_col_low = BytePlaneCodec::compress_plane(col_low_plane.data(), col_low_plane.size());
+                comp_col_high = BytePlaneCodec::compress_plane(col_high_plane.data(), col_high_plane.size());
+            }
+
             const uint32_t low_sz = static_cast<uint32_t>(comp_low.size());
             const uint32_t high_sz = static_cast<uint32_t>(comp_high.size());
             const uint32_t mat_sz = static_cast<uint32_t>(comp_mat.size());
+            const uint32_t col_low_sz = static_cast<uint32_t>(comp_col_low.size());
+            const uint32_t col_high_sz = static_cast<uint32_t>(comp_col_high.size());
 
-            blob.payload.resize(3 * sizeof(uint32_t) + low_sz + high_sz + mat_sz);
+            const std::size_t hdr_bytes = has_col_array ? (5 * sizeof(uint32_t)) : (3 * sizeof(uint32_t));
+            blob.payload.resize(hdr_bytes + low_sz + high_sz + mat_sz + col_low_sz + col_high_sz);
             std::memcpy(blob.payload.data() + 0, &low_sz, sizeof(uint32_t));
             std::memcpy(blob.payload.data() + 4, &high_sz, sizeof(uint32_t));
             std::memcpy(blob.payload.data() + 8, &mat_sz, sizeof(uint32_t));
+            if (has_col_array) {
+                std::memcpy(blob.payload.data() + 12, &col_low_sz, sizeof(uint32_t));
+                std::memcpy(blob.payload.data() + 16, &col_high_sz, sizeof(uint32_t));
+            }
 
-            std::size_t offset = 12;
+            std::size_t offset = hdr_bytes;
             std::memcpy(blob.payload.data() + offset, comp_low.data(), low_sz);
             offset += low_sz;
             std::memcpy(blob.payload.data() + offset, comp_high.data(), high_sz);
             offset += high_sz;
             if (mat_sz > 0) {
                 std::memcpy(blob.payload.data() + offset, comp_mat.data(), mat_sz);
+                offset += mat_sz;
+            }
+            if (has_col_array) {
+                if (col_low_sz > 0) {
+                    std::memcpy(blob.payload.data() + offset, comp_col_low.data(), col_low_sz);
+                    offset += col_low_sz;
+                }
+                if (col_high_sz > 0) {
+                    std::memcpy(blob.payload.data() + offset, comp_col_high.data(), col_high_sz);
+                }
             }
         }
 
@@ -371,6 +409,15 @@ public:
             return populate_slot_from_blob(store, key, *disk_blob);
         }
 
+        // If a chunk was already made Resident synchronously (e.g., via stamp_asset or an edit phase),
+        // do not overwrite it with procedural terrain when a background stream request pops later!
+        if (const ChunkSlot* existing = store.find_slot(key); existing != nullptr) {
+            std::shared_lock<std::shared_mutex> rl(existing->mutex);
+            if (existing->state == ChunkLifecycleState::Resident) {
+                return true;
+            }
+        }
+
         procgen.generate_chunk(store, key, grid34);
         return true;
     }
@@ -442,21 +489,26 @@ private:
             return true;
         }
 
-        if (blob.payload.size() < 12ULL) {
+        const std::size_t hdr_bytes = blob.has_color_plane ? 20ULL : 12ULL;
+        if (blob.payload.size() < hdr_bytes) {
             return false;
         }
-        uint32_t low_sz = 0, high_sz = 0, mat_sz = 0;
+        uint32_t low_sz = 0, high_sz = 0, mat_sz = 0, col_low_sz = 0, col_high_sz = 0;
         std::memcpy(&low_sz, blob.payload.data() + 0, sizeof(uint32_t));
         std::memcpy(&high_sz, blob.payload.data() + 4, sizeof(uint32_t));
         std::memcpy(&mat_sz, blob.payload.data() + 8, sizeof(uint32_t));
+        if (blob.has_color_plane) {
+            std::memcpy(&col_low_sz, blob.payload.data() + 12, sizeof(uint32_t));
+            std::memcpy(&col_high_sz, blob.payload.data() + 16, sizeof(uint32_t));
+        }
 
-        if (12ULL + low_sz + high_sz + mat_sz != blob.payload.size()) {
+        if (hdr_bytes + low_sz + high_sz + mat_sz + col_low_sz + col_high_sz != blob.payload.size()) {
             return false;
         }
 
         std::vector<uint8_t> low_plane(TsdfFormat::kChunkSamples);
         std::vector<uint8_t> high_plane(TsdfFormat::kChunkSamples);
-        const uint8_t* ptr = blob.payload.data() + 12;
+        const uint8_t* ptr = blob.payload.data() + hdr_bytes;
 
         if (!BytePlaneCodec::decompress_plane(ptr, low_sz, low_plane.data(), low_plane.size())) {
             return false;
@@ -481,6 +533,27 @@ private:
             }
             for (uint32_t i = 0; i < TsdfFormat::kChunkSamples; ++i) {
                 (void)slot->set_material_linear(i, mat_plane[i], store.material_pool());
+            }
+            ptr += mat_sz;
+        }
+
+        if (blob.has_color_plane && col_low_sz > 0 && col_high_sz > 0) {
+            std::vector<uint8_t> col_low_plane(TsdfFormat::kChunkSamples);
+            std::vector<uint8_t> col_high_plane(TsdfFormat::kChunkSamples);
+            if (!BytePlaneCodec::decompress_plane(ptr, col_low_sz, col_low_plane.data(), col_low_plane.size())) {
+                return false;
+            }
+            ptr += col_low_sz;
+            if (!BytePlaneCodec::decompress_plane(ptr, col_high_sz, col_high_plane.data(), col_high_plane.size())) {
+                return false;
+            }
+            std::vector<int16_t> col_merged(TsdfFormat::kChunkSamples);
+            BytePlaneCodec::merge_int16_planes(col_low_plane.data(), col_high_plane.data(), col_merged.data());
+            for (uint32_t i = 0; i < TsdfFormat::kChunkSamples; ++i) {
+                const uint16_t c = static_cast<uint16_t>(col_merged[i]);
+                if (c != VoxelColor::kUnpainted) {
+                    (void)slot->set_color_linear(i, c, store.tsdf_pool());
+                }
             }
         }
 
@@ -555,6 +628,7 @@ private:
             blob.form = form;
             blob.base_material_id = e.base_material_id;
             blob.has_material_plane = (e.has_material_plane != 0);
+            blob.has_color_plane = (e.has_color_plane != 0);
             blob.dirty_for_disk = false;
             if (e.payload_size > 0) {
                 blob.payload.assign(all_payloads.begin() + e.payload_offset,
@@ -603,6 +677,7 @@ private:
             e.form = static_cast<uint8_t>(b.form);
             e.base_material_id = b.base_material_id;
             e.has_material_plane = b.has_material_plane ? 1U : 0U;
+            e.has_color_plane = b.has_color_plane ? 1U : 0U;
             e.payload_offset = static_cast<uint32_t>(combined_payload.size());
             e.payload_size = static_cast<uint32_t>(b.payload.size());
             combined_payload.insert(combined_payload.end(), b.payload.begin(), b.payload.end());
@@ -675,11 +750,13 @@ public:
     StreamingManager(ChunkStore& store,
                      DualDirtyScheduler& dirty_scheduler,
                      RegionSaveManager& save_manager,
-                     CoreWorkerPool& worker_pool)
+                     CoreWorkerPool& worker_pool,
+                     float voxel_scale = 1.0f)
         : store_(store),
           dirty_scheduler_(dirty_scheduler),
           save_manager_(save_manager),
-          worker_pool_(worker_pool) {}
+          worker_pool_(worker_pool),
+          voxel_scale_(voxel_scale > 0.0f ? voxel_scale : 1.0f) {}
 
     /// Optional per-stage timing sink. Pass nullptr to disable (default).
     void set_stage_timings(StageTimings* timings) noexcept { stage_timings_ = timings; }
@@ -692,10 +769,11 @@ public:
                                               int32_t active_radius_chunks,
                                               int32_t prefetch_radius_chunks) {
         ScopedTimer timer(stage_timings_, Stage::StreamFocus);
+        const float inv_scale = 1.0f / voxel_scale_;
         const ChunkKey focus_ck = ChunkKey::from_world_sample(
-            static_cast<int32_t>(std::floor(position.x)),
-            static_cast<int32_t>(std::floor(position.y)),
-            static_cast<int32_t>(std::floor(position.z)));
+            static_cast<int32_t>(std::floor(position.x * inv_scale)),
+            static_cast<int32_t>(std::floor(position.y * inv_scale)),
+            static_cast<int32_t>(std::floor(position.z * inv_scale)));
 
         // Fast-path O(1) early exit when still within the same focus chunk and radii!
         if (has_last_focus_ &&
@@ -834,6 +912,7 @@ private:
     DualDirtyScheduler& dirty_scheduler_;
     RegionSaveManager& save_manager_;
     CoreWorkerPool& worker_pool_;
+    float voxel_scale_ = 1.0f;
     StageTimings* stage_timings_ = nullptr;
     bool has_last_focus_ = false;
     ChunkKey last_focus_ck_{};

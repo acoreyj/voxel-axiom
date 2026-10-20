@@ -16,6 +16,11 @@ uniform vec3 crack_glow_color : source_color = vec3(1.0, 0.42, 0.08);
 uniform bool debug_damage_indicator = true;
 uniform float slope_sharpness : hint_range(1.0, 16.0) = 6.0;
 uniform float noise_scale : hint_range(0.01, 1.0) = 0.14;
+// Chiseled geometric facet normals: blends the screen-space triangle face normal
+// into Hard Rock and painted monument surfaces so 1.0 m Surface Nets meshes show
+// crisp monolithic planes on brow, nose bridge, lips and jaw without making
+// curved cheeks look blocky.
+uniform float chisel_normal_strength : hint_range(0.0, 1.0) = 0.24;
 
 varying vec3 v_world_pos;
 varying vec3 v_world_normal;
@@ -26,6 +31,10 @@ varying float v_is_hard_rock;
 // below 0.25 carrying hits-to-break / 255 (1/255, 3/255, 5/255).
 varying float v_hits_to_break;
 varying float v_material_code;
+// Per-voxel baked RGB5551 albedo, packed by ServerSlotManager into UV.xy + UV2.x
+// and gated by COLOR.a (0 = unpainted interior, 1 = painted surface).
+varying vec3 v_baked_albedo;
+varying float v_baked_weight;
 
 float hash31(vec3 p) {
 	p = fract(p * 0.1031);
@@ -118,6 +127,13 @@ vec3 damage_level_color(float level_index) {
 	return vec3(1.00, 0.07, 0.02);
 }
 
+// Baked RGB5551 albedo arrives sRGB-encoded (the offline baker samples source
+// textures directly); ALBEDO expects linear, so convert before mixing.
+vec3 baked_srgb_to_linear(vec3 c) {
+	c = clamp(c, 0.0, 1.0);
+	return mix(c / 12.92, pow((c + vec3(0.055)) / 1.055, vec3(2.4)), step(vec3(0.04045), c));
+}
+
 void vertex() {
 	v_world_pos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
 	v_world_normal = normalize((MODEL_NORMAL_MATRIX * NORMAL).xyz);
@@ -125,6 +141,8 @@ void vertex() {
 	v_is_hard_rock = COLOR.g;
 	v_hits_to_break = COLOR.b * 255.0;
 	v_material_code = (COLOR.b >= 0.2) ? COLOR.b : 0.0;
+	v_baked_weight = COLOR.a;
+	v_baked_albedo = vec3(UV.x, UV.y, UV2.x);
 }
 
 void fragment() {
@@ -174,6 +192,42 @@ void fragment() {
 	float roughness_val = mix(0.90, mix(mix(0.75, 0.52, hard_rock_weight * (1.0 - boulder_weight)),
 		0.88, boulder_weight), flat_mask);
 	float metallic_val = 0.18 * hard_rock_weight * (1.0 - boulder_weight);
+
+	// Blend in per-voxel baked RGB5551 albedo (UV.xy + UV2.x, gated by COLOR.a).
+	// Unpainted interior voxels (v_baked_weight == 0.0) fall back to the procedural
+	// Hard Rock / Soil / boulder albedo above; elemental shading below still wins.
+	// Un-premultiply v_baked_albedo by max(paint_w, 0.001) so triangles straddling
+	// painted (w=1, UV=RGB) and unpainted (w=0, UV=0) vertices never darken toward
+	// black at the statue base or crater rim; the sRGB->linear conversion is applied
+	// after un-premultiplying since the baker samples source textures directly.
+	float paint_w = clamp(v_baked_weight, 0.0, 1.0);
+	if (paint_w > 0.01) {
+		vec3 unpremult_albedo = clamp(v_baked_albedo / max(paint_w, 0.001), vec3(0.0), vec3(1.0));
+		vec3 painted_col = baked_srgb_to_linear(unpremult_albedo) * mix(0.92, 1.08, n_detail);
+		float blend_alpha = smoothstep(0.04, 0.80, paint_w);
+		base_col = mix(base_col, painted_col, blend_alpha);
+		roughness_val = mix(roughness_val, 0.76, blend_alpha);
+		metallic_val = mix(metallic_val, 0.03, blend_alpha);
+	}
+
+	// Chiseled Geometric Facet Normals for Hard Rock & Painted Stone Monuments:
+	// Blends view-space triangle face normal with the smooth TSDF normal so 1.0 m
+	// Surface Nets meshes display crisp, monolithic chiseled planes on brow, nose
+	// bridge, lips, and jaw.
+	float stone_facet_mask = max(hard_rock_weight * 0.80, paint_w);
+	if (stone_facet_mask > 0.01 && chisel_normal_strength > 0.001) {
+		vec3 geom_n = cross(dFdx(VERTEX), dFdy(VERTEX));
+		float geom_len = length(geom_n);
+		if (geom_len > 1e-6) {
+			geom_n /= geom_len;
+			if (dot(geom_n, NORMAL) < 0.0) {
+				geom_n = -geom_n;
+			}
+			float facet_blend = clamp(stone_facet_mask * chisel_normal_strength, 0.0, 0.85);
+			NORMAL = normalize(mix(NORMAL, geom_n, facet_blend));
+		}
+	}
+
 	if (is_elemental > 0.5) {
 		if (lava_w > 0.01) {
 			float magma_crust = crack_voronoi_edge(v_world_pos * 0.55);

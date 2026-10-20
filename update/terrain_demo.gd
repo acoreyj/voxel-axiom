@@ -1,12 +1,14 @@
 extends Node3D
 ## HLD v4.0 GDScript Demo Controller (`terrain_demo.gd`)
-## Streams 32^3 chunks around the active Camera3D only when crossing a chunk boundary,
-## fires asynchronous R+delta sphere explosions or elemental reactions on left-click,
-## and tests 3D `4x2x4` cave navigation pathing with gravity-grounded companion & surface-draped 3D path ribbon:
+## Showcases 2x-scale side-by-side Moai Statues (Option 1: Pristine Mesh -> Voxel Swap vs Option 2: 100% Voxel + Baked RGB5551 Albedo),
+## asynchronous R+delta sphere explosions, elemental reactions, `remove_structure` reset loop, and 3D `4x2x4` cave navigation:
 ##   Key 1: Explode (CSG blast: 1-hit Soil/Lava/Ice, 3-hit Hard Rock & Obsidian)
 ##   Key 2: Water Quench (turns Lava -> 3-hit Obsidian on contact & cools cracks)
 ##   Key 3: Frost / Ice Bridge (builds a flat-topped 31-deg ramped Ice Bridge & quenches Lava -> Obsidian)
 ##   Key 4: Lava / Magma (injects Lava, melts Ice -> Air, reacts with Water -> Obsidian)
+##   Key 5: Stamp Ancient Ruin (.vreg) at crosshair with 15s Reconstitution Timer
+##   Key 6: Stamp 2x Baked-Color Moai Statue (.vreg) at crosshair
+##   Key R: Reset both Moai Statues (calls terrain.remove_structure() to restore pre-stamp chunks & unhide Option 1 mesh!)
 ##   Key P (or Shift + RMB): Place / teleport AI Companion start marker at crosshair hit point
 ##   RMB (Right-Click): Set path goal at crosshair hit point, bake/query 3D path, draw path & walk!
 
@@ -18,16 +20,35 @@ extends Node3D
 @export var companion_walk_speed: float = 10.0
 @export var companion_gravity: float = 28.0
 
+# 2x-Scale Side-by-Side Moai Statue coordinates on the y=78.0..78.6 hilltop plateau:
+# moai_statue.vreg (48m tall x 23m wide x 21m deep) is baked with target_region_center = (144, 160, 128),
+# so stamping at origin_chunk places the statue center at (origin_chunk * 32 + Vector3(144, 160, 128)).
+const MOAI_REGION_CENTER := Vector3(144.0, 160.0, 128.0)
+const OPT1_ORIGIN_CHUNK := Vector3(-5.0, -2.0, -4.0) # World center: (-16, 96, 0), base at y=72 buried in y=78.5 ground
+const OPT1_WORLD_CENTER := Vector3(-16.0, 96.0, 0.0)
+const OPT2_ORIGIN_CHUNK := Vector3(-4.0, -2.0, -4.0) # World center: (+16, 96, 0), base at y=72 buried in y=78.2 ground
+const OPT2_WORLD_CENTER := Vector3(16.0, 96.0, 0.0)
+const MOAI_HALF_EXTENTS := Vector3(13.0, 25.0, 12.0)
+
 @onready var terrain: VoxelTerrain3D = $VoxelTerrain3D
 @onready var ai_companion: VoxelAICompanion = $VoxelAICompanion
 @onready var camera: Camera3D = $Camera3D
+@onready var opt1_root: Node3D = $MoaiOption1_MeshSwap
+@onready var opt1_mesh_inst: MeshInstance3D = $MoaiOption1_MeshSwap/PristineMesh
+@onready var opt1_static_body: StaticBody3D = $MoaiOption1_MeshSwap/StaticBody3D
+@onready var opt1_col_shape: CollisionShape3D = $MoaiOption1_MeshSwap/StaticBody3D/CollisionShape3D
+@onready var opt1_label: Label3D = $MoaiOption1_MeshSwap/Label3D
 
 var _yaw: float = 0.0
-var _pitch: float = -0.25
+var _pitch: float = -0.10
 var _velocity: Vector3 = Vector3.ZERO
 var _last_focus_chunk: Vector3i = Vector3i(999999, 999999, 999999)
 var _committed_chunk_count: int = 0
 var _selected_element_kind: int = 0 # 0=Explode, 1=Water, 2=Frost/Ice Bridge, 3=Lava
+
+var _opt1_swapped_to_voxels: bool = false
+var _opt1_structure_id: int = 0
+var _opt2_structure_id: int = 0
 
 var _companion_initialized: bool = false
 var _companion_vertical_vel: float = 0.0
@@ -48,12 +69,146 @@ func _ready() -> void:
 	terrain.explosion_completed.connect(_on_explosion_completed)
 	terrain.explosion_failed.connect(_on_explosion_failed)
 	terrain.chunk_committed.connect(_on_chunk_committed)
+	terrain.structure_damaged.connect(_on_structure_damaged)
+	terrain.structure_recreated.connect(_on_structure_recreated)
+	if terrain.has_signal("structure_removed"):
+		terrain.structure_removed.connect(_on_structure_removed)
 
 	_setup_path_debug_visuals()
+	_setup_side_by_side_moai_statues()
 	_update_stream_focus(true)
 
+func _setup_side_by_side_moai_statues() -> void:
+	# 1. Option 1 (Left at x=-16, y=96, z=0): Load 2x high-res moai_statue.obj + moai_albedo.png onto PristineMesh
+	_load_pristine_moai_mesh_and_collider()
+	_opt1_swapped_to_voxels = false
+	_opt1_structure_id = 0
+
+	# 2. Option 2 (Right at x=+16, y=96, z=0): Stamp 2x moai_statue.vreg directly into VoxelTerrain3D
+	#    with per-voxel RGB5551 baked colors and a 15-second auto-reconstitution timer!
+	_opt2_structure_id = terrain.stamp_asset("moai_statue.vreg", OPT2_ORIGIN_CHUNK, 15.0)
+	print("[MoaiDemo] 2x Option 1 (Pristine Mesh -> Voxel Swap) ready at ", OPT1_WORLD_CENTER,
+		" | 2x Option 2 (Baked Per-Voxel Albedo, id=#", _opt2_structure_id, ") stamped at ", OPT2_WORLD_CENTER)
+
+func _load_pristine_moai_mesh_and_collider() -> void:
+	var f := FileAccess.open("res://moai_statue.obj", FileAccess.READ)
+	if f == null:
+		f = FileAccess.open("moai_statue.obj", FileAccess.READ)
+	if f == null:
+		push_warning("[MoaiDemo] Could not open moai_statue.obj for Option 1 PristineMesh")
+		return
+
+	var raw_positions := PackedVector3Array()
+	var raw_uvs := PackedVector2Array()
+	var out_verts := PackedVector3Array()
+	var out_norms := PackedVector3Array()
+	var out_uvs := PackedVector2Array()
+
+	while not f.eof_reached():
+		var line := f.get_line().strip_edges()
+		if line.is_empty() or line.begins_with("#"):
+			continue
+		var parts := line.split(" ", false)
+		if parts.is_empty():
+			continue
+		if parts[0] == "v" and parts.size() >= 4:
+			raw_positions.push_back(Vector3(parts[1].to_float(), parts[2].to_float(), parts[3].to_float()))
+		elif parts[0] == "vt" and parts.size() >= 3:
+			raw_uvs.push_back(Vector2(parts[1].to_float(), 1.0 - parts[2].to_float()))
+		elif parts[0] == "f" and parts.size() >= 4:
+			var face_v: Array[int] = []
+			var face_vt: Array[int] = []
+			for i in range(1, parts.size()):
+				var sub := parts[i].split("/")
+				face_v.push_back(sub[0].to_int() - 1)
+				if sub.size() > 1 and not sub[1].is_empty():
+					face_vt.push_back(sub[1].to_int() - 1)
+				else:
+					face_vt.push_back(0)
+			for i in range(1, face_v.size() - 1):
+				var i0 := face_v[0]
+				var i1 := face_v[i]
+				var i2 := face_v[i + 1]
+				var p0 := raw_positions[i0]
+				var p1 := raw_positions[i1]
+				var p2 := raw_positions[i2]
+				var n := (p1 - p0).cross(p2 - p0).normalized()
+				out_verts.push_back(p0)
+				out_verts.push_back(p2)
+				out_verts.push_back(p1)
+				out_norms.push_back(n)
+				out_norms.push_back(n)
+				out_norms.push_back(n)
+				if not raw_uvs.is_empty():
+					out_uvs.push_back(raw_uvs[face_vt[0]])
+					out_uvs.push_back(raw_uvs[face_vt[i + 1]])
+					out_uvs.push_back(raw_uvs[face_vt[i]])
+
+	var arrays := []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = out_verts
+	arrays[Mesh.ARRAY_NORMAL] = out_norms
+	if out_uvs.size() == out_verts.size():
+		arrays[Mesh.ARRAY_TEX_UV] = out_uvs
+
+	var arr_mesh := ArrayMesh.new()
+	arr_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+
+	var mat := StandardMaterial3D.new()
+	mat.roughness = 0.78
+	var img := Image.new()
+	var err := img.load("res://moai_albedo.png")
+	if err != OK:
+		err = img.load("moai_albedo.png")
+	if err == OK:
+		mat.albedo_texture = ImageTexture.create_from_image(img)
+	else:
+		mat.albedo_color = Color(0.57, 0.52, 0.45)
+
+	opt1_mesh_inst.mesh = arr_mesh
+	opt1_mesh_inst.material_override = mat
+	opt1_mesh_inst.visible = true
+
+	var shape := ConcavePolygonShape3D.new()
+	shape.set_faces(out_verts)
+	opt1_col_shape.shape = shape
+	opt1_col_shape.disabled = false
+
+func _check_and_swap_opt1_moai_on_blast(blast_pos: Vector3, blast_radius: float, hit_collider: Object) -> void:
+	if _opt1_swapped_to_voxels:
+		return
+	var direct_hit := (hit_collider == opt1_static_body)
+	var dx: float = max(0.0, abs(blast_pos.x - OPT1_WORLD_CENTER.x) - MOAI_HALF_EXTENTS.x)
+	var dy: float = max(0.0, abs(blast_pos.y - OPT1_WORLD_CENTER.y) - MOAI_HALF_EXTENTS.y)
+	var dz: float = max(0.0, abs(blast_pos.z - OPT1_WORLD_CENTER.z) - MOAI_HALF_EXTENTS.z)
+	var dist_to_box := sqrt(dx * dx + dy * dy + dz * dz)
+
+	if direct_hit or dist_to_box <= blast_radius + 2.0:
+		opt1_mesh_inst.visible = false
+		opt1_col_shape.disabled = true
+		_opt1_structure_id = terrain.stamp_asset("moai_statue.vreg", OPT1_ORIGIN_CHUNK, 0.0)
+		_opt1_swapped_to_voxels = true
+		opt1_label.text = "Option 1 (2x Scale): SWAPPED TO VOXELS (#%d)\n(Carve freely | Press R to restore Pristine Mesh)" % _opt1_structure_id
+		print("[MoaiSwap] Option 1 Moai hit at ", blast_pos, " -> Hid PristineMesh & stamped Voxel Structure #", _opt1_structure_id, "!")
+
+func _reset_moai_statues() -> void:
+	if _opt1_swapped_to_voxels and _opt1_structure_id > 0:
+		var ok := terrain.remove_structure(_opt1_structure_id)
+		print("[MoaiReset] Removed Option 1 voxel structure #", _opt1_structure_id, " (restored pre-stamp chunks: ", ok, ")")
+	_opt1_swapped_to_voxels = false
+	_opt1_structure_id = 0
+	opt1_mesh_inst.visible = true
+	opt1_col_shape.disabled = false
+	opt1_label.text = "Option 1 (2x Scale): Pristine Mesh -> Voxel Swap\n(Shoot to fracture into voxels | Press R to Reset)"
+
+	if _opt2_structure_id > 0:
+		terrain.remove_structure(_opt2_structure_id)
+	_opt2_structure_id = terrain.stamp_asset("moai_statue.vreg", OPT2_ORIGIN_CHUNK, 15.0)
+	print("[MoaiReset] Both 2x Moai statues restored to pristine state! (Option 2 id=#", _opt2_structure_id, ")")
+	if _companion_initialized and _goal_mesh_inst.visible:
+		_has_pending_path_query = true
+
 func _setup_path_debug_visuals() -> void:
-	# 1. Cyan capsule marker on VoxelAICompanion so you can see it walk along the path
 	_companion_mesh_inst = MeshInstance3D.new()
 	var cap := CapsuleMesh.new()
 	cap.radius = 0.6
@@ -67,7 +222,6 @@ func _setup_path_debug_visuals() -> void:
 	_companion_mesh_inst.position = Vector3(0.0, 0.9, 0.0)
 	ai_companion.add_child(_companion_mesh_inst)
 
-	# 2. Gold sphere marker at the path Goal
 	_goal_mesh_inst = MeshInstance3D.new()
 	var sph := SphereMesh.new()
 	sph.radius = 0.55
@@ -81,7 +235,6 @@ func _setup_path_debug_visuals() -> void:
 	_goal_mesh_inst.visible = false
 	add_child(_goal_mesh_inst)
 
-	# 3. 3D Line Strip (ImmediateMesh) for rendering the computed waypoint path
 	_path_mesh_inst = MeshInstance3D.new()
 	_path_immediate_mesh = ImmediateMesh.new()
 	var line_mat := StandardMaterial3D.new()
@@ -115,6 +268,12 @@ func _unhandled_input(event: InputEvent) -> void:
 		elif event.keycode == KEY_4:
 			_selected_element_kind = 3
 			print("[Tool] Selected 4: Lava / Magma (Soil -> Lava, Melts Ice -> Air)")
+		elif event.keycode == KEY_5:
+			_stamp_asset_at_crosshair("ancient_ruin.vreg", 15.0, Vector3(128.0, 128.0, 128.0))
+		elif event.keycode == KEY_6:
+			_stamp_asset_at_crosshair("moai_statue.vreg", 15.0, MOAI_REGION_CENTER)
+		elif event.keycode == KEY_R:
+			_reset_moai_statues()
 		elif event.keycode == KEY_P:
 			_place_companion_at_crosshair()
 
@@ -184,16 +343,13 @@ func _apply_companion_gravity_and_ground_snap(delta: float) -> void:
 	if not hit.is_empty():
 		var ground_y: float = hit.position.y + 0.15
 		if cur.y > ground_y + 0.35:
-			# Ground was carved away beneath the pill -> fall with gravity into the crater!
 			_companion_vertical_vel = min(_companion_vertical_vel + companion_gravity * delta, 40.0)
 			cur.y = max(ground_y, cur.y - _companion_vertical_vel * delta)
 			ai_companion.global_position = cur
-			# Once it lands on the new floor, trigger a fresh path query from its landed position
 			if cur.y <= ground_y + 0.05 and _goal_mesh_inst.visible:
 				_companion_vertical_vel = 0.0
 				_has_pending_path_query = true
 		else:
-			# Smoothly step up/down onto newly added Ice Bridges or slopes beneath the pill
 			_companion_vertical_vel = 0.0
 			cur.y = ground_y
 			ai_companion.global_position = cur
@@ -201,12 +357,33 @@ func _apply_companion_gravity_and_ground_snap(delta: float) -> void:
 func _fire_raycast_action() -> void:
 	var hit := _raycast_crosshair()
 	var target_pos: Vector3 = hit.position if not hit.is_empty() else (camera.global_position - camera.global_transform.basis.z * 24.0)
+	var hit_collider: Object = hit.get("collider") if not hit.is_empty() else null
+
+	_check_and_swap_opt1_moai_on_blast(target_pos, explosion_radius, hit_collider)
+
 	if _companion_initialized and _goal_mesh_inst.visible:
 		_rebake_in_progress = true
 	if _selected_element_kind == 0:
 		terrain.trigger_explosion(target_pos, explosion_radius)
 	else:
 		terrain.trigger_elemental_sphere(target_pos, explosion_radius, _selected_element_kind)
+
+func _stamp_asset_at_crosshair(vreg_path: String, recreate_delay: float, region_center: Vector3) -> void:
+	var hit := _raycast_crosshair()
+	var stamp_world_pos: Vector3 = hit.position if not hit.is_empty() else (camera.global_position - camera.global_transform.basis.z * 30.0)
+	var origin_chunk := Vector3(
+		floor((stamp_world_pos.x - region_center.x) / 32.0),
+		floor((stamp_world_pos.y - region_center.y) / 32.0),
+		floor((stamp_world_pos.z - region_center.z) / 32.0)
+	)
+	var struct_id := terrain.stamp_asset(vreg_path, origin_chunk, recreate_delay)
+	if struct_id > 0:
+		print("[AssetStamp] Stamped '", vreg_path, "' #", struct_id, " at chunk ", origin_chunk,
+			" (recreate_delay=", recreate_delay, "s)")
+		if _companion_initialized and _goal_mesh_inst.visible:
+			_has_pending_path_query = true
+	else:
+		push_warning("[AssetStamp] Failed to stamp asset from " + vreg_path)
 
 func _place_companion_at_crosshair() -> void:
 	var hit := _raycast_crosshair()
@@ -224,7 +401,6 @@ func _query_companion_cave_path_to_crosshair() -> void:
 	var hit := _raycast_crosshair()
 	var goal_pos: Vector3 = (hit.position + Vector3(0.0, 0.15, 0.0)) if not hit.is_empty() else camera.global_position
 
-	# First RMB click places the companion if it hasn't been placed on the surface yet
 	if not _companion_initialized:
 		ai_companion.global_position = goal_pos
 		_companion_vertical_vel = 0.0
@@ -259,9 +435,6 @@ func _poll_pending_path_query() -> void:
 	_current_waypoint_idx = 0
 	_draw_path_ribbon(draped_path)
 
-## Subdivides Detour's string-pulled segments every ~1.25m and snaps their Y coordinate
-## onto the physical terrain/Ice Bridge surface so the green ribbon and companion follow
-## the true 3D contour of craters, hills, and Ice Bridges without cutting through mid-air.
 func _drape_path_onto_terrain(raw_path: PackedVector3Array) -> PackedVector3Array:
 	var out := PackedVector3Array()
 	if raw_path.is_empty():
@@ -320,7 +493,6 @@ func _on_explosion_requested(pos: Vector3, radius: float) -> void:
 
 func _on_explosion_completed(pos: Vector3, radius: float, affected_chunks: int) -> void:
 	print("[VoxelTerrain3D] Action completed at ", pos, " radius=", radius, " chunks=", affected_chunks)
-	# Snap the goal sphere onto the updated terrain / Ice Bridge surface
 	if _goal_mesh_inst.visible:
 		var g_hit := _raycast_ground_at(_pending_path_goal, 6.0, 32.0)
 		if not g_hit.is_empty():
@@ -335,3 +507,16 @@ func _on_explosion_failed(reason: String) -> void:
 
 func _on_chunk_committed(_chunk_key: int) -> void:
 	_committed_chunk_count += 1
+
+func _on_structure_damaged(structure_id: int, struct_name: String) -> void:
+	print("[Structure] Stamped structure #", structure_id, " ('", struct_name, "') damaged!")
+
+func _on_structure_recreated(structure_id: int, struct_name: String) -> void:
+	print("[Structure] Stamped structure #", structure_id, " ('", struct_name, "') timer elapsed: FULLY RECONSTITUTED from original TSDF + RGB5551 colors!")
+	if _companion_initialized and _goal_mesh_inst.visible:
+		_has_pending_path_query = true
+
+func _on_structure_removed(structure_id: int, struct_name: String) -> void:
+	print("[Structure] Stamped structure #", structure_id, " ('", struct_name, "') removed -> pre-stamp chunk baseline restored!")
+	if _companion_initialized and _goal_mesh_inst.visible:
+		_has_pending_path_query = true

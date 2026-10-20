@@ -57,10 +57,12 @@ PackedVector3Array VoxelAICompanion::get_voxel_path(Vector3 p_start, Vector3 p_e
 
         if (terrain_node_) {
             const auto& nav_mgr = terrain_node_->get_navigation_manager();
+            const float nav_scale = nav_mgr.voxel_scale();
+            const float inv_scale = (nav_scale > 0.0f) ? (1.0f / nav_scale) : 1.0f;
             const voxel::ChunkKey mid_ck = voxel::ChunkKey::from_world_sample(
-                static_cast<int32_t>(std::floor(midpoint.x)),
-                static_cast<int32_t>(std::floor(midpoint.y)),
-                static_cast<int32_t>(std::floor(midpoint.z)));
+                static_cast<int32_t>(std::floor(midpoint.x * inv_scale)),
+                static_cast<int32_t>(std::floor(midpoint.y * inv_scale)),
+                static_cast<int32_t>(std::floor(midpoint.z * inv_scale)));
             const voxel::NavigationGroupKey gk = voxel::NavigationGroupKey::from_chunk_key(mid_ck);
             if (const voxel::NavigationGroupState* g = nav_mgr.find_group(gk);
                 g != nullptr && g->assembled_source_faces.size() >= 3ULL) {

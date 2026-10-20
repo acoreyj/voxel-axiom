@@ -2,12 +2,27 @@ extends Node3D
 ## HLD v4.0 GDScript Demo Controller (`terrain_demo.gd`)
 ## Streams 32^3 chunks around the active Camera3D and applies terrain tools on
 ## left-click: keys 1-6 select add / explode / large-explode / paint / paint-delete /
-## place-boulder, where paint and paint-delete are hold-and-drag brushes. R toggles
-## the add/paint material between soil and 3-hit rock. Keys 7-9 fire Bananza-style
+## place-boulder, where paint and paint-delete are hold-and-drag brushes. Key C
+## selects a much smaller chip blast (small_hit_radius) for sculpting fine craters.
+## T toggles the add/paint material between soil and 3-hit rock. Keys 7-9 fire Bananza-style
 ## elemental reaction spheres:
 ##   Key 7: Water Quench (turns Lava -> 3-hit Obsidian on contact & cools cracks)
 ##   Key 8: Frost / Ice Bridge (builds a flat-topped 31-deg ramped Ice Bridge & crater plug; flips Air/Water -> solid Ice & quenches Lava -> Obsidian)
 ##   Key 9: Lava / Magma (injects Lava, melts Ice -> Air, reacts with Water -> Obsidian)
+## Key 0 stamps an offline-baked `.vreg` ruin asset at the crosshair with the
+## reconstitution timer below; Key - (minus) stamps the same asset permanently
+## destroyed (no timer). Blast the stamped structure and it is either restored
+## after the quiet period or stays destroyed forever.
+## Side-by-side 2x-scale Moai statues are seeded on startup (see `_setup_side_by_side_moai_statues`):
+##   Option 1 `MoaiOption1_MeshSwap` shows a pristine 2x moai_statue.obj mesh + StaticBody3D
+##   until the first blast nearby, then swaps to a stamped moai_statue.vreg voxel structure.
+##   Option 2 `MoaiOption2_BakedVoxel` is stamped directly into VoxelTerrain3D with baked
+##   RGB5551 colors, 3-hit crack damage, raw interior craters and a 15 s reconstitution timer.
+## A second Atlas statue pair at z=-64 uses the same two styles, baked from atlas.glb:
+##   Option 1 `AtlasOption1_MeshSwap` swaps atlas.obj for models/atlas/atlas_statue.vreg.
+##   Option 2 `AtlasOption2_BakedVoxel` is stamped from the same watertight .vreg.
+## Key R resets all four statues (restores Option 1's pre-stamp chunks and pristine mesh);
+## Key T toggles the add/paint material between soil and 3-hit rock.
 ## Right-click queries a 3D cave navigation path to the crosshair hit point and draws
 ## it as a green 3D ribbon that the cyan companion marker walks along. P (or Shift + RMB)
 ## places / teleports the AI Companion start marker at the crosshair hit point.
@@ -21,6 +36,10 @@ extends Node3D
 @export var mouse_sensitivity: float = 0.0025
 @export var explosion_radius: float = 8.5
 @export var large_explosion_radius: float = 18.0
+## Small-chip blast (Key C): a much smaller carve for sculpting fine craters
+## into statues without destroying half the model per click. Still respects the
+## 3-hit hard-rock damage rules.
+@export var small_hit_radius: float = 1.5
 @export var add_radius: float = 6.0
 @export var paint_radius: float = 3.5
 @export var paint_delete_radius: float = 3.5
@@ -42,10 +61,29 @@ extends Node3D
 ## `boom_snap_lateral` releases the snap and starts a new spot.
 @export var boom_snap_depth_factor: float = 0.5
 @export var boom_snap_lateral: float = 0.75
+## Offline-baked ruin asset stamped by Key 0 / Key - (see the `voxel_baker` CLI:
+## `voxel_baker ancient_ruin.obj ancient_ruin.vreg`). Place the .vreg next to
+## this scene or point this at any other exported region file.
+@export var stamp_asset_path: String = "res://ancient_ruin.vreg"
+## Reconstitution quiet period for Key 0 stamps, in seconds. Key - stamps the
+## same region with 0.0 so it stays permanently destroyed once blasted.
+@export var stamp_recreate_delay_seconds: float = 15.0
+## Moai statue assets for the side-by-side demo. `moai_vreg_path` is produced by
+## the voxel_baker CLI from the 2x-scale (48 m) OBJ + albedo at 0.5 m voxels, and
+## is stamped directly into the terrain for both demo options.
+@export var moai_mesh_path: String = "res://models/moai_statue.obj"
+@export var moai_albedo_path: String = "res://models/moai_albedo.png"
+@export var moai_vreg_path: String = "moai_statue.vreg"
+## Atlas statue assets for the second side-by-side demo pair. `atlas_statue.vreg`
+## is baked from models/atlas/atlas.glb's 5.333x (48 m tall) OBJ + albedo at
+## 0.5 m voxels with `--watertight --color-depth 2.8`.
+@export var atlas_mesh_path: String = "res://models/atlas/atlas.obj"
+@export var atlas_albedo_path: String = "res://models/atlas/atlas_albedo.png"
+@export var atlas_vreg_path: String = "models/atlas/atlas_statue.vreg"
 
-enum Tool { ADD_TERRAIN, EXPLODE, LARGE_EXPLODE, PAINT, PAINT_DELETE, BOULDER, WATER_QUENCH, FROST_ICE, LAVA_MAGMA }
+enum Tool { ADD_TERRAIN, EXPLODE, LARGE_EXPLODE, PAINT, PAINT_DELETE, BOULDER, WATER_QUENCH, FROST_ICE, LAVA_MAGMA, SMALL_HIT }
 
-const TOOL_NAMES := ["Add terrain", "Explode", "Large explode", "Paint terrain", "Paint delete", "Place boulder", "Water quench", "Frost / Ice", "Lava / Magma"]
+const TOOL_NAMES := ["Add terrain", "Explode", "Large explode", "Paint terrain", "Paint delete", "Place boulder", "Water quench", "Frost / Ice", "Lava / Magma", "Small hit"]
 const MATERIAL_NAMES := ["Soil", "Rock"]
 ## MaterialHardness::kMaterial* IDs -> display names for the "Looking at" HUD readout.
 const MATERIAL_ID_NAMES := ["Air", "Soil", "Hard Rock", "Lava", "Water", "Obsidian", "Ice", "Boulder"]
@@ -58,10 +96,53 @@ const ELEMENTAL_WATER := 1
 const ELEMENTAL_FROST := 2
 const ELEMENTAL_LAVA := 3
 
+## Side-by-side 2x Moai statue placement. `moai_statue.vreg` is baked at
+## voxel_scale = 0.5 m with target region center (160, 160, 128) at 48 m tall
+## x 23.1 m wide x 21.2 m deep, so stamping at `origin_chunk` puts the statue
+## center at `(origin_chunk * 32 + MOAI_REGION_CENTER) * voxel_scale` and its
+## base at region sample 112 (= 160 - 24 m half height / 0.5 m per voxel).
+const MOAI_REGION_CENTER := Vector3(160.0, 160.0, 128.0)
+const OPT1_ORIGIN_CHUNK := Vector3(-5.0, -2.0, -4.0) # World center: (-16, 96, 0), base at y=72 buried in the ground
+const OPT1_WORLD_CENTER := Vector3(-16.0, 96.0, 0.0)
+const OPT2_ORIGIN_CHUNK := Vector3(-4.0, -2.0, -4.0) # World center: (+16, 96, 0), base at y=72 buried in the ground
+const OPT2_WORLD_CENTER := Vector3(16.0, 96.0, 0.0)
+const MOAI_HALF_EXTENTS := Vector3(13.0, 25.0, 12.0)
+## Model base in region-sample coords for the (160,160,128)-centred 0.5 m bake;
+## used to seat the statue on the terrain at the 32-sample chunk quantisation.
+const MOAI_BASE_LOCAL_Y := 112.0
+## The exported 2x OBJ has its origin at the statue mid-point (y -24..24 m), so
+## the model center used for blast-proximity tests sits 24 m above the base.
+const MOAI_MESH_CENTER_OFFSET_Y := 24.0
+## Because the 2x OBJ origin already coincides with the model center, the pristine
+## MeshInstance3D root is placed directly at `_opt1_world_center` (no base/rebase
+## subtraction the way a base-origin OBJ would need).
+const MOAI_ROOT_OFFSET_Y := 0.0
+
+## Second side-by-side pair: the Atlas statue at z=-64. The source atlas.glb is
+## 9 m tall, so it is baked at 5.333x to match the 48 m Moai pair and shares the
+## same region center/base placement. Its exported OBJ origin is at the feet
+## (y 0..48), so the pristine mesh root is seated 24 m above the statue center.
+const ATLAS_REGION_CENTER := Vector3(160.0, 160.0, 128.0)
+const ATLAS_BASE_LOCAL_Y := 112.0
+const ATLAS_HALF_EXTENTS := Vector3(13.0, 25.0, 13.0)
+const ATLAS_ROOT_OFFSET_Y := 24.0
+const ATLAS_OPT1_WORLD_CENTER := Vector3(-16.0, 96.0, -64.0)
+const ATLAS_OPT2_WORLD_CENTER := Vector3(16.0, 96.0, -64.0)
+
 @onready var terrain: VoxelTerrain3D = $VoxelTerrain3D
 @onready var ai_companion: VoxelAICompanion = $VoxelAICompanion
 @onready var camera: Camera3D = $Camera3D
 @onready var stats_label: Label = $HUD/StatsLabel
+@onready var opt1_root: Node3D = $MoaiOption1_MeshSwap
+@onready var opt1_mesh_inst: MeshInstance3D = $MoaiOption1_MeshSwap/PristineMesh
+@onready var opt1_static_body: StaticBody3D = $MoaiOption1_MeshSwap/StaticBody3D
+@onready var opt1_col_shape: CollisionShape3D = $MoaiOption1_MeshSwap/StaticBody3D/CollisionShape3D
+@onready var opt1_label: Label3D = $MoaiOption1_MeshSwap/Label3D
+@onready var atlas_opt1_root: Node3D = $AtlasOption1_MeshSwap
+@onready var atlas_opt1_mesh_inst: MeshInstance3D = $AtlasOption1_MeshSwap/PristineMesh
+@onready var atlas_opt1_static_body: StaticBody3D = $AtlasOption1_MeshSwap/StaticBody3D
+@onready var atlas_opt1_col_shape: CollisionShape3D = $AtlasOption1_MeshSwap/StaticBody3D/CollisionShape3D
+@onready var atlas_opt1_label: Label3D = $AtlasOption1_MeshSwap/Label3D
 
 var _yaw: float = 0.0
 var _pitch: float = -0.25
@@ -96,6 +177,23 @@ var _goal_mesh_inst: MeshInstance3D = null
 var _path_mesh_inst: MeshInstance3D = null
 var _path_immediate_mesh: ImmediateMesh = null
 
+var _opt1_swapped_to_voxels: bool = false
+var _opt1_structure_id: int = 0
+var _opt2_structure_id: int = 0
+## Surface-resolved placement (computed on startup / reset, not fixed in the scene).
+var _opt1_world_center: Vector3 = OPT1_WORLD_CENTER
+var _opt2_world_center: Vector3 = OPT2_WORLD_CENTER
+var _opt1_origin_chunk: Vector3 = OPT1_ORIGIN_CHUNK
+var _opt2_origin_chunk: Vector3 = OPT2_ORIGIN_CHUNK
+
+var _atlas_opt1_swapped_to_voxels: bool = false
+var _atlas_opt1_structure_id: int = 0
+var _atlas_opt2_structure_id: int = 0
+var _atlas_opt1_world_center: Vector3 = ATLAS_OPT1_WORLD_CENTER
+var _atlas_opt2_world_center: Vector3 = ATLAS_OPT2_WORLD_CENTER
+var _atlas_opt1_origin_chunk: Vector3 = Vector3.ZERO
+var _atlas_opt2_origin_chunk: Vector3 = Vector3.ZERO
+
 func _ready() -> void:
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 	terrain.explosion_requested.connect(_on_explosion_requested)
@@ -105,8 +203,14 @@ func _ready() -> void:
 	terrain.terrain_add_completed.connect(_on_terrain_add_completed)
 	terrain.terrain_add_failed.connect(_on_terrain_add_failed)
 	terrain.chunk_committed.connect(_on_chunk_committed)
+	terrain.structure_damaged.connect(_on_structure_damaged)
+	terrain.structure_recreated.connect(_on_structure_recreated)
+	if terrain.has_signal("structure_removed"):
+		terrain.connect("structure_removed", Callable(self, "_on_structure_removed"))
 
 	_setup_path_debug_visuals()
+	_setup_side_by_side_moai_statues()
+	_setup_side_by_side_atlas_statues()
 	_update_stream_focus(true)
 
 func _setup_path_debug_visuals() -> void:
@@ -148,6 +252,308 @@ func _setup_path_debug_visuals() -> void:
 	_path_mesh_inst.material_override = line_mat
 	add_child(_path_mesh_inst)
 
+## Returns the stamp origin chunk that seats a voxel model's base on the terrain
+## surface at the requested world X/Z, keeping the region centred on `region_center`.
+func _statue_origin_for_surface(region_center: Vector3, base_local_y: float, world_x: float, world_z: float) -> Vector3:
+	var surface_y := terrain.get_surface_height(world_x, world_z)
+	# region_center/base_local_y are region-sample coordinates; convert the desired
+	# world placement into samples before solving for the origin chunk.
+	var inv_scale: float = 1.0 / terrain.voxel_scale
+	var origin_x := roundi((world_x * inv_scale - region_center.x) / 32.0)
+	var origin_z := roundi((world_z * inv_scale - region_center.z) / 32.0)
+	var origin_y := roundi((surface_y * inv_scale - base_local_y) / 32.0)
+	return Vector3(origin_x, origin_y, origin_z)
+
+func _moai_origin_for_surface(world_x: float, world_z: float) -> Vector3:
+	return _statue_origin_for_surface(MOAI_REGION_CENTER, MOAI_BASE_LOCAL_Y, world_x, world_z)
+
+func _atlas_origin_for_surface(world_x: float, world_z: float) -> Vector3:
+	return _statue_origin_for_surface(ATLAS_REGION_CENTER, ATLAS_BASE_LOCAL_Y, world_x, world_z)
+
+func _setup_side_by_side_moai_statues() -> void:
+	# 1. Option 1 (Left at x=-16, z=0): Load the 2x (48 m) moai_statue.obj +
+	#    albedo onto PristineMesh. It stays a normal mesh + StaticBody3D until the
+	#    first nearby blast, then swaps to a stamped voxel structure. Its height is
+	#    matched to Option 2's chunk-quantized base below so both stand level.
+	_load_pristine_moai_mesh_and_collider()
+	_opt1_swapped_to_voxels = false
+	_opt1_structure_id = 0
+	_opt1_origin_chunk = _moai_origin_for_surface(OPT1_WORLD_CENTER.x, OPT1_WORLD_CENTER.z)
+
+	# 2. Option 2 (Right at x=+16, z=0): Stamp moai_statue.vreg directly into
+	#    VoxelTerrain3D with per-voxel RGB5551 baked colors and a 15-second
+	#    auto-reconstitution timer, seated on the surface. A region's vertical
+	#    origin is quantized to a whole 32 m chunk, so its base can sit up to half
+	#    a chunk off the terrain; compute it first and seat Option 1 to match, so
+	#    the pristine .obj and the voxel statue stand at exactly the same level.
+	_opt2_origin_chunk = _moai_origin_for_surface(OPT2_WORLD_CENTER.x, OPT2_WORLD_CENTER.z)
+	_opt2_world_center = (_opt2_origin_chunk * 32.0 + MOAI_REGION_CENTER) * terrain.voxel_scale
+	_opt1_world_center = Vector3(OPT1_WORLD_CENTER.x, _opt2_world_center.y, OPT1_WORLD_CENTER.z)
+	opt1_root.global_position = _opt1_world_center - Vector3(0.0, MOAI_ROOT_OFFSET_Y, 0.0)
+
+	_opt2_structure_id = _stamp_structure(moai_vreg_path, _opt2_origin_chunk, 15.0)
+	if _opt2_structure_id <= 0:
+		push_warning("[MoaiDemo] Failed to stamp '%s' — bake it first: voxel_baker models/moai_statue.obj %s --voxel-scale 0.5 --watertight --texture models/moai_albedo.ppm --color-depth 2.8 --center-x 160 --center-y 160 --center-z 128" % [
+			moai_vreg_path, moai_vreg_path
+		])
+	print("[MoaiDemo] Option 1 (Pristine Mesh -> Voxel Swap) ready at ", _opt1_world_center,
+		" | Option 2 (Baked Per-Voxel Albedo, id=#", _opt2_structure_id, ") stamped at ", _opt2_world_center)
+
+func _setup_side_by_side_atlas_statues() -> void:
+	# Same two styles as the Moai pair, one row further down the view direction
+	# (z=-64). atlas.glb is baked at 5.333x so the statue is 48 m tall and shares
+	# the Moai region center/base, letting both pairs seat at the same terrain level.
+	_load_pristine_atlas_mesh_and_collider()
+	_atlas_opt1_swapped_to_voxels = false
+	_atlas_opt1_structure_id = 0
+	_atlas_opt1_origin_chunk = _atlas_origin_for_surface(ATLAS_OPT1_WORLD_CENTER.x, ATLAS_OPT1_WORLD_CENTER.z)
+
+	_atlas_opt2_origin_chunk = _atlas_origin_for_surface(ATLAS_OPT2_WORLD_CENTER.x, ATLAS_OPT2_WORLD_CENTER.z)
+	_atlas_opt2_world_center = (_atlas_opt2_origin_chunk * 32.0 + ATLAS_REGION_CENTER) * terrain.voxel_scale
+	_atlas_opt1_world_center = Vector3(ATLAS_OPT1_WORLD_CENTER.x, _atlas_opt2_world_center.y, ATLAS_OPT1_WORLD_CENTER.z)
+	atlas_opt1_root.global_position = _atlas_opt1_world_center - Vector3(0.0, ATLAS_ROOT_OFFSET_Y, 0.0)
+
+	_atlas_opt2_structure_id = _stamp_structure(atlas_vreg_path, _atlas_opt2_origin_chunk, 15.0)
+	if _atlas_opt2_structure_id <= 0:
+		push_warning("[AtlasDemo] Failed to stamp '%s' - bake it first: voxel_baker models/atlas/atlas.obj %s --voxel-scale 0.5 --watertight --texture models/atlas/atlas_albedo.ppm --color-depth 2.8 --center-x 160 --center-y 160 --center-z 128" % [
+			atlas_vreg_path, atlas_vreg_path
+		])
+	print("[AtlasDemo] Option 1 (Pristine Mesh -> Voxel Swap) ready at ", _atlas_opt1_world_center,
+		" | Option 2 (Baked Per-Voxel Albedo, id=#", _atlas_opt2_structure_id, ") stamped at ", _atlas_opt2_world_center)
+
+func _load_pristine_moai_mesh_and_collider() -> void:
+	var mesh_candidates: Array[String] = [
+		moai_mesh_path,
+		"res://models/moai_statue.obj",
+		"res://moai_statue.obj",
+		"res://update/moai_statue.obj",
+		"moai_statue.obj",
+	]
+	var albedo_candidates: Array[String] = [
+		moai_albedo_path,
+		"res://models/moai_albedo.png",
+		"res://moai_albedo.png",
+		"res://update/moai_albedo.png",
+		"moai_albedo.png",
+	]
+	_load_pristine_statue_mesh(mesh_candidates, albedo_candidates, opt1_mesh_inst, opt1_col_shape, "MoaiDemo")
+
+func _load_pristine_atlas_mesh_and_collider() -> void:
+	var mesh_candidates: Array[String] = [
+		atlas_mesh_path,
+		"res://models/atlas/atlas.obj",
+		"models/atlas/atlas.obj",
+	]
+	var albedo_candidates: Array[String] = [
+		atlas_albedo_path,
+		"res://models/atlas/atlas_albedo.png",
+		"models/atlas/atlas_albedo.png",
+	]
+	_load_pristine_statue_mesh(mesh_candidates, albedo_candidates, atlas_opt1_mesh_inst, atlas_opt1_col_shape, "AtlasDemo")
+
+func _load_pristine_statue_mesh(mesh_candidates: Array[String], albedo_candidates: Array[String], target_mesh: MeshInstance3D, target_shape: CollisionShape3D, tag: String) -> void:
+	var f: FileAccess = null
+	for path in mesh_candidates:
+		f = FileAccess.open(path, FileAccess.READ)
+		if f != null:
+			break
+	if f == null:
+		push_warning("[%s] Could not open .obj for Option 1 PristineMesh" % tag)
+		return
+
+	var raw_positions := PackedVector3Array()
+	var raw_uvs := PackedVector2Array()
+	var out_verts := PackedVector3Array()
+	var out_norms := PackedVector3Array()
+	var out_uvs := PackedVector2Array()
+
+	while not f.eof_reached():
+		var line := f.get_line().strip_edges()
+		if line.is_empty() or line.begins_with("#"):
+			continue
+		var parts := line.split(" ", false)
+		if parts.is_empty():
+			continue
+		if parts[0] == "v" and parts.size() >= 4:
+			raw_positions.push_back(Vector3(parts[1].to_float(), parts[2].to_float(), parts[3].to_float()))
+		elif parts[0] == "vt" and parts.size() >= 3:
+			raw_uvs.push_back(Vector2(parts[1].to_float(), 1.0 - parts[2].to_float()))
+		elif parts[0] == "f" and parts.size() >= 4:
+			var face_v: Array[int] = []
+			var face_vt: Array[int] = []
+			for i in range(1, parts.size()):
+				var sub := parts[i].split("/")
+				face_v.push_back(sub[0].to_int() - 1)
+				if sub.size() > 1 and not sub[1].is_empty():
+					face_vt.push_back(sub[1].to_int() - 1)
+				else:
+					face_vt.push_back(0)
+			for i in range(1, face_v.size() - 1):
+				var i0 := face_v[0]
+				var i1 := face_v[i]
+				var i2 := face_v[i + 1]
+				var p0 := raw_positions[i0]
+				var p1 := raw_positions[i1]
+				var p2 := raw_positions[i2]
+				var n := (p1 - p0).cross(p2 - p0).normalized()
+				out_verts.push_back(p0)
+				out_verts.push_back(p2)
+				out_verts.push_back(p1)
+				out_norms.push_back(n)
+				out_norms.push_back(n)
+				out_norms.push_back(n)
+				if not raw_uvs.is_empty():
+					out_uvs.push_back(raw_uvs[face_vt[0]])
+					out_uvs.push_back(raw_uvs[face_vt[i + 1]])
+					out_uvs.push_back(raw_uvs[face_vt[i]])
+
+	var arrays := []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = out_verts
+	arrays[Mesh.ARRAY_NORMAL] = out_norms
+	if out_uvs.size() == out_verts.size():
+		arrays[Mesh.ARRAY_TEX_UV] = out_uvs
+
+	var arr_mesh := ArrayMesh.new()
+	arr_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+
+	var mat := StandardMaterial3D.new()
+	mat.roughness = 0.78
+	var albedo_loaded := false
+	for path in albedo_candidates:
+		if not ResourceLoader.exists(path):
+			continue
+		var tex := load(path) as Texture2D
+		if tex != null:
+			mat.albedo_texture = tex
+			albedo_loaded = true
+			break
+	# Fallback for a raw PNG that has not been imported as a Texture2D resource yet.
+	if not albedo_loaded:
+		for path in albedo_candidates:
+			var img := Image.new()
+			if img.load(path) == OK:
+				mat.albedo_texture = ImageTexture.create_from_image(img)
+				albedo_loaded = true
+				break
+	if not albedo_loaded:
+		mat.albedo_color = Color(0.57, 0.52, 0.45)
+
+	target_mesh.mesh = arr_mesh
+	target_mesh.material_override = mat
+	target_mesh.visible = true
+
+	var shape := ConcavePolygonShape3D.new()
+	shape.set_faces(out_verts)
+	target_shape.shape = shape
+	target_shape.disabled = false
+
+## Option 1 starts as a pristine mesh. The first explosion or elemental sphere
+## whose blast volume reaches the statue (or that directly hits its StaticBody3D)
+## hides the mesh/collider and stamps the exact same Moai into the voxel terrain,
+## immediately followed by the normal crater carve in the same frame.
+func _check_and_swap_opt1_moai_on_blast(blast_pos: Vector3, blast_radius: float, hit_collider: Object) -> void:
+	if _opt1_swapped_to_voxels:
+		return
+	var direct_hit := (hit_collider == opt1_static_body)
+	var dx: float = max(0.0, abs(blast_pos.x - _opt1_world_center.x) - MOAI_HALF_EXTENTS.x)
+	var dy: float = max(0.0, abs(blast_pos.y - _opt1_world_center.y) - MOAI_HALF_EXTENTS.y)
+	var dz: float = max(0.0, abs(blast_pos.z - _opt1_world_center.z) - MOAI_HALF_EXTENTS.z)
+	var dist_to_box := sqrt(dx * dx + dy * dy + dz * dz)
+
+	if direct_hit or dist_to_box <= blast_radius + 2.0:
+		opt1_mesh_inst.visible = false
+		opt1_col_shape.disabled = true
+		_opt1_structure_id = _stamp_structure(moai_vreg_path, _opt1_origin_chunk, 0.0)
+		_opt1_swapped_to_voxels = true
+		opt1_label.text = "Option 1 (2x Scale): SWAPPED TO VOXELS (#%d)\n(Carve freely | Press R to restore Pristine Mesh)" % _opt1_structure_id
+		print("[MoaiSwap] Option 1 Moai hit at ", blast_pos, " -> Hid PristineMesh & stamped Voxel Structure #", _opt1_structure_id, "!")
+
+## Same pristine-mesh-to-voxel swap for the Atlas Option 1 statue.
+func _check_and_swap_atlas_opt1_on_blast(blast_pos: Vector3, blast_radius: float, hit_collider: Object) -> void:
+	if _atlas_opt1_swapped_to_voxels:
+		return
+	var direct_hit := (hit_collider == atlas_opt1_static_body)
+	var dx: float = max(0.0, abs(blast_pos.x - _atlas_opt1_world_center.x) - ATLAS_HALF_EXTENTS.x)
+	var dy: float = max(0.0, abs(blast_pos.y - _atlas_opt1_world_center.y) - ATLAS_HALF_EXTENTS.y)
+	var dz: float = max(0.0, abs(blast_pos.z - _atlas_opt1_world_center.z) - ATLAS_HALF_EXTENTS.z)
+	var dist_to_box := sqrt(dx * dx + dy * dy + dz * dz)
+
+	if direct_hit or dist_to_box <= blast_radius + 2.0:
+		atlas_opt1_mesh_inst.visible = false
+		atlas_opt1_col_shape.disabled = true
+		_atlas_opt1_structure_id = _stamp_structure(atlas_vreg_path, _atlas_opt1_origin_chunk, 0.0)
+		_atlas_opt1_swapped_to_voxels = true
+		atlas_opt1_label.text = "Atlas Option 1 (5.33x Scale): SWAPPED TO VOXELS (#%d)\n(Carve freely | Press R to restore Pristine Mesh)" % _atlas_opt1_structure_id
+		print("[AtlasSwap] Option 1 Atlas hit at ", blast_pos, " -> Hid PristineMesh & stamped Voxel Structure #", _atlas_opt1_structure_id, "!")
+
+## Key R reset loop. Option 1 is removed via terrain.remove_structure(), which
+## restores the pre-stamp chunks bit-exactly and brings back the pristine mesh +
+## collider. Option 2 is re-stamped if it was removed successfully.
+func _reset_statues() -> void:
+	_reset_moai_statues()
+	_reset_atlas_statues()
+
+func _reset_moai_statues() -> void:
+	if _opt1_swapped_to_voxels and _opt1_structure_id > 0:
+		var ok := _remove_structure(_opt1_structure_id)
+		print("[MoaiReset] Removed Option 1 voxel structure #", _opt1_structure_id, " (restored pre-stamp chunks: ", ok, ")")
+	_opt1_swapped_to_voxels = false
+	_opt1_structure_id = 0
+	opt1_mesh_inst.visible = true
+	opt1_col_shape.disabled = false
+	opt1_label.text = "Option 1 (2x Scale): Pristine Mesh -> Voxel Swap\n(Shoot to fracture into voxels | Press R to Reset)"
+
+	var can_restamp_opt2 := true
+	if _opt2_structure_id > 0:
+		can_restamp_opt2 = _remove_structure(_opt2_structure_id)
+	_opt2_structure_id = 0
+	if can_restamp_opt2:
+		_opt2_structure_id = _stamp_structure(moai_vreg_path, _opt2_origin_chunk, 15.0)
+	print("[MoaiReset] Both Moai statues restored to pristine state! (Option 2 id=#", _opt2_structure_id, ")")
+	if _companion_initialized and _goal_mesh_inst.visible:
+		_has_pending_path_query = true
+
+func _reset_atlas_statues() -> void:
+	if _atlas_opt1_swapped_to_voxels and _atlas_opt1_structure_id > 0:
+		var ok := _remove_structure(_atlas_opt1_structure_id)
+		print("[AtlasReset] Removed Option 1 voxel structure #", _atlas_opt1_structure_id, " (restored pre-stamp chunks: ", ok, ")")
+	_atlas_opt1_swapped_to_voxels = false
+	_atlas_opt1_structure_id = 0
+	atlas_opt1_mesh_inst.visible = true
+	atlas_opt1_col_shape.disabled = false
+	atlas_opt1_label.text = "Atlas Option 1 (5.33x Scale): Pristine Mesh -> Voxel Swap\n(Shoot to fracture into voxels | Press R to Reset)"
+
+	var can_restamp_opt2 := true
+	if _atlas_opt2_structure_id > 0:
+		can_restamp_opt2 = _remove_structure(_atlas_opt2_structure_id)
+	_atlas_opt2_structure_id = 0
+	if can_restamp_opt2:
+		_atlas_opt2_structure_id = _stamp_structure(atlas_vreg_path, _atlas_opt2_origin_chunk, 15.0)
+	print("[AtlasReset] Both Atlas statues restored to pristine state! (Option 2 id=#", _atlas_opt2_structure_id, ")")
+	if _companion_initialized and _goal_mesh_inst.visible:
+		_has_pending_path_query = true
+
+## Removes one stamped voxel structure. The reset binding lives in the
+## GDExtension core; if the loaded binary predates it, warn instead of crashing.
+func _remove_structure(structure_id: int) -> bool:
+	if structure_id <= 0:
+		return false
+	if not terrain.has_method("remove_structure"):
+		push_warning("[StatueReset] VoxelTerrain3D has no remove_structure(); rebuild the GDExtension with the asset-stamp reset binding.")
+		return false
+	var ok: bool = bool(terrain.call("remove_structure", structure_id))
+	return ok
+
+## Stamps a baked .vreg structure through the dynamic binding. Using `call()`
+## keeps the demo parsing when the editor still has an older GDExtension loaded;
+## the launched game process loads the freshly built one from disk.
+func _stamp_structure(vreg_path: String, origin: Vector3, recreate_delay: float) -> int:
+	if not terrain.has_method("stamp_asset"):
+		push_warning("[VoxelTerrain3D] stamp_asset() missing; rebuild the GDExtension.")
+		return 0
+	return int(terrain.call("stamp_asset", vreg_path, origin, recreate_delay))
+
 func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
 		_yaw -= event.relative.x * mouse_sensitivity
@@ -179,10 +585,18 @@ func _unhandled_input(event: InputEvent) -> void:
 				_set_tool(Tool.FROST_ICE)
 			KEY_9:
 				_set_tool(Tool.LAVA_MAGMA)
+			KEY_C:
+				_set_tool(Tool.SMALL_HIT)
 			KEY_R:
+				_reset_statues()
+			KEY_T:
 				_toggle_add_material()
 			KEY_P:
 				_place_companion_at_crosshair()
+			KEY_0:
+				_stamp_asset_at_crosshair(stamp_recreate_delay_seconds)
+			KEY_MINUS:
+				_stamp_asset_at_crosshair(0.0)
 
 	elif event is InputEventMouseButton:
 		if event.button_index == MOUSE_BUTTON_LEFT:
@@ -230,12 +644,14 @@ func _process(delta: float) -> void:
 
 func _update_stream_focus(force: bool) -> void:
 	var cur_pos := camera.global_position
+	# Chunks stay 32^3 samples, so their world size scales with the node's voxel size.
+	var chunk_size := 32.0 * terrain.voxel_scale
 	var cur_chunk := Vector3i(
-		int(floor(cur_pos.x / 32.0)),
-		int(floor(cur_pos.y / 32.0)),
-		int(floor(cur_pos.z / 32.0))
+		int(floor(cur_pos.x / chunk_size)),
+		int(floor(cur_pos.y / chunk_size)),
+		int(floor(cur_pos.z / chunk_size))
 	)
-	# Only call into C++ set_stream_focus when the camera crosses into a new 32^3 chunk!
+	# Only call into C++ set_stream_focus when the camera crosses into a new chunk!
 	if force or cur_chunk != _last_focus_chunk:
 		_last_focus_chunk = cur_chunk
 		terrain.set_stream_focus(cur_pos, _velocity)
@@ -259,14 +675,14 @@ func _update_hud(delta: float) -> void:
 
 	var material_state := ""
 	if _active_tool == Tool.ADD_TERRAIN or _active_tool == Tool.PAINT:
-		material_state = " | Material: %s (R)" % MATERIAL_NAMES[_add_material - 1]
+		material_state = " | Material: %s (T)" % MATERIAL_NAMES[_add_material - 1]
 
 	_look_at_accum += delta
 	if _look_at_accum >= LOOK_AT_REFRESH_INTERVAL:
 		_look_at_accum = 0.0
 		_refresh_look_at_material()
 
-	stats_label.text = "FPS: %.0f  (%.2f ms)\nView dist: %d / %d chunks  (prefetch %d)\nCommitted: %d chunks  (%.0f/s)\nStreaming: %s\nLooking at: %s\nTool: [%d] %s%s | 1-9 select, LMB use, RMB path, P place" % [
+	stats_label.text = "FPS: %.0f  (%.2f ms)\nView dist: %d / %d chunks  (prefetch %d)\nCommitted: %d chunks  (%.0f/s)\nStreaming: %s\nLooking at: %s\nTool: [%d] %s%s | 1-9 select, C small hit, 0 stamp ruin, - permanent ruin, R reset statues, T material, LMB use, RMB path, P place" % [
 		_fps_smoothed,
 		1000.0 / max(_fps_smoothed, 1.0),
 		terrain.get_effective_view_distance_chunks(),
@@ -310,7 +726,7 @@ func _is_drag_tool() -> bool:
 
 func _is_boom_tool() -> bool:
 	return _active_tool == Tool.EXPLODE or _active_tool == Tool.LARGE_EXPLODE \
-		or _is_elemental_tool()
+		or _active_tool == Tool.SMALL_HIT or _is_elemental_tool()
 
 func _is_elemental_tool() -> bool:
 	return _active_tool == Tool.WATER_QUENCH or _active_tool == Tool.FROST_ICE \
@@ -325,6 +741,16 @@ func _is_elemental_tool() -> bool:
 ## of the blast radius and the aim did not slide sideways.
 func _apply_click_tool() -> void:
 	var point := _aim_point()
+	# Aiming straight at a pristine statue should blast its surface, not the
+	# terrain behind it, so the swap and the crater land on the same spot.
+	if _is_boom_tool() and (not _opt1_swapped_to_voxels or not _atlas_opt1_swapped_to_voxels):
+		var phys_hit := _raycast_crosshair()
+		if not phys_hit.is_empty():
+			var hit_collider: Object = phys_hit.get("collider")
+			if not _opt1_swapped_to_voxels and hit_collider == opt1_static_body:
+				point = phys_hit.position
+			elif not _atlas_opt1_swapped_to_voxels and hit_collider == atlas_opt1_static_body:
+				point = phys_hit.position
 	if _is_boom_tool():
 		if is_finite(_last_boom_point.x):
 			var forward := -camera.global_transform.basis.z
@@ -350,6 +776,8 @@ func _active_radius() -> float:
 			return paint_delete_radius
 		Tool.BOULDER:
 			return boulder_radius
+		Tool.SMALL_HIT:
+			return small_hit_radius
 		Tool.WATER_QUENCH, Tool.FROST_ICE, Tool.LAVA_MAGMA:
 			return elemental_radius
 		_:
@@ -382,6 +810,13 @@ func _apply_tool_at(point: Vector3) -> void:
 	if _companion_initialized and _goal_mesh_inst.visible \
 			and (_is_boom_tool() or _active_tool == Tool.PAINT_DELETE):
 		_rebake_in_progress = true
+	# First blast/elemental hit near either Option 1 statue swaps its pristine
+	# mesh for the stamped voxel version; the crater carve lands on the same frame.
+	if _is_boom_tool() and (not _opt1_swapped_to_voxels or not _atlas_opt1_swapped_to_voxels):
+		var hit := _raycast_crosshair()
+		var hit_collider: Object = hit.get("collider") if not hit.is_empty() else null
+		_check_and_swap_opt1_moai_on_blast(point, _active_radius(), hit_collider)
+		_check_and_swap_atlas_opt1_on_blast(point, _active_radius(), hit_collider)
 	match _active_tool:
 		Tool.ADD_TERRAIN:
 			terrain.add_terrain_with_material(point, add_radius, _add_material)
@@ -393,6 +828,8 @@ func _apply_tool_at(point: Vector3) -> void:
 			terrain.trigger_explosion(point, paint_delete_radius)
 		Tool.BOULDER:
 			terrain.place_boulder(point, boulder_radius)
+		Tool.SMALL_HIT:
+			terrain.trigger_explosion(point, small_hit_radius)
 		Tool.WATER_QUENCH:
 			terrain.trigger_elemental_sphere(point, elemental_radius, ELEMENTAL_WATER)
 		Tool.FROST_ICE:
@@ -442,6 +879,32 @@ func _apply_companion_gravity_and_ground_snap(delta: float) -> void:
 			_companion_vertical_vel = 0.0
 			cur.y = ground_y
 			ai_companion.global_position = cur
+
+## Stamps the configured offline-baked `.vreg` region at the crosshair with the given
+## reconstitution delay (0 or less keeps the ruin permanently destroyed once blasted).
+## Baked regions are auto-centered on their local sample (128, 128, 128) = local chunk
+## (4, 4, 4), so the origin is offset by that much to straddle the hit point.
+func _stamp_asset_at_crosshair(recreate_delay: float) -> void:
+	var hit := _raycast_crosshair()
+	if hit.is_empty():
+		print("[VoxelTerrain3D] Aim at terrain surface and press 0 (timed ruin) or - (permanent ruin) to stamp an asset.")
+		return
+	var hit_pos: Vector3 = hit.position
+	var chunk_size: float = 32.0 * terrain.voxel_scale
+	var origin := Vector3i(
+		int(floor(hit_pos.x / chunk_size)) - 4,
+		int(floor(hit_pos.y / chunk_size)) - 4,
+		int(floor(hit_pos.z / chunk_size)) - 4
+	)
+	var structure_id := _stamp_structure(stamp_asset_path, Vector3(origin), recreate_delay)
+	if structure_id > 0:
+		print("[VoxelTerrain3D] Stamped asset '%s' structure_id=%d at chunk %s delay=%.1fs" % [
+			stamp_asset_path, structure_id, str(origin), recreate_delay
+		])
+	else:
+		push_warning("[VoxelTerrain3D] Failed to stamp '%s' — bake one first: voxel_baker <model.obj> %s" % [
+			stamp_asset_path, stamp_asset_path
+		])
 
 func _place_companion_at_crosshair() -> void:
 	var hit := _raycast_crosshair()
@@ -595,3 +1058,26 @@ func _on_terrain_add_failed(reason: String) -> void:
 func _on_chunk_committed(_chunk_key: int) -> void:
 	_committed_chunk_count += 1
 	_commits_in_window += 1
+
+## A stamped structure was carved by an explosion/elemental reaction. Its
+## reconstitution timer is now counting down (permanent stamps ignore this).
+func _on_structure_damaged(structure_id: int, asset_name: String) -> void:
+	_print_throttled("[VoxelTerrain3D] Structure damaged: id=%d name=%s (reconstitution timer armed)" % [
+		structure_id, asset_name
+	])
+
+## A stamped structure's quiet period elapsed and its exact pre-damage voxels
+## were restored; its chunks were re-meshed and navmesh rebaked.
+func _on_structure_recreated(structure_id: int, asset_name: String) -> void:
+	print("[VoxelTerrain3D] Structure reconstituted: id=%d name=%s" % [structure_id, asset_name])
+	if _companion_initialized and _goal_mesh_inst.visible:
+		_has_pending_path_query = true
+
+## A stamped structure was removed by the reset loop; its pre-stamp chunk
+## baseline was restored, so re-plan any active companion path.
+func _on_structure_removed(structure_id: int, asset_name: String) -> void:
+	print("[VoxelTerrain3D] Structure removed: id=%d name=%s -> pre-stamp chunk baseline restored" % [
+		structure_id, asset_name
+	])
+	if _companion_initialized and _goal_mesh_inst.visible:
+		_has_pending_path_query = true

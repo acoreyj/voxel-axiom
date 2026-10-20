@@ -116,6 +116,96 @@ void test_world_seed_roundtrip() {
     std::printf("[PASS] test_world_seed_roundtrip (default 1337, set/get round-trips)\n");
 }
 
+void test_voxel_scale_roundtrip() {
+    ++g_tests_run;
+
+    VoxelTerrain3D terrain;
+    REQUIRE(std::abs(terrain.get_voxel_scale() - 1.0f) < 1e-6f);
+
+    terrain.set_voxel_scale(0.5f);
+    REQUIRE(std::abs(terrain.get_voxel_scale() - 0.5f) < 1e-6f);
+
+    terrain.set_voxel_scale(0.01f);
+    REQUIRE(std::abs(terrain.get_voxel_scale() - 0.125f) < 1e-6f);
+
+    terrain.set_voxel_scale(16.0f);
+    REQUIRE(std::abs(terrain.get_voxel_scale() - 4.0f) < 1e-6f);
+
+    std::printf("[PASS] test_voxel_scale_roundtrip (default 1.0 m, clamped to [0.125, 4.0])\n");
+}
+
+void test_gdextension_fine_voxel_scale_streaming_and_edits() {
+    ++g_tests_run;
+
+    const std::filesystem::path save_dir = "/tmp/voxel_gdextension_voxel_scale_test";
+    std::filesystem::remove_all(save_dir);
+
+    VoxelTerrain3D terrain;
+    terrain.set_save_directory_path(save_dir.string());
+    terrain.set_voxel_scale(0.5f);
+    terrain.set_view_distance_chunks(1);
+    terrain.set_prefetch_distance_chunks(0);
+    terrain.set_world_height_chunks(6);
+    terrain.set_upload_budget_ms(8.0f);
+    terrain._enter_tree();
+
+    // Stream around the world-space surface. A correct focus mapping lands on
+    // grid sample 136 = chunk y 4 at 0.5 m/voxel; a broken one would stream chunk y 2.
+    terrain.set_stream_focus(Vector3(8.0f, 68.0f, 8.0f), Vector3(0.0f, 0.0f, 0.0f));
+    wait_until_terrain_fully_committed(terrain);
+
+    const float surface_y = terrain.get_surface_height(8.0f, 8.0f);
+    // A generator that ignored voxel_scale would place the surface near world y=34.
+    REQUIRE(surface_y > 40.0f);
+    REQUIRE(surface_y < 92.0f);
+
+    const Vector3 down_hit =
+        terrain.raycast_terrain(Vector3(8.0f, 92.0f, 8.0f), Vector3(8.0f, 0.0f, 8.0f));
+    REQUIRE(std::isfinite(down_hit.x));
+    // Raycast returns world meters: the hit must sit near the queried surface.
+    REQUIRE(std::abs(down_hit.y - surface_y) < 2.0f);
+    const int material =
+        terrain.raycast_terrain_material(Vector3(8.0f, 92.0f, 8.0f), Vector3(8.0f, 0.0f, 8.0f));
+    REQUIRE(material >= 0);
+
+    // Explosion and fill inputs are world meters; completion signals must echo them.
+    const Vector3 blast_center(8.0f, surface_y, 8.0f);
+    terrain.trigger_explosion(blast_center, 3.0f);
+    REQUIRE(terrain.emitted_signals().back().name == "explosion_requested");
+    REQUIRE(std::abs(terrain.emitted_signals().back().radius - 3.0f) < 1e-6f);
+
+    wait_until_terrain_fully_committed(terrain);
+
+    bool saw_explosion_completed = false;
+    for (const auto& sig : terrain.emitted_signals()) {
+        if (sig.name == "explosion_completed") {
+            saw_explosion_completed = true;
+            REQUIRE(std::abs(sig.position.x - blast_center.x) < 0.01f);
+            REQUIRE(std::abs(sig.position.y - blast_center.y) < 0.01f);
+            REQUIRE(std::abs(sig.position.z - blast_center.z) < 0.01f);
+            REQUIRE(std::abs(sig.radius - 3.0f) < 1e-6f);
+        }
+    }
+    REQUIRE(saw_explosion_completed);
+
+    terrain.add_terrain(blast_center, 3.0f);
+    wait_until_terrain_fully_committed(terrain);
+
+    bool saw_fill_completed = false;
+    for (const auto& sig : terrain.emitted_signals()) {
+        if (sig.name == "terrain_add_completed") {
+            saw_fill_completed = true;
+            REQUIRE(std::abs(sig.radius - 3.0f) < 1e-6f);
+        }
+    }
+    REQUIRE(saw_fill_completed);
+
+    terrain._exit_tree();
+    std::filesystem::remove_all(save_dir);
+
+    std::printf("[PASS] test_gdextension_fine_voxel_scale_streaming_and_edits (0.5 m voxels: stream, raycast, world-space edit signals verified)\n");
+}
+
 void test_gdextension_streaming_explosion_and_nav_lifecycle() {
     ++g_tests_run;
 
@@ -403,16 +493,95 @@ void test_gdextension_mid_path_terrain_removal_and_frost_bridge_addition() {
     std::printf("[PASS] test_gdextension_mid_path_terrain_removal_and_frost_bridge_addition (mid-walk crater & Ice bridge reroute verified)\n");
 }
 
+// ============================================================================
+// 3. End-to-End Side-by-Side Moai Statue Stamp, Per-Voxel Baked Albedo Commit,
+//    and remove_structure() Reset Loop via VoxelTerrain3D
+// ============================================================================
+void test_gdextension_moai_stamp_baked_colors_and_remove_structure() {
+    ++g_tests_run;
+
+    const std::filesystem::path save_dir = "/tmp/voxel_gdextension_moai_test";
+    std::filesystem::remove_all(save_dir);
+
+    VoxelTerrain3D terrain;
+    terrain.set_save_directory_path(save_dir.string());
+    terrain.set_view_distance_chunks(2);
+    terrain.set_prefetch_distance_chunks(0);
+    terrain.set_world_height_chunks(4);
+    terrain.set_upload_budget_ms(8.0f);
+    terrain._enter_tree();
+
+    std::size_t painted_vertices_committed = 0;
+    terrain.get_server_slot_manager().set_commit_hook([&](const voxel::ChunkMeshPayload& mesh) {
+        for (float w : mesh.baked_albedo_weights) {
+            if (w > 0.5f) {
+                ++painted_vertices_committed;
+            }
+        }
+    });
+
+    // Test stamping BEFORE set_stream_focus (exact _ready() order in terrain_demo.gd)
+    // to verify background streaming never overwrites the stamped 2x Moai statue!
+    // Seat the statue on the surface: moai_statue.vreg is baked centred at
+    // (144,160,128) and its solid base is at local y=136, so stamping at origin
+    // chunk y = round((surface_y - 136) / 32) puts the base on the terrain.
+    const float opt2_surface_y = terrain.get_surface_height(16.0f, 0.0f);
+    const int opt2_origin_y = static_cast<int>(std::lround((opt2_surface_y - 136.0f) / 32.0f));
+    std::printf("[MoaiTest] surface at (16,0)=%.2f -> origin chunk y=%d\n", opt2_surface_y, opt2_origin_y);
+    const int opt2_id = terrain.stamp_asset(
+        "moai_statue.vreg", Vector3(-4.0f, static_cast<float>(opt2_origin_y), -4.0f), 15.0f);
+    REQUIRE(opt2_id > 0);
+
+    terrain.set_stream_focus(
+        Vector3(16.0f, static_cast<float>(opt2_origin_y) * 32.0f + 160.0f, 0.0f),
+        Vector3(0.0f, 0.0f, 0.0f));
+    wait_until_terrain_fully_committed(terrain);
+    // 2x voxel-tuned Moai: ~17k painted vertices ride into the mesh payload.
+    REQUIRE(painted_vertices_committed > 4000ULL);
+
+    // Simulate Option 1 Mesh -> Voxel Swap on the surface at world x=-16, z=0.
+    const float opt1_surface_y = terrain.get_surface_height(-16.0f, 0.0f);
+    const int opt1_origin_y = static_cast<int>(std::lround((opt1_surface_y - 136.0f) / 32.0f));
+    const int opt1_id = terrain.stamp_asset(
+        "moai_statue.vreg", Vector3(-5.0f, static_cast<float>(opt1_origin_y), -4.0f), 0.0f);
+    REQUIRE(opt1_id > 0);
+    terrain.trigger_explosion(
+        Vector3(-16.0f, static_cast<float>(opt1_origin_y) * 32.0f + 160.0f, 6.0f), 6.5f);
+    wait_until_terrain_fully_committed(terrain);
+
+    // Press R to reset Option 1 via remove_structure(opt1_id)
+    REQUIRE(terrain.remove_structure(opt1_id));
+    REQUIRE(!terrain.remove_structure(opt1_id));
+    wait_until_terrain_fully_committed(terrain);
+
+    bool saw_structure_removed_signal = false;
+    for (const auto& sig : terrain.emitted_signals()) {
+        if (sig.name == "structure_removed" && sig.structure_id == opt1_id) {
+            saw_structure_removed_signal = true;
+        }
+    }
+    REQUIRE(saw_structure_removed_signal);
+
+    terrain._exit_tree();
+    std::filesystem::remove_all(save_dir);
+
+    std::printf("[PASS] test_gdextension_moai_stamp_baked_colors_and_remove_structure (%zu painted Moai vertices committed, remove_structure verified)\n",
+                painted_vertices_committed);
+}
+
 } // namespace
 
 int main() {
-    std::printf("=== Running GDExtension End-to-End Streaming, Destruction & Nav3D Test Suite ===\n");
+    std::printf("=== Running GDExtension End-to-End Streaming, Destruction, Moai Albedo & Nav3D Test Suite ===\n");
     test_generate_caves_flag_roundtrip();
     test_collision_toggles_roundtrip();
     test_terrain_depth_slider_roundtrip();
     test_world_seed_roundtrip();
+    test_voxel_scale_roundtrip();
+    test_gdextension_fine_voxel_scale_streaming_and_edits();
     test_gdextension_streaming_explosion_and_nav_lifecycle();
     test_gdextension_mid_path_terrain_removal_and_frost_bridge_addition();
+    test_gdextension_moai_stamp_baked_colors_and_remove_structure();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",
                 g_tests_run, g_assertions_checked);
     return EXIT_SUCCESS;

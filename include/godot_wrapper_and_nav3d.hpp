@@ -29,9 +29,11 @@
 #include <godot_cpp/variant/color.hpp>
 #include <godot_cpp/variant/packed_color_array.hpp>
 #include <godot_cpp/variant/packed_int32_array.hpp>
+#include <godot_cpp/variant/packed_vector2_array.hpp>
 #include <godot_cpp/variant/packed_vector3_array.hpp>
 #include <godot_cpp/variant/rid.hpp>
 #include <godot_cpp/variant/transform3d.hpp>
+#include <godot_cpp/variant/vector2.hpp>
 #endif
 
 namespace voxel {
@@ -164,12 +166,29 @@ public:
                 norms.resize(static_cast<int64_t>(mesh.normals.size()));
                 std::memcpy(norms.ptrw(), mesh.normals.data(), mesh.normals.size() * sizeof(Vec3f));
 
+                const int64_t vcount = static_cast<int64_t>(mesh.vertices.size());
+
                 godot::PackedColorArray colors;
-                colors.resize(static_cast<int64_t>(mesh.vertices.size()));
+                colors.resize(vcount);
                 godot::Color* color_ptr = colors.ptrw();
+
+                godot::PackedVector2Array uvs;
+                uvs.resize(vcount);
+                godot::Vector2* uv_ptr = uvs.ptrw();
+
+                godot::PackedVector2Array uv2s;
+                uv2s.resize(vcount);
+                godot::Vector2* uv2_ptr = uv2s.ptrw();
+
                 for (std::size_t i = 0; i < mesh.vertices.size(); ++i) {
                     const Vec3f c = (i < mesh.colors.size()) ? mesh.colors[i] : Vec3f{};
-                    color_ptr[i] = godot::Color(c.x, c.y, c.z, 1.0f);
+                    const Vec3f alb = (i < mesh.baked_albedos.size()) ? mesh.baked_albedos[i] : Vec3f{};
+                    const float w = (i < mesh.baked_albedo_weights.size()) ? mesh.baked_albedo_weights[i] : 0.0f;
+                    // COLOR.rgb = (damage_ratio, is_hard_rock, material_code), COLOR.a = baked_albedo_weight
+                    color_ptr[i] = godot::Color(c.x, c.y, c.z, w);
+                    // UV.xy = baked_albedo.rg, UV2.xy = (baked_albedo.b, baked_albedo_weight)
+                    uv_ptr[i] = godot::Vector2(alb.x, alb.y);
+                    uv2_ptr[i] = godot::Vector2(alb.z, w);
                 }
 
                 godot::PackedInt32Array indices;
@@ -178,10 +197,12 @@ public:
 
                 godot::Array surface_arrays;
                 surface_arrays.resize(godot::RenderingServer::ARRAY_MAX);
-                surface_arrays[godot::RenderingServer::ARRAY_VERTEX] = verts;
-                surface_arrays[godot::RenderingServer::ARRAY_NORMAL] = norms;
-                surface_arrays[godot::RenderingServer::ARRAY_COLOR]  = colors;
-                surface_arrays[godot::RenderingServer::ARRAY_INDEX]  = indices;
+                surface_arrays[godot::RenderingServer::ARRAY_VERTEX]  = verts;
+                surface_arrays[godot::RenderingServer::ARRAY_NORMAL]  = norms;
+                surface_arrays[godot::RenderingServer::ARRAY_COLOR]   = colors;
+                surface_arrays[godot::RenderingServer::ARRAY_TEX_UV]  = uvs;
+                surface_arrays[godot::RenderingServer::ARRAY_TEX_UV2] = uv2s;
+                surface_arrays[godot::RenderingServer::ARRAY_INDEX]   = indices;
 
                 rs->mesh_add_surface_from_arrays(
                     slot.mesh_rid.native_rid,
@@ -403,6 +424,8 @@ public:
     void set_bake_on_stream_enabled(bool enabled) noexcept {
         bake_on_stream_enabled_ = enabled;
     }
+
+    [[nodiscard]] float voxel_scale() const noexcept { return config_.voxel_scale; }
 
     void shutdown() noexcept {
 #if defined(VOXEL_WITH_GODOT_CPP)

@@ -31,6 +31,9 @@ shadow_enabled = true
 [node name="VoxelTerrain3D" type="VoxelTerrain3D" parent="."]
 view_distance_chunks = 6
 prefetch_distance_chunks = 2
+world_height_chunks = 8
+voxel_scale = 0.5
+save_directory_path = "/tmp/voxel_world_saves_s050_nocaves"
 resident_memory_budget_mb = 512
 upload_budget_ms = 2.0
 generate_caves = false

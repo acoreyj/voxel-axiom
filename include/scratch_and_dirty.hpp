@@ -44,13 +44,14 @@ public:
     static constexpr int32_t kDim = 36; // -1 .. 34 inclusive
     static constexpr std::size_t kTotalSamples = 36ULL * 36ULL * 36ULL; // 46,656 samples
     static constexpr std::size_t kScratchBytes =
-        kTotalSamples * (sizeof(int16_t) + 2 * sizeof(uint8_t)); // 186,624 B (~182.3 KiB): tsdf + material + damage
+        kTotalSamples * (sizeof(int16_t) + 2 * sizeof(uint8_t) + sizeof(uint16_t)); // 279,936 B (~273.4 KiB): tsdf + material + damage + color
 
     explicit WorkerScratchWindow36(MemoryLedger& ledger)
         : ledger_(ledger),
           tsdf_(kTotalSamples, TsdfFormat::kClampedAir),
           material_(kTotalSamples, 0),
-          damage_(kTotalSamples, 0) {
+          damage_(kTotalSamples, 0),
+          color_(kTotalSamples, VoxelColor::kUnpainted) {
         reserved_ = ledger_.try_reserve(kScratchBytes, MemoryPoolId::WorkerScratch);
         assert(reserved_ && "WorkerScratchWindow36 reservation must succeed within budget");
     }
@@ -104,9 +105,18 @@ public:
         damage_[linear_index(sx, sy, sz)] = dmg;
     }
 
+    [[nodiscard]] uint16_t get_color(int32_t sx, int32_t sy, int32_t sz) const noexcept {
+        return color_[linear_index(sx, sy, sz)];
+    }
+
+    void set_color(int32_t sx, int32_t sy, int32_t sz, uint16_t col) noexcept {
+        color_[linear_index(sx, sy, sz)] = col;
+    }
+
     [[nodiscard]] const std::vector<int16_t>& raw_tsdf() const noexcept { return tsdf_; }
     [[nodiscard]] const std::vector<uint8_t>& raw_material() const noexcept { return material_; }
     [[nodiscard]] const std::vector<uint8_t>& raw_damage() const noexcept { return damage_; }
+    [[nodiscard]] const std::vector<uint16_t>& raw_color() const noexcept { return color_; }
 
 private:
     MemoryLedger& ledger_;
@@ -114,6 +124,7 @@ private:
     std::vector<int16_t> tsdf_;
     std::vector<uint8_t> material_;
     std::vector<uint8_t> damage_;
+    std::vector<uint16_t> color_;
 };
 
 /// Gathers the 36^3 (-1..34) worker scratch window for `center` from `store` under
@@ -208,6 +219,7 @@ private:
                         scratch.set_tsdf(sx, sy, sz, n.slot->get_tsdf(lc));
                         scratch.set_material(sx, sy, sz, n.slot->get_material(lc));
                         scratch.set_damage(sx, sy, sz, n.slot->get_damage(lc));
+                        scratch.set_color(sx, sy, sz, n.slot->get_color_linear(lc.to_linear_index()));
                     }
                 }
             }
@@ -224,6 +236,7 @@ private:
                         scratch.set_tsdf(sx, sy, sz, fallback_tsdf);
                         scratch.set_material(sx, sy, sz, 0);
                         scratch.set_damage(sx, sy, sz, 0);
+                        scratch.set_color(sx, sy, sz, VoxelColor::kUnpainted);
                     }
                 }
             }

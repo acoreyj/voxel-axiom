@@ -14,6 +14,7 @@ A high-performance, real-time destructible voxel engine with 3D cave generation 
 - **3D Cave Navigation**: Dynamic integration with Godot's `NavigationServer3D`, asynchronous navigation mesh baking, and synchronized path queries for AI companions.
 - **World-Space Terrain Queries**: `VoxelTerrain3D.raycast_terrain()`, `raycast_terrain_material()` and `get_surface_height()` answer against the resident TSDF field (edited terrain first, procedural generator fallback), so aiming, spawns, and patrols work with no physics-collision dependency. `raycast_terrain_material()` additionally reports the material ID of the solid voxel behind the surface; the demo's top-left HUD shows it as the "Looking at" readout. The demo's `VoxelAICompanion` carries a visible pill capsule that patrols a triangular route on the terrain surface.
 - **Crash-Safe 3D Region Persistence**: $8 \times 8 \times 8$ chunk region files (up to 512 chunks per region) with LZ4 byte-plane compression and background disk streaming.
+- **Offline Asset Voxelization & Reconstitution**: The standalone `voxel_baker` CLI converts hand-crafted Wavefront `.obj` meshes (ruins, arches, walls — manifold or not) into native $8 \times 8 \times 8$ `.vreg` region files via a narrow-band TSDF; `VoxelTerrain3D.stamp_asset()` unions them into the live world, where they are destroyed with identical voxel physics and either reconstituted after a timer or kept permanently destroyed. Stamping can be `Union`ed into existing terrain and emits `structure_damaged` / `structure_recreated`.
 - **Triplanar Voxel Shading**: Custom triplanar shader blending rock, soil, grass, and cave interior textures with normal mapping and roughness.
 - **Built-in Performance Instrumentation**: Lock-free per-operation timing (`generate`, `mesh`, `commit`, `stream_focus`, `edit`, `navigation`) accumulated per frame and logged to the Godot **Output** panel. Toggle with the `instrumentation_enabled` property.
 
@@ -139,7 +140,7 @@ The test suite can be built independently of Godot (`VOXEL_BUILD_TESTS=ON` is en
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DVOXEL_BUILD_TESTS=ON
 cmake --build build -j
 
-# Run all 9 test suites
+# Run all test suites
 ctest --test-dir build --output-on-failure
 ```
 
@@ -163,7 +164,7 @@ ctest --test-dir build --output-on-failure
 
 ### Automated Bash Script (`run_all_tests.sh`)
 
-On Linux/macOS/WSL, you can run all 9 milestone test suites under both ASan and TSan in one pass:
+On Linux/macOS/WSL, you can run all milestone test suites under both ASan and TSan in one pass, plus build the standalone `voxel_baker` CLI:
 
 ```bash
 chmod +x run_all_tests.sh
@@ -189,7 +190,8 @@ Both demo scenes drive a `VoxelTerrain3D` node, whose key exported properties ar
 | --- | --- | --- | --- |
 | `view_distance_chunks` | `int` | `2` | Active streaming radius in chunks (auto-shrunk by 2 under memory pressure). |
 | `prefetch_distance_chunks` | `int` | `1` | Extra Chebyshev ring streamed ahead of the active radius. |
-| `world_height_chunks` | `int` | `4` | Vertical chunk ceiling, in 32 m chunks. Sets the top of the world; streaming only populates layer indices `0 … world_height_chunks-1`. Baked in when the node starts, so set it before running. |
+| `voxel_scale` | `float` | `1.0` | Meters per voxel sample, clamped to `[0.125, 4.0]`. Set it before the node enters the tree; the demo uses `0.5`. |
+| `world_height_chunks` | `int` | `4` | Vertical chunk ceiling, in 32-sample chunks (`32 × voxel_scale` m each). Sets the top of the world; streaming only populates layer indices `0 … world_height_chunks-1`. Baked in when the node starts, so set it before running. |
 | `surface_base_height` | `float` | `68.0` | Average terrain surface height above the `y = 0` bedrock, in meters. Controls how much rock sits under the surface (and how many cave layers fit). |
 | `collision_distance_chunks` | `int` | `-1` | 3D Chebyshev radius (in chunks, from the focus chunk) within which chunks build a `PhysicsServer3D` collision body. Distant chunks upload only their visual mesh. `-1` disables the gate. |
 | `collision_subsample_stride` | `int` | `1` | Collision-only decimation (HLD §4.4). `2` rebuilds the physics/navigation triangle soup from a `16³` stride-2 subsample (~4× fewer physics triangles) while the `32³` visual mesh stays full-resolution and watertight. Clamped to `1`/`2`. |
@@ -212,14 +214,15 @@ surface height (`surface_base_height`), bounded above by the world ceiling
 the Godot **Inspector** or from GDScript:
 
 ```gdscript
-$VoxelTerrain3D.world_height_chunks = 6      # 6 x 32 m = 192 m ceiling
+$VoxelTerrain3D.world_height_chunks = 6      # 6 x 32 samples x 0.5 m = 96 m ceiling
 $VoxelTerrain3D.surface_base_height = 132.0  # ~132 m of underground rock
 ```
 
 **What each one does**
 
-- **`world_height_chunks`** — the vertical ceiling in 32 m chunks, so the top of
-  the world is `world_height_chunks * 32` m. The streaming manager only populates
+- **`world_height_chunks`** — the vertical ceiling in 32-sample chunks, so the top
+  of the world is `world_height_chunks × 32 × voxel_scale` m (96 m at `6` and
+  `0.5` m voxels). The streaming manager only populates
   chunk layers `0 … world_height_chunks-1`; anything above simply does not exist.
   It is baked into the chunk store when the node enters the tree, so **set it in
   the Inspector (or before adding the node) — changing it at runtime has no
@@ -231,9 +234,10 @@ $VoxelTerrain3D.surface_base_height = 132.0  # ~132 m of underground rock
   the change adopt the new height.**
 
 **Picking a value.** Keep `surface_base_height + surface_amplitude` at least 20 m
-below `world_height_chunks * 32` so hilltops never clip the ceiling. The
-`world_height_chunks` slider runs `1 … 12` and `surface_base_height` `16 … 256` m.
-Common profiles (from [`docs/terrain depth.md`](docs/terrain%20depth.md)):
+below `world_height_chunks × 32 × voxel_scale` so hilltops never clip the ceiling.
+The `world_height_chunks` slider runs `1 … 12` and `surface_base_height`
+`16 … 256` m. Common profiles at `voxel_scale = 1.0` (from
+[`docs/terrain depth.md`](docs/terrain%20depth.md)):
 
 | Profile | `world_height_chunks` | `surface_base_height` | Underground depth |
 | --- | --- | --- | --- |
@@ -304,6 +308,11 @@ The shipped `voxel_terrain_demo.tscn` uses `collision_distance_chunks = 3` and
 | **Shift** (Hold) | Sprint speed boost ($3\times$) |
 | **Mouse Motion** | Look around (first-person pitch/yaw) |
 | **1 … 5** | Select terrain tool: Add terrain / Explode / Large explode / Paint terrain / Paint delete |
+| **6 … 9** | Place boulder / Water quench / Frost-Ice bridge / Lava |
+| **C** | Select the **Small hit** chip blast (default radius 1.5 m) for fine carving |
+| **0 / -** | Stamp the configured asset at the crosshair (timed / permanent) |
+| **R** | Reset all four demo statues (remove stamps + restore pristine meshes) |
+| **T** | Toggle the add/paint material (soil / 3-hit rock) |
 | **Left Click** | Apply the active tool at the crosshair (hit point, or 24 m ahead when aiming at the sky) |
 | **Left Click** (Hold) | Tools 4 and 5 stream terrain additions / deletions along the drag path |
 | **Right Click** | Query 3D cave navigation path for AI companion |
@@ -324,6 +333,7 @@ the Inspector:
 | `large_explosion_radius` | `18.0` | Tool 3 (Large explode) |
 | `paint_radius` | `3.5` | Tool 4 (Paint terrain, drag-add) |
 | `paint_delete_radius` | `3.5` | Tool 5 (Paint delete, drag-erase) |
+| `small_hit_radius` | `1.5` | Key C (Small hit chip blast) |
 | `brush_spacing_factor` | `0.6` | Drag-brush step distance (`radius x factor`) |
 | `brush_interval` | `0.05` | Minimum seconds between drag-brush steps |
 
@@ -341,6 +351,96 @@ $VoxelTerrain3D.add_terrain(Vector3(16, 70, 16), 6.0)        # add
 `trigger_explosion` reports through `explosion_requested` / `explosion_completed`
 / `explosion_failed`; `add_terrain` mirrors those with `terrain_add_requested` /
 `terrain_add_completed` / `terrain_add_failed`.
+
+### Offline Asset Stamping & Reconstitution
+
+Hand-crafted meshes are voxelized **offline** into `.vreg` region files by the
+standalone `voxel_baker` CLI (built by CMake into `build/bin/voxel_baker`), then
+stamped into the live world at runtime:
+
+```bash
+voxel_baker <input.obj> <output.vreg> [options]
+  --scale <float>      # Uniform vertex scale multiplier (default: 1.0)
+  --voxel-scale <float># Meters per voxel sample (default: 1.0)
+  --thickness <float>  # Shell wall thickness in meters (default: 1.6)
+  --material <name>    # hard_rock (default), soil, obsidian, ice, lava
+  --watertight         # Watertight solid mode (surface stays on the source mesh)
+  --texture <file.ppm> # Binary PPM albedo sampled via UVs into per-voxel RGB5551
+  --color-depth <float># Depth (m) that receives baked color (default: 1.8)
+  --center-x/y/z <f>   # Target region center (default: 128, 128, 128)
+  --no-color           # Disable per-voxel color baking
+  --no-center          # Do not auto-center the mesh at local (128, 128, 128)
+  --rx/--ry/--rz <int> # Target region coordinates written to the header
+  --delta <float>      # Narrow-band truncation delta (default: 2.0)
+```
+
+The baker fan-triangulates polygon faces, maps `usemtl` names to engine
+materials, accelerates point-to-triangle distance queries with an 8 m spatial
+grid, and writes the engine's canonical format: a 512-entry TOC with far-field
+chunks as uniform `Empty` (0 bytes), narrow-band chunks as byte-plane-RLE
+compressed 16-bit TSDF samples, and an FNV-1a64 payload checksum. `--watertight`
+fills closed interiors solid; the default shell mode gives open ruins, arches
+and walls a real $T$ metre wall thickness. With `--texture`, the closest-point
+UV is sampled and baked into an RGB5551 **per-voxel albedo plane** (outer
+`--color-depth` skin only), carried through chunk storage, the Surface Nets
+mesher (`UV`/`UV2`/`COLOR.a`), and saved `.vreg`s — so painted statues keep
+their texture through carving, and deep crater walls expose raw rock. See
+`include/voxel_mesh_baker.hpp` and the full walkthrough in
+[`docs/asset stamping and reconstitution.md`](docs/asset%20stamping%20and%20reconstitution.md).
+
+Stamping a baked region from GDScript (a reconstitution timer of `15.0` s here;
+pass `0.0` — or use demo Key `-` — for permanent destruction):
+
+```gdscript
+var structure_id := $VoxelTerrain3D.stamp_asset(
+    "res://ancient_ruin.vreg", Vector3(chunk_x, chunk_y, chunk_z), 15.0)
+```
+
+`AssetStampManager` snapshots each stamped chunk's pre-damage TSDF and materials
+as its baseline. Non-fill edits (explosions / elemental reactions) that dirty a
+stamped chunk mark the structure damaged, re-mesh its chunks and re-bake its
+navigation groups; when the quiet period elapses it restores the exact baseline
+TSDF, materials and damage state. Signals:
+
+| Signal | Payload | Fires when |
+| --- | --- | --- |
+| `structure_damaged` | `structure_id`, `name` | A stamped structure's chunks were carved; its reconstitution timer is armed. |
+| `structure_recreated` | `structure_id`, `name` | The quiet period elapsed and the exact pre-damage voxels were restored. |
+
+In the demo, **Key 0** stamps the configured `stamp_asset_path` at the crosshair
+with `stamp_recreate_delay_seconds` (default 15 s); **Key -** stamps it with no
+timer so it stays permanently destroyed. Aim at the terrain surface first.
+
+`voxel_terrain_demo.tscn` also seeds two 48 m statue pairs: the 2x Moai pair at
+`z = 0` and the 5.33x Atlas pair at `z = -64`, both stamped into a `0.5 m` voxel
+world. Each pair shows the same two styles side by side:
+
+| Statue | Behavior |
+| --- | --- |
+| **Option 1 �?" Pristine Mesh Swap** | Shows the textured `models/moai_statue.obj` / `models/atlas/atlas.obj` mesh until the first blast reaches it; the hit hides the mesh and stamps the same statue as voxels (crater carved immediately). |
+| **Option 2 �?" Baked Voxel Colors** | Stamped at startup from `moai_statue.vreg` / `models/atlas/atlas_statue.vreg` with per-voxel albedo, 3-hit cracks, raw-rock craters, and a 15 s reconstitution timer. |
+
+The Atlas `.vreg` is baked watertight from the GLB's extracted OBJ + albedo:
+
+```bash
+voxel_baker models/atlas/atlas.obj models/atlas/atlas_statue.vreg \
+    --voxel-scale 0.5 --watertight --texture models/atlas/atlas_albedo.ppm \
+    --color-depth 2.8 --center-x 160 --center-y 160 --center-z 128
+```
+
+`atlas.obj` and `atlas_albedo.ppm` are derived from `models/atlas/atlas.glb`
+(the 9 m source mesh scaled 5.333x to 48 m); re-export them from the GLB before
+re-baking if the source asset changes. The Moai pair is baked the same way:
+
+```bash
+voxel_baker models/moai_statue.obj moai_statue.vreg \
+    --voxel-scale 0.5 --watertight --texture models/moai_albedo.ppm \
+    --color-depth 2.8 --center-x 160 --center-y 160 --center-z 128
+```
+
+**Key R** resets all four statues (removes the voxel structures, restores
+Option 1's pristine meshes, re-stamps both Option 2 statues); **Key T** toggles
+the add/paint material.
 
 ### Pill Companion (Demo)
 
@@ -409,6 +509,7 @@ hosts redirect the output (tests capture it instead of printing).
 ├── build/                        # CMake build tree (auto `.gdignore` keeps Godot from importing `.obj` files)
 ├── docs/                         # High-level architecture and design documents (v1 - v4)
 ├── include/                      # Pure C++20 voxel core engine (zero Godot dependencies)
+│   ├── asset_stamp_manager.hpp   # .vreg asset stamping, damage tracking, reconstitution
 │   ├── chunk_key.hpp             # 64-bit packed chunk coordinates and spatial hashing
 │   ├── chunk_store.hpp           # 32³ TSDF chunk storage, compact chunks, open-address map
 │   ├── edit_and_worker_pool.hpp  # Multi-threaded job pool, CSG sphere edits, anti-crumb filter
@@ -416,11 +517,14 @@ hosts redirect the output (tests capture it instead of printing).
 │   ├── persistence_and_streaming.hpp # 8×8×8 region streaming and LZ4 compression
 │   ├── procgen_and_surface_nets.hpp  # Surface Nets mesher, FastNoise SIMD terrain/caves
 │   ├── scratch_and_dirty.hpp     # 36³ thread-local scratch windows, dirty flags tracking
-│   └── stage_timings.hpp         # Lock-free per-operation timing accumulator (Godot-free)
+│   ├── stage_timings.hpp         # Lock-free per-operation timing accumulator (Godot-free)
+│   └── voxel_mesh_baker.hpp      # Offline .obj → .vreg voxelizer (TSDF narrow band)
 ├── src/                          # Godot 4 GDExtension bindings
 │   ├── register_types.cpp/.h     # GDExtension entrypoint and class registration
+│   ├── voxel_baker_main.cpp      # Standalone `voxel_baker` CLI entry point
 │   ├── voxel_ai_companion.cpp/.h # VoxelAICompanion node (3D cave pathfinding)
 │   └── voxel_terrain_3d.cpp/.h   # VoxelTerrain3D node (streaming, remeshing, physics)
+├── models/                       # Demo assets (Moai GLB/OBJ, extracted albedo, baked .vreg)
 ├── tests/                        # Milestone unit & integration tests (M0 - M4)
 ├── CMakeLists.txt                # Root CMake build configuration
 ├── project.godot                 # Godot engine project definition

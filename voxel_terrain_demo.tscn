@@ -27,9 +27,10 @@ shader_parameter/water_color = Color(0.1, 0.45, 0.85, 1)
 shader_parameter/obsidian_color = Color(0.08, 0.06, 0.14, 1)
 shader_parameter/ice_color = Color(0.62, 0.88, 0.98, 1)
 shader_parameter/crack_glow_color = Color(1, 0.42, 0.08, 1)
-shader_parameter/debug_damage_indicator = true
+shader_parameter/debug_damage_indicator = false
 shader_parameter/slope_sharpness = 6.0
 shader_parameter/noise_scale = 0.14
+shader_parameter/chisel_normal_strength = 0.24
 
 [sub_resource type="StyleBoxFlat" id="StyleBoxFlat_reticle"]
 bg_color = Color(1, 1, 1, 1)
@@ -54,14 +55,70 @@ transform = Transform3D(0.866025, -0.353553, 0.353553, 0, 0.707107, 0.707107, -0
 shadow_enabled = true
 
 [node name="VoxelTerrain3D" type="VoxelTerrain3D" parent="." unique_id=1732306372]
-view_distance_chunks = 6
-prefetch_distance_chunks = 2
-world_height_chunks = 6
+view_distance_chunks = 12
+prefetch_distance_chunks = 4
+world_height_chunks = 8
+voxel_scale = 0.5
 terrain_material = SubResource("ShaderMaterial_Terrain")
-instrumentation_enabled = false
 
 [node name="VoxelAICompanion" type="VoxelAICompanion" parent="." unique_id=1917223628]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 16, 48, 16)
+
+[node name="MoaiOption1_MeshSwap" type="Node3D" parent="." unique_id=1701159093]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -16, 96, 0)
+
+[node name="PristineMesh" type="MeshInstance3D" parent="MoaiOption1_MeshSwap" unique_id=562080943]
+
+[node name="StaticBody3D" type="StaticBody3D" parent="MoaiOption1_MeshSwap" unique_id=758329704]
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="MoaiOption1_MeshSwap/StaticBody3D" unique_id=1099841325]
+
+[node name="Label3D" type="Label3D" parent="MoaiOption1_MeshSwap" unique_id=55224615]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 26, 0)
+billboard = 1
+text = "Option 1 (2x Scale): Pristine Mesh -> Voxel Swap
+(Shoot to fracture into voxels | Press R to Reset)"
+font_size = 42
+outline_size = 10
+
+[node name="MoaiOption2_BakedVoxel" type="Node3D" parent="." unique_id=614955450]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 16, 96, 0)
+
+[node name="Label3D" type="Label3D" parent="MoaiOption2_BakedVoxel" unique_id=261667783]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 26, 0)
+billboard = 1
+text = "Option 2: 100% Voxel + Baked RGB5551 Albedo
+(3-Hit Cracks + Raw Interior Crater | 15s Reconstitution)"
+font_size = 42
+outline_size = 10
+
+[node name="AtlasOption1_MeshSwap" type="Node3D" parent="." unique_id=824030349]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -16, 72, -64)
+
+[node name="PristineMesh" type="MeshInstance3D" parent="AtlasOption1_MeshSwap" unique_id=522659000]
+
+[node name="StaticBody3D" type="StaticBody3D" parent="AtlasOption1_MeshSwap" unique_id=1217019546]
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="AtlasOption1_MeshSwap/StaticBody3D" unique_id=545409224]
+
+[node name="Label3D" type="Label3D" parent="AtlasOption1_MeshSwap" unique_id=483640263]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 50, 0)
+billboard = 1
+text = "Atlas Option 1 (5.33x Scale): Pristine Mesh -> Voxel Swap
+(Shoot to fracture into voxels | Press R to Reset)"
+font_size = 42
+outline_size = 10
+
+[node name="AtlasOption2_BakedVoxel" type="Node3D" parent="." unique_id=1695487085]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 16, 96, -64)
+
+[node name="Label3D" type="Label3D" parent="AtlasOption2_BakedVoxel" unique_id=404694295]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 26, 0)
+billboard = 1
+text = "Atlas Option 2: 100% Voxel + Baked RGB5551 Albedo
+(3-Hit Cracks + Raw Interior Crater | 15s Reconstitution)"
+font_size = 42
+outline_size = 10
 
 [node name="Camera3D" type="Camera3D" parent="." unique_id=263971570]
 transform = Transform3D(1, 0, 0, 0, 0.968912, 0.247404, 0, -0.247404, 0.968912, 16, 84, 48)
