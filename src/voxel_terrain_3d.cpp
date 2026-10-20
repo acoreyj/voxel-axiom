@@ -752,20 +752,16 @@ void VoxelTerrain3D::_process(double delta) {
         }
 
         const bool currently_over_cap = (remaining_depth >= 32ULL);
-        // Cap non-empty PhysicsServer3D concave BVH commits to at most 2 per frame when not over cap
-        // so Godot's internal PhysicsServer3D sync phase never stalls the main loop!
+        // Commit up to 8 non-empty chunk meshes per frame (still bounded by upload_budget_ms)
+        // so a single 8-chunk blast clears in one frame instead of re-dirtying and rebaking
+        // neighbouring navigation groups across five frames.
         if (!currently_over_cap &&
-            (elapsed_us >= soft_budget_us || non_empty_meshes_committed >= 2ULL)) {
+            (elapsed_us >= soft_budget_us || non_empty_meshes_committed >= 8ULL)) {
             break;
         }
         if (elapsed_us >= emergency_budget_us) {
             break;
         }
-    }
-
-    // Only submit navigation group bakes after initial streaming settles (core_idle)
-    if (core_idle()) {
-        navigation_manager.submit_ready_groups_to_server(server_slot_manager);
     }
 
     // Advance reconstitution timers for stamped assets: damaged structures with a
@@ -777,6 +773,12 @@ void VoxelTerrain3D::_process(double delta) {
             core_engine->store,
             core_engine->dirty_scheduler,
             navigation_manager);
+    }
+
+    // Only submit NavigationGroup async bakes once all finished chunk meshes in
+    // completion_queue have been committed, preventing multi-frame repeated rebakes.
+    if (core_idle() && core_engine->worker_pool->completion_queue_depth() == 0) {
+        navigation_manager.submit_ready_groups_to_server(server_slot_manager);
     }
 
     for (const voxel::ChunkKey key : navigation_manager.drain_newly_committed_chunks()) {

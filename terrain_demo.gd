@@ -100,13 +100,18 @@ extends Node3D
 ## First-person Play mode (F toggles Fly <-> Play). Play drops an eye-height body
 ## onto the voxel surface below the camera: WASD runs, Shift sprints, Space jumps,
 ## and LMB swings the rigged pickaxe arms before chipping the terrain at the crosshair.
-@export var play_eye_height: float = 1.6
+@export var play_eye_height: float = 1.75
 @export var play_walk_speed: float = 5.0
 @export var play_run_speed: float = 9.0
 @export var play_jump_speed: float = 6.0
 @export var play_gravity: float = 24.0
 @export var play_step_height: float = 0.6
 @export var play_body_radius: float = 0.4
+## Slightly wider than the free-fly lens so the viewmodel arms clear the frame.
+@export var play_fov: float = 85.0
+## Viewmodel placement relative to the eye. The authored arms sit beside/behind
+## the head, so the rig is pulled forward and up to bring the hands on screen.
+@export var arms_view_offset: Vector3 = Vector3(0.0, -1.38, -0.62)
 ## Radius of the pickaxe chip carved on the swing's impact frame.
 @export var pickaxe_hit_radius: float = 1.5
 ## Playback multiplier applied to the authored 80-frame PickaxeSwing_R action.
@@ -214,13 +219,21 @@ var _mode: int = Mode.FLY
 var _player_feet: Vector3 = Vector3.ZERO
 var _player_vel_y: float = 0.0
 var _player_grounded: bool = false
+var _last_safe_feet: Vector3 = Vector3.ZERO
+var _spawn_pending: bool = false
+var _spawn_wait: float = 0.0
 var _arms_root: Node3D = null
 var _arms_player: AnimationPlayer = null
 var _arms_current_anim: String = ""
+var _arms_idle: bool = false
 var _swing_active: bool = false
 var _swing_hit_done: bool = false
 var _swing_elapsed: float = 0.0
 var _swing_impact_time: float = 0.0
+var _pcam_host: PhantomCameraHost = null
+var _fly_pcam: PhantomCamera3D = null
+var _play_pcam: PhantomCamera3D = null
+var _base_fov: float = 75.0
 var _last_focus_chunk: Vector3i = Vector3i(999999, 999999, 999999)
 var _committed_chunk_count: int = 0
 var _fps_smoothed: float = 0.0
@@ -300,6 +313,7 @@ func _ready() -> void:
 	_setup_side_by_side_easter_island_statues()
 	_setup_side_by_side_atlas_statues()
 	_setup_side_by_side_ape_statues()
+	_setup_phantom_camera()
 	_setup_first_person_arms()
 	_update_stream_focus(true)
 
@@ -773,6 +787,39 @@ func _update_pending_pristine_hides(delta: float) -> void:
 			label.text = String(pending["text"])
 		_pending_pristine_hides.remove_at(i)
 
+func _setup_phantom_camera() -> void:
+	_base_fov = camera.fov
+	_pcam_host = PhantomCameraHost.new()
+	_pcam_host.name = "PhantomCameraHost"
+	camera.add_child(_pcam_host)
+
+	var instant := PhantomCameraTween.new()
+	instant.duration = 0.0
+	var blend := PhantomCameraTween.new()
+	blend.duration = 0.25
+	blend.transition = PhantomCameraTween.TransitionType.SINE
+	blend.ease = PhantomCameraTween.EaseType.EASE_IN_OUT
+
+	_fly_pcam = PhantomCamera3D.new()
+	_fly_pcam.name = "FlyPhantomCamera3D"
+	_fly_pcam.top_level = true
+	_fly_pcam.follow_mode = PhantomCamera3D.FollowMode.NONE
+	_fly_pcam.priority = 0
+	_fly_pcam.tween_resource = instant
+	_fly_pcam.global_transform = camera.global_transform
+	add_child(_fly_pcam)
+
+	_play_pcam = PhantomCamera3D.new()
+	_play_pcam.name = "PlayPhantomCamera3D"
+	_play_pcam.top_level = true
+	_play_pcam.follow_mode = PhantomCamera3D.FollowMode.NONE
+	_play_pcam.priority = 0
+	_play_pcam.tween_resource = blend
+	_play_pcam.global_transform = camera.global_transform
+	add_child(_play_pcam)
+
+	_fly_pcam.priority = 1
+
 func _setup_first_person_arms() -> void:
 	var packed := load(ARMS_SCENE_PATH) as PackedScene
 	if packed == null:
@@ -784,8 +831,7 @@ func _setup_first_person_arms() -> void:
 		return
 	_arms_root.name = "FirstPersonArms"
 	camera.add_child(_arms_root)
-	# The rig origin is at the feet, 0.15 m behind the authored ArmCam eye.
-	_arms_root.position = Vector3(0.0, -play_eye_height, 0.15)
+	_arms_root.position = arms_view_offset
 	_arms_root.rotation = Vector3(0.0, PI, 0.0)
 	_arms_root.visible = false
 	_arms_player = _arms_root.find_child("AnimationPlayer", true, false) as AnimationPlayer
@@ -809,13 +855,28 @@ func _enter_play() -> void:
 	_tool_pressed = false
 	_swing_active = false
 	var eye := camera.global_position
-	var ground_y := _ground_height_below(eye + Vector3(0.0, play_step_height, 0.0), 400.0)
-	if not is_finite(ground_y):
-		ground_y = eye.y - play_eye_height
-	_player_feet = Vector3(eye.x, ground_y, eye.z)
+	var ground_y := _ground_probe(eye + Vector3(0.0, play_step_height, 0.0), 400.0)
+	_spawn_pending = not is_finite(ground_y)
+	_spawn_wait = 0.0
+	_player_feet = Vector3(eye.x, eye.y - play_eye_height, eye.z)
+	if is_finite(ground_y):
+		_player_feet.y = ground_y
+	else:
+		# Taking over while hovering over a void: spawn on the visible terrain
+		# under the crosshair instead of dropping into the void below.
+		var aim := _pickaxe_aim_point()
+		if is_finite(aim.x):
+			var aim_ground := _ground_probe(aim + Vector3(0.0, play_step_height, 0.0), 400.0)
+			_player_feet = Vector3(aim.x, aim_ground if is_finite(aim_ground) else aim.y, aim.z)
+			_spawn_pending = false
+	_last_safe_feet = _player_feet
 	_player_vel_y = 0.0
 	_player_grounded = true
-	camera.global_position = _player_feet + Vector3(0.0, play_eye_height, 0.0)
+	camera.fov = play_fov
+	_play_pcam.global_position = _player_feet + Vector3(0.0, play_eye_height, 0.0)
+	_play_pcam.rotation = camera.rotation
+	_play_pcam.priority = 1
+	_fly_pcam.priority = 0
 	if _arms_root:
 		_arms_root.visible = true
 	_play_arms_idle()
@@ -831,29 +892,38 @@ func _exit_play() -> void:
 		_arms_player.stop()
 	if _arms_root:
 		_arms_root.visible = false
+	camera.fov = _base_fov
+	_fly_pcam.global_transform = camera.global_transform
+	_fly_pcam.priority = 1
+	_play_pcam.priority = 0
 	print("[FirstPerson] Fly mode (F to play)")
 
 func _play_arms_idle() -> void:
 	if _arms_player == null:
 		return
 	_arms_current_anim = "Walk_R"
-	_arms_player.speed_scale = 1.0
+	_arms_idle = true
 	_arms_player.play("Walk_R")
 	_arms_player.seek(0.0, true)
-	_arms_player.pause()
+	_arms_player.speed_scale = 0.0
 
 func _update_arms_locomotion(speed: float) -> void:
 	if _arms_player == null or _swing_active:
 		return
 	if speed < 0.05:
-		if _arms_player.is_playing():
+		if not _arms_idle:
 			_play_arms_idle()
 		return
 	var want := "Run_R" if speed > play_walk_speed + 0.01 else "Walk_R"
+	if _arms_idle and _arms_current_anim == want:
+		_arms_idle = false
+		_arms_player.speed_scale = 1.0
+		return
 	if _arms_current_anim != want or not _arms_player.is_playing():
 		_arms_current_anim = want
-		_arms_player.speed_scale = 1.0
 		_arms_player.play(want)
+	_arms_idle = false
+	_arms_player.speed_scale = 1.0
 
 func _start_pickaxe_swing() -> void:
 	if _arms_player == null or _swing_active:
@@ -861,6 +931,7 @@ func _start_pickaxe_swing() -> void:
 	_swing_active = true
 	_swing_hit_done = false
 	_swing_elapsed = 0.0
+	_arms_idle = false
 	_arms_current_anim = "PickaxeSwing_R"
 	var swing := _arms_player.get_animation("PickaxeSwing_R")
 	_swing_impact_time = swing.length * pickaxe_impact_fraction if swing else 0.4
@@ -925,7 +996,37 @@ func _ground_height_below(from: Vector3, distance: float) -> float:
 			best = phys_y
 	return best
 
+## Samples the center and four points around the body so a foot cannot slip
+## through a seam between chunks or miss the surface at the edge of a voxel.
+func _ground_probe(from: Vector3, distance: float) -> float:
+	var best := -INF
+	for offset in [Vector3.ZERO, Vector3(0.3, 0.0, 0.0), Vector3(-0.3, 0.0, 0.0), Vector3(0.0, 0.0, 0.3), Vector3(0.0, 0.0, -0.3)]:
+		var ground_y := _ground_height_below(from + offset, distance)
+		if is_finite(ground_y) and ground_y > best:
+			best = ground_y
+	return best
+
 func _process_play(delta: float) -> void:
+	if _spawn_pending:
+		_spawn_wait += delta
+		var spawn_ground := _ground_probe(camera.global_position + Vector3(0.0, play_step_height, 0.0), 400.0)
+		if is_finite(spawn_ground):
+			_player_feet = Vector3(_player_feet.x, spawn_ground, _player_feet.z)
+			_last_safe_feet = _player_feet
+			_player_vel_y = 0.0
+			_player_grounded = true
+			_spawn_pending = false
+		else:
+			_player_vel_y = 0.0
+			_player_grounded = false
+			_play_pcam.global_position = _player_feet + Vector3(0.0, play_eye_height, 0.0)
+			_play_pcam.rotation = Vector3(_pitch, _yaw, 0.0)
+			_update_pickaxe_swing(delta)
+			_update_arms_locomotion(0.0)
+			if _spawn_wait > 4.0:
+				_spawn_pending = false
+			return
+
 	var forward := Vector3(-sin(_yaw), 0.0, -cos(_yaw))
 	var right := Vector3(cos(_yaw), 0.0, -sin(_yaw))
 	var input_dir := Vector3.ZERO
@@ -943,13 +1044,25 @@ func _process_play(delta: float) -> void:
 	_velocity = wish
 	_move_player_horizontal(wish * delta)
 
-	_player_vel_y -= play_gravity * delta
+	var prev_y := _player_feet.y
+	_player_vel_y = maxf(_player_vel_y - play_gravity * delta, -80.0)
 	_player_feet.y += _player_vel_y * delta
-	var ground_y := _ground_height_below(_player_feet + Vector3(0.0, play_step_height, 0.0), play_step_height + 5.0)
+	var probe_top := maxf(prev_y, _player_feet.y) + play_step_height
+	var ground_y := _ground_probe(
+		Vector3(_player_feet.x, probe_top, _player_feet.z),
+		probe_top - _player_feet.y + 1.0
+	)
+	if not is_finite(ground_y) and not _player_grounded:
+		# Rescue a body that slipped just inside a freshly remeshed surface.
+		var rescue_y := _ground_probe(Vector3(_player_feet.x, _player_feet.y + 2.0, _player_feet.z), 4.0)
+		if is_finite(rescue_y) and rescue_y >= _player_feet.y - 0.2:
+			ground_y = rescue_y
 	if is_finite(ground_y):
+		var within_step := ground_y - prev_y <= play_step_height + 0.05
+		var crossing := _player_feet.y <= ground_y
 		var snap_to_ground := _player_grounded and _player_vel_y <= 0.0 \
 			and _player_feet.y - ground_y <= 0.35
-		if _player_feet.y <= ground_y or snap_to_ground:
+		if within_step and (crossing or snap_to_ground):
 			_player_feet.y = ground_y
 			_player_vel_y = 0.0
 			_player_grounded = true
@@ -958,8 +1071,16 @@ func _process_play(delta: float) -> void:
 	else:
 		_player_grounded = false
 
-	camera.global_position = _player_feet + Vector3(0.0, play_eye_height, 0.0)
-	camera.rotation = Vector3(_pitch, _yaw, 0.0)
+	if _player_grounded:
+		_last_safe_feet = _player_feet
+	elif _player_feet.y < _last_safe_feet.y - 80.0 or _player_feet.y < -64.0:
+		# Safety net for a missed ground sample while chunks stream in.
+		_player_feet = _last_safe_feet
+		_player_vel_y = 0.0
+		_player_grounded = true
+
+	_play_pcam.global_position = _player_feet + Vector3(0.0, play_eye_height, 0.0)
+	_play_pcam.rotation = Vector3(_pitch, _yaw, 0.0)
 	_update_pickaxe_swing(delta)
 	_update_arms_locomotion(wish.length())
 
@@ -1003,7 +1124,8 @@ func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
 		_yaw -= event.relative.x * mouse_sensitivity
 		_pitch = clamp(_pitch - event.relative.y * mouse_sensitivity, -1.45, 1.45)
-		camera.rotation = Vector3(_pitch, _yaw, 0.0)
+		if _mode == Mode.FLY:
+			camera.rotation = Vector3(_pitch, _yaw, 0.0)
 
 	elif event is InputEventKey and event.pressed:
 		if _mode == Mode.PLAY and event.keycode in [KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_0, KEY_B]:
@@ -1113,13 +1235,7 @@ func _process_fly(delta: float) -> void:
 	var speed := move_speed * (fast_multiplier if Input.is_key_pressed(KEY_SHIFT) else 1.0)
 	_velocity = input_dir.normalized() * speed if input_dir.length_squared() > 0.0 else Vector3.ZERO
 	camera.global_position += _velocity * delta
-
-	_update_stream_focus(false)
-	_apply_companion_gravity_and_ground_snap(delta)
-	_poll_pending_path_query()
-	_step_companion_along_path(delta)
-	_update_pending_pristine_hides(delta)
-	_update_hud(delta)
+	_fly_pcam.global_transform = camera.global_transform
 
 func _update_stream_focus(force: bool) -> void:
 	var cur_pos := camera.global_position

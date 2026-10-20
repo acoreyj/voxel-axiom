@@ -234,7 +234,8 @@ void test_sloped_cave_vertical_boundary_halo_gathering() {
     REQUIRE(cfg.filter_walkable_low_height_spans);
     REQUIRE(std::abs(cfg.agent_max_slope - 70.0f) < 1e-5f);
     REQUIRE(std::abs(cfg.agent_max_climb - 1.5f) < 1e-5f);
-    REQUIRE(std::abs(cfg.cell_size - 0.35f) < 1e-5f);
+    REQUIRE(std::abs(cfg.cell_size - 0.50f) < 1e-5f);
+    REQUIRE(std::abs(cfg.cell_height - 0.25f) < 1e-5f);
     REQUIRE(std::abs(cfg.agent_radius - 0.35f) < 1e-5f);
     REQUIRE(std::abs(cfg.region_min_size - 8.0f) < 1e-5f);
     REQUIRE(cfg.vertical_padding() > 4.0f);   // P_y = 1.8 + 1.5 + 2.0 = 5.3 m
