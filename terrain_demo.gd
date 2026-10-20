@@ -21,7 +21,10 @@ extends Node3D
 ## A second Atlas statue pair at z=-64 uses the same two styles, baked from atlas.glb:
 ##   Option 1 `AtlasOption1_MeshSwap` swaps atlas.obj for models/atlas/atlas_statue.vreg.
 ##   Option 2 `AtlasOption2_BakedVoxel` is stamped from the same watertight .vreg.
-## Key R resets all four statues (restores Option 1's pre-stamp chunks and pristine mesh);
+## A third Ape statue pair at z=-128 uses the same two styles, baked from ape.glb:
+##   Option 1 `ApeOption1_MeshSwap` swaps ape.obj for models/ape/ape_statue.vreg.
+##   Option 2 `ApeOption2_BakedVoxel` is stamped from the same watertight .vreg.
+## Key R resets all six statues (restores Option 1's pre-stamp chunks and pristine mesh);
 ## Key T toggles the add/paint material between soil and 3-hit rock.
 ## Right-click queries a 3D cave navigation path to the crosshair hit point and draws
 ## it as a green 3D ribbon that the cyan companion marker walks along. P (or Shift + RMB)
@@ -80,6 +83,13 @@ extends Node3D
 @export var atlas_mesh_path: String = "res://models/atlas/atlas.obj"
 @export var atlas_albedo_path: String = "res://models/atlas/atlas_albedo.png"
 @export var atlas_vreg_path: String = "models/atlas/atlas_statue.vreg"
+## Ape statue assets for the third side-by-side demo pair. `ape_statue.vreg` is
+## baked from models/ape/ape.glb's 5.333x (48 m tall) OBJ + albedo at 0.5 m
+## voxels with `--watertight --color-depth 2.8`. The OBJ is decimated to ~28.5k
+## triangles so the narrow-band bake stays tractable at this voxel size.
+@export var ape_mesh_path: String = "res://models/ape/ape.obj"
+@export var ape_albedo_path: String = "res://models/ape/ape_albedo.png"
+@export var ape_vreg_path: String = "models/ape/ape_statue.vreg"
 
 enum Tool { ADD_TERRAIN, EXPLODE, LARGE_EXPLODE, PAINT, PAINT_DELETE, BOULDER, WATER_QUENCH, FROST_ICE, LAVA_MAGMA, SMALL_HIT }
 
@@ -129,6 +139,18 @@ const ATLAS_ROOT_OFFSET_Y := 24.0
 const ATLAS_OPT1_WORLD_CENTER := Vector3(-16.0, 96.0, -64.0)
 const ATLAS_OPT2_WORLD_CENTER := Vector3(16.0, 96.0, -64.0)
 
+## Third side-by-side pair: the Ape statue at z=-128. ape.glb is also 9 m tall,
+## so it shares the 5.333x bake and region center/base placement. The model is
+## much wider (~53 m) than the Moai/Atlas, so the pair is spaced symmetrically
+## at x=+/-32. Its OBJ origin is at the feet (y 0..48), so the pristine mesh
+## root is seated 24 m above the statue center.
+const APE_REGION_CENTER := Vector3(160.0, 160.0, 128.0)
+const APE_BASE_LOCAL_Y := 112.0
+const APE_HALF_EXTENTS := Vector3(26.5, 24.0, 15.8)
+const APE_ROOT_OFFSET_Y := 24.0
+const APE_OPT1_WORLD_CENTER := Vector3(-32.0, 96.0, -128.0)
+const APE_OPT2_WORLD_CENTER := Vector3(32.0, 96.0, -128.0)
+
 @onready var terrain: VoxelTerrain3D = $VoxelTerrain3D
 @onready var ai_companion: VoxelAICompanion = $VoxelAICompanion
 @onready var camera: Camera3D = $Camera3D
@@ -143,6 +165,11 @@ const ATLAS_OPT2_WORLD_CENTER := Vector3(16.0, 96.0, -64.0)
 @onready var atlas_opt1_static_body: StaticBody3D = $AtlasOption1_MeshSwap/StaticBody3D
 @onready var atlas_opt1_col_shape: CollisionShape3D = $AtlasOption1_MeshSwap/StaticBody3D/CollisionShape3D
 @onready var atlas_opt1_label: Label3D = $AtlasOption1_MeshSwap/Label3D
+@onready var ape_opt1_root: Node3D = $ApeOption1_MeshSwap
+@onready var ape_opt1_mesh_inst: MeshInstance3D = $ApeOption1_MeshSwap/PristineMesh
+@onready var ape_opt1_static_body: StaticBody3D = $ApeOption1_MeshSwap/StaticBody3D
+@onready var ape_opt1_col_shape: CollisionShape3D = $ApeOption1_MeshSwap/StaticBody3D/CollisionShape3D
+@onready var ape_opt1_label: Label3D = $ApeOption1_MeshSwap/Label3D
 
 var _yaw: float = 0.0
 var _pitch: float = -0.25
@@ -194,6 +221,14 @@ var _atlas_opt2_world_center: Vector3 = ATLAS_OPT2_WORLD_CENTER
 var _atlas_opt1_origin_chunk: Vector3 = Vector3.ZERO
 var _atlas_opt2_origin_chunk: Vector3 = Vector3.ZERO
 
+var _ape_opt1_swapped_to_voxels: bool = false
+var _ape_opt1_structure_id: int = 0
+var _ape_opt2_structure_id: int = 0
+var _ape_opt1_world_center: Vector3 = APE_OPT1_WORLD_CENTER
+var _ape_opt2_world_center: Vector3 = APE_OPT2_WORLD_CENTER
+var _ape_opt1_origin_chunk: Vector3 = Vector3.ZERO
+var _ape_opt2_origin_chunk: Vector3 = Vector3.ZERO
+
 func _ready() -> void:
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 	terrain.explosion_requested.connect(_on_explosion_requested)
@@ -211,6 +246,7 @@ func _ready() -> void:
 	_setup_path_debug_visuals()
 	_setup_side_by_side_moai_statues()
 	_setup_side_by_side_atlas_statues()
+	_setup_side_by_side_ape_statues()
 	_update_stream_focus(true)
 
 func _setup_path_debug_visuals() -> void:
@@ -270,6 +306,9 @@ func _moai_origin_for_surface(world_x: float, world_z: float) -> Vector3:
 func _atlas_origin_for_surface(world_x: float, world_z: float) -> Vector3:
 	return _statue_origin_for_surface(ATLAS_REGION_CENTER, ATLAS_BASE_LOCAL_Y, world_x, world_z)
 
+func _ape_origin_for_surface(world_x: float, world_z: float) -> Vector3:
+	return _statue_origin_for_surface(APE_REGION_CENTER, APE_BASE_LOCAL_Y, world_x, world_z)
+
 func _setup_side_by_side_moai_statues() -> void:
 	# 1. Option 1 (Left at x=-16, z=0): Load the 2x (48 m) moai_statue.obj +
 	#    albedo onto PristineMesh. It stays a normal mesh + StaticBody3D until the
@@ -321,6 +360,32 @@ func _setup_side_by_side_atlas_statues() -> void:
 	print("[AtlasDemo] Option 1 (Pristine Mesh -> Voxel Swap) ready at ", _atlas_opt1_world_center,
 		" | Option 2 (Baked Per-Voxel Albedo, id=#", _atlas_opt2_structure_id, ") stamped at ", _atlas_opt2_world_center)
 
+func _setup_side_by_side_ape_statues() -> void:
+	# Same two styles as the Moai and Atlas pairs, one row further down the view
+	# direction (z=-128). ape.glb is also baked at 5.333x (48 m tall) and shares
+	# the region center/base, letting all three pairs seat at the same level.
+	_load_pristine_ape_mesh_and_collider()
+	_ape_opt1_swapped_to_voxels = false
+	_ape_opt1_structure_id = 0
+
+	_ape_opt2_origin_chunk = _ape_origin_for_surface(APE_OPT2_WORLD_CENTER.x, APE_OPT2_WORLD_CENTER.z)
+	_ape_opt2_world_center = (_ape_opt2_origin_chunk * 32.0 + APE_REGION_CENTER) * terrain.voxel_scale
+	# Resolve Option 1 from its own stamp origin (not the raw constant) so the
+	# pristine mesh sits exactly where the voxel structure will appear. Reuse
+	# Option 2's chunk-aligned Y so both halves of the pair stand level.
+	_ape_opt1_origin_chunk = _ape_origin_for_surface(APE_OPT1_WORLD_CENTER.x, APE_OPT1_WORLD_CENTER.z)
+	_ape_opt1_origin_chunk.y = _ape_opt2_origin_chunk.y
+	_ape_opt1_world_center = (_ape_opt1_origin_chunk * 32.0 + APE_REGION_CENTER) * terrain.voxel_scale
+	ape_opt1_root.global_position = _ape_opt1_world_center - Vector3(0.0, APE_ROOT_OFFSET_Y, 0.0)
+
+	_ape_opt2_structure_id = _stamp_structure(ape_vreg_path, _ape_opt2_origin_chunk, 15.0)
+	if _ape_opt2_structure_id <= 0:
+		push_warning("[ApeDemo] Failed to stamp '%s' - bake it first: voxel_baker models/ape/ape.obj %s --voxel-scale 0.5 --watertight --texture models/ape/ape_albedo.ppm --color-depth 2.8 --center-x 160 --center-y 160 --center-z 128" % [
+			ape_vreg_path, ape_vreg_path
+		])
+	print("[ApeDemo] Option 1 (Pristine Mesh -> Voxel Swap) ready at ", _ape_opt1_world_center,
+		" | Option 2 (Baked Per-Voxel Albedo, id=#", _ape_opt2_structure_id, ") stamped at ", _ape_opt2_world_center)
+
 func _load_pristine_moai_mesh_and_collider() -> void:
 	var mesh_candidates: Array[String] = [
 		moai_mesh_path,
@@ -350,6 +415,19 @@ func _load_pristine_atlas_mesh_and_collider() -> void:
 		"models/atlas/atlas_albedo.png",
 	]
 	_load_pristine_statue_mesh(mesh_candidates, albedo_candidates, atlas_opt1_mesh_inst, atlas_opt1_col_shape, "AtlasDemo")
+
+func _load_pristine_ape_mesh_and_collider() -> void:
+	var mesh_candidates: Array[String] = [
+		ape_mesh_path,
+		"res://models/ape/ape.obj",
+		"models/ape/ape.obj",
+	]
+	var albedo_candidates: Array[String] = [
+		ape_albedo_path,
+		"res://models/ape/ape_albedo.png",
+		"models/ape/ape_albedo.png",
+	]
+	_load_pristine_statue_mesh(mesh_candidates, albedo_candidates, ape_opt1_mesh_inst, ape_opt1_col_shape, "ApeDemo")
 
 func _load_pristine_statue_mesh(mesh_candidates: Array[String], albedo_candidates: Array[String], target_mesh: MeshInstance3D, target_shape: CollisionShape3D, tag: String) -> void:
 	var f: FileAccess = null
@@ -487,12 +565,31 @@ func _check_and_swap_atlas_opt1_on_blast(blast_pos: Vector3, blast_radius: float
 		atlas_opt1_label.text = "Atlas Option 1 (5.33x Scale): SWAPPED TO VOXELS (#%d)\n(Carve freely | Press R to restore Pristine Mesh)" % _atlas_opt1_structure_id
 		print("[AtlasSwap] Option 1 Atlas hit at ", blast_pos, " -> Hid PristineMesh & stamped Voxel Structure #", _atlas_opt1_structure_id, "!")
 
+## Same pristine-mesh-to-voxel swap for the Ape Option 1 statue.
+func _check_and_swap_ape_opt1_on_blast(blast_pos: Vector3, blast_radius: float, hit_collider: Object) -> void:
+	if _ape_opt1_swapped_to_voxels:
+		return
+	var direct_hit := (hit_collider == ape_opt1_static_body)
+	var dx: float = max(0.0, abs(blast_pos.x - _ape_opt1_world_center.x) - APE_HALF_EXTENTS.x)
+	var dy: float = max(0.0, abs(blast_pos.y - _ape_opt1_world_center.y) - APE_HALF_EXTENTS.y)
+	var dz: float = max(0.0, abs(blast_pos.z - _ape_opt1_world_center.z) - APE_HALF_EXTENTS.z)
+	var dist_to_box := sqrt(dx * dx + dy * dy + dz * dz)
+
+	if direct_hit or dist_to_box <= blast_radius + 2.0:
+		ape_opt1_mesh_inst.visible = false
+		ape_opt1_col_shape.disabled = true
+		_ape_opt1_structure_id = _stamp_structure(ape_vreg_path, _ape_opt1_origin_chunk, 0.0)
+		_ape_opt1_swapped_to_voxels = true
+		ape_opt1_label.text = "Ape Option 1 (5.33x Scale): SWAPPED TO VOXELS (#%d)\n(Carve freely | Press R to restore Pristine Mesh)" % _ape_opt1_structure_id
+		print("[ApeSwap] Option 1 Ape hit at ", blast_pos, " -> Hid PristineMesh & stamped Voxel Structure #", _ape_opt1_structure_id, "!")
+
 ## Key R reset loop. Option 1 is removed via terrain.remove_structure(), which
 ## restores the pre-stamp chunks bit-exactly and brings back the pristine mesh +
 ## collider. Option 2 is re-stamped if it was removed successfully.
 func _reset_statues() -> void:
 	_reset_moai_statues()
 	_reset_atlas_statues()
+	_reset_ape_statues()
 
 func _reset_moai_statues() -> void:
 	if _opt1_swapped_to_voxels and _opt1_structure_id > 0:
@@ -531,6 +628,26 @@ func _reset_atlas_statues() -> void:
 	if can_restamp_opt2:
 		_atlas_opt2_structure_id = _stamp_structure(atlas_vreg_path, _atlas_opt2_origin_chunk, 15.0)
 	print("[AtlasReset] Both Atlas statues restored to pristine state! (Option 2 id=#", _atlas_opt2_structure_id, ")")
+	if _companion_initialized and _goal_mesh_inst.visible:
+		_has_pending_path_query = true
+
+func _reset_ape_statues() -> void:
+	if _ape_opt1_swapped_to_voxels and _ape_opt1_structure_id > 0:
+		var ok := _remove_structure(_ape_opt1_structure_id)
+		print("[ApeReset] Removed Option 1 voxel structure #", _ape_opt1_structure_id, " (restored pre-stamp chunks: ", ok, ")")
+	_ape_opt1_swapped_to_voxels = false
+	_ape_opt1_structure_id = 0
+	ape_opt1_mesh_inst.visible = true
+	ape_opt1_col_shape.disabled = false
+	ape_opt1_label.text = "Ape Option 1 (5.33x Scale): Pristine Mesh -> Voxel Swap\n(Shoot to fracture into voxels | Press R to Reset)"
+
+	var can_restamp_opt2 := true
+	if _ape_opt2_structure_id > 0:
+		can_restamp_opt2 = _remove_structure(_ape_opt2_structure_id)
+	_ape_opt2_structure_id = 0
+	if can_restamp_opt2:
+		_ape_opt2_structure_id = _stamp_structure(ape_vreg_path, _ape_opt2_origin_chunk, 15.0)
+	print("[ApeReset] Both Ape statues restored to pristine state! (Option 2 id=#", _ape_opt2_structure_id, ")")
 	if _companion_initialized and _goal_mesh_inst.visible:
 		_has_pending_path_query = true
 
@@ -743,13 +860,15 @@ func _apply_click_tool() -> void:
 	var point := _aim_point()
 	# Aiming straight at a pristine statue should blast its surface, not the
 	# terrain behind it, so the swap and the crater land on the same spot.
-	if _is_boom_tool() and (not _opt1_swapped_to_voxels or not _atlas_opt1_swapped_to_voxels):
+	if _is_boom_tool() and (not _opt1_swapped_to_voxels or not _atlas_opt1_swapped_to_voxels or not _ape_opt1_swapped_to_voxels):
 		var phys_hit := _raycast_crosshair()
 		if not phys_hit.is_empty():
 			var hit_collider: Object = phys_hit.get("collider")
 			if not _opt1_swapped_to_voxels and hit_collider == opt1_static_body:
 				point = phys_hit.position
 			elif not _atlas_opt1_swapped_to_voxels and hit_collider == atlas_opt1_static_body:
+				point = phys_hit.position
+			elif not _ape_opt1_swapped_to_voxels and hit_collider == ape_opt1_static_body:
 				point = phys_hit.position
 	if _is_boom_tool():
 		if is_finite(_last_boom_point.x):
@@ -812,11 +931,12 @@ func _apply_tool_at(point: Vector3) -> void:
 		_rebake_in_progress = true
 	# First blast/elemental hit near either Option 1 statue swaps its pristine
 	# mesh for the stamped voxel version; the crater carve lands on the same frame.
-	if _is_boom_tool() and (not _opt1_swapped_to_voxels or not _atlas_opt1_swapped_to_voxels):
+	if _is_boom_tool() and (not _opt1_swapped_to_voxels or not _atlas_opt1_swapped_to_voxels or not _ape_opt1_swapped_to_voxels):
 		var hit := _raycast_crosshair()
 		var hit_collider: Object = hit.get("collider") if not hit.is_empty() else null
 		_check_and_swap_opt1_moai_on_blast(point, _active_radius(), hit_collider)
 		_check_and_swap_atlas_opt1_on_blast(point, _active_radius(), hit_collider)
+		_check_and_swap_ape_opt1_on_blast(point, _active_radius(), hit_collider)
 	match _active_tool:
 		Tool.ADD_TERRAIN:
 			terrain.add_terrain_with_material(point, add_radius, _add_material)

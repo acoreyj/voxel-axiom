@@ -120,6 +120,34 @@ text = "Atlas Option 2: 100% Voxel + Baked RGB5551 Albedo
 font_size = 42
 outline_size = 10
 
+[node name="ApeOption1_MeshSwap" type="Node3D" parent="." unique_id=1900000011]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -32, 72, -128)
+
+[node name="PristineMesh" type="MeshInstance3D" parent="ApeOption1_MeshSwap" unique_id=1900000012]
+
+[node name="StaticBody3D" type="StaticBody3D" parent="ApeOption1_MeshSwap" unique_id=1900000013]
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="ApeOption1_MeshSwap/StaticBody3D" unique_id=1900000014]
+
+[node name="Label3D" type="Label3D" parent="ApeOption1_MeshSwap" unique_id=1900000015]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 50, 0)
+billboard = 1
+text = "Ape Option 1 (5.33x Scale): Pristine Mesh -> Voxel Swap
+(Shoot to fracture into voxels | Press R to Reset)"
+font_size = 42
+outline_size = 10
+
+[node name="ApeOption2_BakedVoxel" type="Node3D" parent="." unique_id=1900000016]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 32, 96, -128)
+
+[node name="Label3D" type="Label3D" parent="ApeOption2_BakedVoxel" unique_id=1900000017]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 26, 0)
+billboard = 1
+text = "Ape Option 2: 100% Voxel + Baked RGB5551 Albedo
+(3-Hit Cracks + Raw Interior Crater | 15s Reconstitution)"
+font_size = 42
+outline_size = 10
+
 [node name="Camera3D" type="Camera3D" parent="." unique_id=263971570]
 transform = Transform3D(1, 0, 0, 0, 0.968912, 0.247404, 0, -0.247404, 0.968912, 16, 84, 48)
 current = true

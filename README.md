@@ -411,14 +411,15 @@ In the demo, **Key 0** stamps the configured `stamp_asset_path` at the crosshair
 with `stamp_recreate_delay_seconds` (default 15 s); **Key -** stamps it with no
 timer so it stays permanently destroyed. Aim at the terrain surface first.
 
-`voxel_terrain_demo.tscn` also seeds two 48 m statue pairs: the 2x Moai pair at
-`z = 0` and the 5.33x Atlas pair at `z = -64`, both stamped into a `0.5 m` voxel
-world. Each pair shows the same two styles side by side:
+`voxel_terrain_demo.tscn` also seeds three 48 m statue pairs: the 2x Moai pair
+at `z = 0`, the 5.33x Atlas pair at `z = -64`, and the 5.33x Ape pair at
+`z = -128`, all stamped into a `0.5 m` voxel world. Each pair shows the same two
+styles side by side:
 
 | Statue | Behavior |
 | --- | --- |
-| **Option 1 �?" Pristine Mesh Swap** | Shows the textured `models/moai_statue.obj` / `models/atlas/atlas.obj` mesh until the first blast reaches it; the hit hides the mesh and stamps the same statue as voxels (crater carved immediately). |
-| **Option 2 �?" Baked Voxel Colors** | Stamped at startup from `moai_statue.vreg` / `models/atlas/atlas_statue.vreg` with per-voxel albedo, 3-hit cracks, raw-rock craters, and a 15 s reconstitution timer. |
+| **Option 1 �?" Pristine Mesh Swap** | Shows the textured `models/moai_statue.obj` / `models/atlas/atlas.obj` / `models/ape/ape.obj` mesh until the first blast reaches it; the hit hides the mesh and stamps the same statue as voxels (crater carved immediately). |
+| **Option 2 �?" Baked Voxel Colors** | Stamped at startup from `moai_statue.vreg` / `models/atlas/atlas_statue.vreg` / `models/ape/ape_statue.vreg` with per-voxel albedo, 3-hit cracks, raw-rock craters, and a 15 s reconstitution timer. |
 
 The Atlas `.vreg` is baked watertight from the GLB's extracted OBJ + albedo:
 
@@ -438,8 +439,17 @@ voxel_baker models/moai_statue.obj moai_statue.vreg \
     --color-depth 2.8 --center-x 160 --center-y 160 --center-z 128
 ```
 
-**Key R** resets all four statues (removes the voxel structures, restores
-Option 1's pristine meshes, re-stamps both Option 2 statues); **Key T** toggles
+The Ape pair follows the same recipe from `models/ape/ape.glb` (decimated to
+~28.5k triangles before baking; see `models/ape/README.md`):
+
+```bash
+voxel_baker models/ape/ape.obj models/ape/ape_statue.vreg \
+    --voxel-scale 0.5 --watertight --texture models/ape/ape_albedo.ppm \
+    --color-depth 2.8 --center-x 160 --center-y 160 --center-z 128
+```
+
+**Key R** resets all six statues (removes the voxel structures, restores
+Option 1's pristine meshes, re-stamps every Option 2 statue); **Key T** toggles
 the add/paint material.
 
 ### Pill Companion (Demo)
