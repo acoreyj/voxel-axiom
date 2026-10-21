@@ -114,18 +114,79 @@ extends Node3D
 @export var pickaxe_impact_fraction: float = 0.42
 ## Swing length in seconds; the chip is applied at `pickaxe_impact_fraction`.
 const PICKAXE_SWING_TIME := 0.55
+const BASE_VIEWMODEL_POS := Vector3(0.64, -0.44, -0.18)
+const BASE_SHOULDER_ROT := Vector3(0.14, 0.16, -0.10)
+const BASE_ELBOW_ROT := Vector3(0.30, 0.06, 0.08)
+const BASE_WRIST_ROT := Vector3(-0.20, -0.10, 0.06)
 
 ## Tool palette in keyboard order: construction (1-4), destruction (5-7),
 ## elemental reactions (8-0). `TOOL_KEYS` is the keycap shown in the HUD.
 enum Tool { ADD_TERRAIN, PAINT, PAINT_DELETE, BOULDER, SMALL_HIT, EXPLODE, LARGE_EXPLODE, WATER_QUENCH, FROST_ICE, LAVA_MAGMA }
 
-## Fly is the original free camera; Play is the first-person pickaxe body.
-enum Mode { FLY, PLAY }
+## Fly is the original free camera; Play is the first-person pickaxe body;
+## Benchmark sweeps multiple VoxelTerrain3D settings and logs hardware + FPS/latency metrics.
+enum Mode { FLY, PLAY, BENCHMARK }
+
+enum BenchmarkPhase { SETTLE, STREAM_FLIGHT, DESTRUCTION_CSG, NAVIGATION_3D }
+
+const BENCHMARK_PHASE_NAMES := ["Settle & Warmup", "Stream Flight", "Destruction & CSG", "3D Nav Pathing"]
+const BENCHMARK_SETTLE_MAX_SEC := 3.5
+const BENCHMARK_FLIGHT_SEC := 4.5
+const BENCHMARK_DESTRUCTION_SEC := 4.0
+const BENCHMARK_NAV_SEC := 2.5
+const BENCHMARK_REPORT_JSON_USER := "user://voxel_benchmark_results.json"
+const BENCHMARK_REPORT_MD_USER := "user://voxel_benchmark_report.md"
+const BENCHMARK_REPORT_JSON_RES := "res://voxel_benchmark_results.json"
+const BENCHMARK_REPORT_MD_RES := "res://voxel_benchmark_report.md"
+
+const BENCHMARK_PRESETS := [
+	{
+		"name": "Low / Fast Stream",
+		"view_distance_chunks": 6,
+		"prefetch_distance_chunks": 1,
+		"upload_budget_ms": 1.5,
+		"collision_distance_chunks": 2,
+		"resident_memory_budget_mb": 512,
+	},
+	{
+		"name": "Balanced Default",
+		"view_distance_chunks": 8,
+		"prefetch_distance_chunks": 2,
+		"upload_budget_ms": 2.5,
+		"collision_distance_chunks": 4,
+		"resident_memory_budget_mb": 1024,
+	},
+	{
+		"name": "High Throughput Upload",
+		"view_distance_chunks": 10,
+		"prefetch_distance_chunks": 3,
+		"upload_budget_ms": 5.0,
+		"collision_distance_chunks": 4,
+		"resident_memory_budget_mb": 1536,
+	},
+	{
+		"name": "Extended Horizon",
+		"view_distance_chunks": 14,
+		"prefetch_distance_chunks": 4,
+		"upload_budget_ms": 6.0,
+		"collision_distance_chunks": 6,
+		"resident_memory_budget_mb": 2048,
+	},
+	{
+		"name": "Full Collision Stress",
+		"view_distance_chunks": 12,
+		"prefetch_distance_chunks": 2,
+		"upload_budget_ms": 8.0,
+		"collision_distance_chunks": 10,
+		"resident_memory_budget_mb": 2048,
+	},
+]
 
 const TOOL_NAMES := ["Add terrain", "Paint terrain", "Paint delete", "Place boulder", "Small hit", "Explode", "Large explode", "Water quench", "Frost / Ice", "Lava / Magma"]
 const TOOL_KEYS := ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"]
 const CONTROLS_TEXT := """CONTROLS  (H to hide)
-Mode    F fly / play   Play: WASD run   Shift sprint   Space jump
+Mode    F fly / play   M (or F8) run benchmark suite
+Play    WASD run   Shift sprint   Space jump   LMB swing pickaxe
 Move    W/A/S/D   Space or E up   Ctrl or Q down   Shift sprint
 Look    Mouse   Esc releases cursor   click recaptures
 Build   1 Add terrain   2 Paint   3 Paint delete   4 Boulder
@@ -221,6 +282,17 @@ var _swing_active: bool = false
 var _swing_hit_done: bool = false
 var _swing_elapsed: float = 0.0
 var _swing_impact_time: float = 0.0
+var _swing_hit_solid_recoil: float = 0.0
+var _idle_bob_time: float = 0.0
+var _mouse_sway_offset: Vector2 = Vector2.ZERO
+var _viewmodel_root: Node3D = null
+var _shoulder_pivot: Node3D = null
+var _elbow_pivot: Node3D = null
+var _wrist_pivot: Node3D = null
+var _pickaxe_root: Node3D = null
+var _pickaxe_tip_marker: Marker3D = null
+var _pickaxe_accent_mat: StandardMaterial3D = null
+var _impact_sparks: CPUParticles3D = null
 var _pcam_host: PhantomCameraHost = null
 var _fly_pcam: PhantomCamera3D = null
 var _play_pcam: PhantomCamera3D = null
@@ -284,6 +356,40 @@ var _ape_opt2_world_center: Vector3 = APE_OPT2_WORLD_CENTER
 var _ape_opt1_origin_chunk: Vector3 = Vector3.ZERO
 var _ape_opt2_origin_chunk: Vector3 = Vector3.ZERO
 
+## Benchmark state & telemetry accumulators
+var _bench_quit_on_finish: bool = false
+var _bench_saved_settings: Dictionary = {}
+var _bench_saved_cam_transform: Transform3D = Transform3D.IDENTITY
+var _bench_saved_yaw: float = 0.0
+var _bench_saved_pitch: float = 0.0
+var _bench_saved_vsync: int = DisplayServer.VSYNC_ENABLED
+var _bench_hardware_info: Dictionary = {}
+var _bench_preset_idx: int = 0
+var _bench_phase: int = BenchmarkPhase.SETTLE
+var _bench_phase_elapsed: float = 0.0
+var _bench_preset_elapsed: float = 0.0
+var _bench_settle_time_ms: float = 0.0
+var _bench_frame_times_ms: PackedFloat64Array = PackedFloat64Array()
+var _bench_phase_frame_times: Dictionary = {}
+var _bench_commits_count: int = 0
+var _bench_csg_step_idx: int = 0
+var _bench_csg_next_fire_sec: float = 0.0
+var _bench_pending_blast_start_usec: PackedInt64Array = PackedInt64Array()
+var _bench_blast_latencies_ms: PackedFloat64Array = PackedFloat64Array()
+var _bench_affected_chunks_total: int = 0
+var _bench_nav_query_started: bool = false
+var _bench_nav_start_usec: int = 0
+var _bench_nav_sync_ms: float = 0.0
+var _bench_nav_query_ms: float = 0.0
+var _bench_nav_waypoints: int = 0
+var _bench_peak_vram_mb: float = 0.0
+var _bench_peak_ram_mb: float = 0.0
+var _bench_peak_draw_calls: int = 0
+var _bench_peak_primitives: int = 0
+var _bench_results: Array[Dictionary] = []
+var _bench_last_summary_banner: String = ""
+var _bench_banner_timer: float = 0.0
+
 func _ready() -> void:
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 	terrain.explosion_requested.connect(_on_explosion_requested)
@@ -298,6 +404,7 @@ func _ready() -> void:
 	if terrain.has_signal("structure_removed"):
 		terrain.connect("structure_removed", Callable(self, "_on_structure_removed"))
 
+	_setup_pickaxe_viewmodel()
 	_setup_path_debug_visuals()
 	controls_label.text = CONTROLS_TEXT
 	controls_label.visible = _controls_visible
@@ -306,6 +413,7 @@ func _ready() -> void:
 	_setup_side_by_side_ape_statues()
 	_setup_phantom_camera()
 	_update_stream_focus(true)
+	_check_cli_benchmark_autostart()
 
 func _setup_path_debug_visuals() -> void:
 	# 1. Cyan capsule marker on VoxelAICompanion so you can see it walk along the path
@@ -811,15 +919,302 @@ func _setup_phantom_camera() -> void:
 	_fly_pcam.priority = 1
 
 func _toggle_mode() -> void:
+	if _mode == Mode.BENCHMARK:
+		_stop_benchmark(true)
+		return
 	if _mode == Mode.FLY:
 		_enter_play()
 	else:
 		_exit_play()
 
+func _setup_pickaxe_viewmodel() -> void:
+	_viewmodel_root = camera.get_node_or_null("ViewmodelRoot") as Node3D
+	if _viewmodel_root == null:
+		_viewmodel_root = Node3D.new()
+		_viewmodel_root.name = "ViewmodelRoot"
+		camera.add_child(_viewmodel_root)
+	_viewmodel_root.position = BASE_VIEWMODEL_POS
+	_viewmodel_root.visible = (_mode == Mode.PLAY)
+
+	_shoulder_pivot = _viewmodel_root.get_node_or_null("ShoulderPivot") as Node3D
+	if _shoulder_pivot == null:
+		_shoulder_pivot = Node3D.new()
+		_shoulder_pivot.name = "ShoulderPivot"
+		_viewmodel_root.add_child(_shoulder_pivot)
+	_shoulder_pivot.rotation = BASE_SHOULDER_ROT
+
+	_elbow_pivot = _shoulder_pivot.get_node_or_null("ElbowPivot") as Node3D
+	if _elbow_pivot == null:
+		_elbow_pivot = Node3D.new()
+		_elbow_pivot.name = "ElbowPivot"
+		_shoulder_pivot.add_child(_elbow_pivot)
+	_elbow_pivot.position = Vector3(-0.04, 0.06, -0.26)
+	_elbow_pivot.rotation = BASE_ELBOW_ROT
+
+	_wrist_pivot = _elbow_pivot.get_node_or_null("WristPivot") as Node3D
+	if _wrist_pivot == null:
+		_wrist_pivot = Node3D.new()
+		_wrist_pivot.name = "WristPivot"
+		_elbow_pivot.add_child(_wrist_pivot)
+	_wrist_pivot.position = Vector3(-0.05, 0.08, -0.28)
+	_wrist_pivot.rotation = BASE_WRIST_ROT
+
+	_pickaxe_root = _wrist_pivot.get_node_or_null("PickaxeRoot") as Node3D
+	if _pickaxe_root == null:
+		_pickaxe_root = Node3D.new()
+		_pickaxe_root.name = "PickaxeRoot"
+		_wrist_pivot.add_child(_pickaxe_root)
+
+	var sleeve_mat := StandardMaterial3D.new()
+	sleeve_mat.albedo_color = Color(0.20, 0.25, 0.32)
+	sleeve_mat.roughness = 0.82
+
+	var skin_mat := StandardMaterial3D.new()
+	skin_mat.albedo_color = Color(0.84, 0.65, 0.52)
+	skin_mat.roughness = 0.65
+
+	var bracer_mat := StandardMaterial3D.new()
+	bracer_mat.albedo_color = Color(0.34, 0.23, 0.15)
+	bracer_mat.roughness = 0.72
+	bracer_mat.metallic = 0.15
+
+	var glove_mat := StandardMaterial3D.new()
+	glove_mat.albedo_color = Color(0.24, 0.18, 0.13)
+	glove_mat.roughness = 0.78
+
+	var wood_handle_mat := StandardMaterial3D.new()
+	wood_handle_mat.albedo_color = Color(0.46, 0.29, 0.15)
+	wood_handle_mat.roughness = 0.75
+
+	var grip_wrap_mat := StandardMaterial3D.new()
+	grip_wrap_mat.albedo_color = Color(0.18, 0.14, 0.11)
+	grip_wrap_mat.roughness = 0.88
+
+	var dark_iron_mat := StandardMaterial3D.new()
+	dark_iron_mat.albedo_color = Color(0.28, 0.30, 0.34)
+	dark_iron_mat.metallic = 0.82
+	dark_iron_mat.roughness = 0.36
+
+	_pickaxe_accent_mat = StandardMaterial3D.new()
+	_pickaxe_accent_mat.albedo_color = Color(0.76, 0.78, 0.84)
+	_pickaxe_accent_mat.metallic = 0.90
+	_pickaxe_accent_mat.roughness = 0.24
+	_pickaxe_accent_mat.emission_enabled = true
+	_pickaxe_accent_mat.emission = Color(1.0, 0.55, 0.12) * 0.45
+
+	# 1. Upper Arm (Shoulder -> Elbow, overlapped across the elbow joint)
+	var upper_arm := MeshInstance3D.new()
+	upper_arm.name = "UpperArmMesh"
+	var upper_cap := CapsuleMesh.new()
+	upper_cap.radius = 0.068
+	upper_cap.height = 0.42
+	upper_arm.mesh = upper_cap
+	upper_arm.material_override = sleeve_mat
+	upper_arm.position = Vector3(-0.02, 0.02, -0.11)
+	upper_arm.rotation = Vector3(PI * 0.43, 0.15, 0.0)
+	upper_arm.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_shoulder_pivot.add_child(upper_arm)
+
+	# 2. Forearm & Leather Bracer (Elbow -> Wrist, overlapped with upper arm & hand)
+	var forearm := MeshInstance3D.new()
+	forearm.name = "ForearmMesh"
+	var forearm_cap := CapsuleMesh.new()
+	forearm_cap.radius = 0.058
+	forearm_cap.height = 0.38
+	forearm.mesh = forearm_cap
+	forearm.material_override = skin_mat
+	forearm.position = Vector3(-0.025, 0.04, -0.14)
+	forearm.rotation = Vector3(PI * 0.41, 0.17, 0.0)
+	forearm.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_elbow_pivot.add_child(forearm)
+
+	var bracer := MeshInstance3D.new()
+	bracer.name = "ForearmBracerMesh"
+	var bracer_cyl := CylinderMesh.new()
+	bracer_cyl.top_radius = 0.056
+	bracer_cyl.bottom_radius = 0.064
+	bracer_cyl.height = 0.16
+	bracer.mesh = bracer_cyl
+	bracer.material_override = bracer_mat
+	bracer.position = Vector3(-0.035, 0.055, -0.19)
+	bracer.rotation = Vector3(PI * 0.42, 0.16, 0.0)
+	bracer.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_elbow_pivot.add_child(bracer)
+
+	# 3. Gloved Hand & Fingers at WristPivot
+	var hand := MeshInstance3D.new()
+	hand.name = "HandFistMesh"
+	var hand_box := BoxMesh.new()
+	hand_box.size = Vector3(0.105, 0.115, 0.115)
+	hand.mesh = hand_box
+	hand.material_override = glove_mat
+	hand.position = Vector3(0.0, 0.02, -0.04)
+	hand.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_wrist_pivot.add_child(hand)
+
+	var fingers := MeshInstance3D.new()
+	fingers.name = "FingerKnucklesMesh"
+	var fingers_box := BoxMesh.new()
+	fingers_box.size = Vector3(0.085, 0.095, 0.055)
+	fingers.mesh = fingers_box
+	fingers.material_override = skin_mat
+	fingers.position = Vector3(-0.025, 0.02, -0.09)
+	fingers.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_wrist_pivot.add_child(fingers)
+
+	# 4. Pickaxe Assembly inside _pickaxe_root
+	_pickaxe_root.position = Vector3(0.0, 0.02, -0.05)
+	_pickaxe_root.rotation = Vector3(-0.28, 0.10, 0.08)
+
+	var shaft := MeshInstance3D.new()
+	shaft.name = "HandleShaft"
+	var shaft_cyl := CylinderMesh.new()
+	shaft_cyl.top_radius = 0.026
+	shaft_cyl.bottom_radius = 0.022
+	shaft_cyl.height = 0.78
+	shaft.mesh = shaft_cyl
+	shaft.material_override = wood_handle_mat
+	shaft.position = Vector3(0.0, 0.18, 0.0)
+	shaft.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_pickaxe_root.add_child(shaft)
+
+	var grip := MeshInstance3D.new()
+	grip.name = "HandleGripWrap"
+	var grip_cyl := CylinderMesh.new()
+	grip_cyl.top_radius = 0.028
+	grip_cyl.bottom_radius = 0.027
+	grip_cyl.height = 0.24
+	grip.mesh = grip_cyl
+	grip.material_override = grip_wrap_mat
+	grip.position = Vector3(0.0, 0.02, 0.0)
+	grip.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_pickaxe_root.add_child(grip)
+
+	var pommel := MeshInstance3D.new()
+	pommel.name = "PommelCap"
+	var pommel_cyl := CylinderMesh.new()
+	pommel_cyl.top_radius = 0.030
+	pommel_cyl.bottom_radius = 0.036
+	pommel_cyl.height = 0.05
+	pommel.mesh = pommel_cyl
+	pommel.material_override = dark_iron_mat
+	pommel.position = Vector3(0.0, -0.21, 0.0)
+	pommel.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_pickaxe_root.add_child(pommel)
+
+	var collar := MeshInstance3D.new()
+	collar.name = "HeadCollar"
+	var collar_box := BoxMesh.new()
+	collar_box.size = Vector3(0.085, 0.11, 0.13)
+	collar.mesh = collar_box
+	collar.material_override = dark_iron_mat
+	collar.position = Vector3(0.0, 0.50, 0.0)
+	collar.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_pickaxe_root.add_child(collar)
+
+	var top_stud := MeshInstance3D.new()
+	top_stud.name = "TopSpikeStud"
+	var stud_cyl := CylinderMesh.new()
+	stud_cyl.top_radius = 0.006
+	stud_cyl.bottom_radius = 0.028
+	stud_cyl.height = 0.07
+	top_stud.mesh = stud_cyl
+	top_stud.material_override = _pickaxe_accent_mat
+	top_stud.position = Vector3(0.0, 0.59, 0.0)
+	top_stud.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_pickaxe_root.add_child(top_stud)
+
+	var front_arm := MeshInstance3D.new()
+	front_arm.name = "FrontPickArm"
+	var front_arm_box := BoxMesh.new()
+	front_arm_box.size = Vector3(0.052, 0.068, 0.24)
+	front_arm.mesh = front_arm_box
+	front_arm.material_override = dark_iron_mat
+	front_arm.position = Vector3(0.0, 0.49, -0.14)
+	front_arm.rotation = Vector3(0.18, 0.0, 0.0)
+	front_arm.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_pickaxe_root.add_child(front_arm)
+
+	var front_tip := MeshInstance3D.new()
+	front_tip.name = "FrontPickSpikeTip"
+	var front_tip_prism := PrismMesh.new()
+	front_tip_prism.size = Vector3(0.048, 0.20, 0.064)
+	front_tip.mesh = front_tip_prism
+	front_tip.material_override = _pickaxe_accent_mat
+	front_tip.position = Vector3(0.0, 0.0, -0.20)
+	front_tip.rotation = Vector3(-PI * 0.5, 0.0, 0.0)
+	front_tip.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	front_arm.add_child(front_tip)
+
+	var back_arm := MeshInstance3D.new()
+	back_arm.name = "BackPickArm"
+	var back_arm_box := BoxMesh.new()
+	back_arm_box.size = Vector3(0.054, 0.068, 0.18)
+	back_arm.mesh = back_arm_box
+	back_arm.material_override = dark_iron_mat
+	back_arm.position = Vector3(0.0, 0.49, 0.11)
+	back_arm.rotation = Vector3(-0.15, 0.0, 0.0)
+	back_arm.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_pickaxe_root.add_child(back_arm)
+
+	var back_blade := MeshInstance3D.new()
+	back_blade.name = "BackChiselWedge"
+	var back_prism := PrismMesh.new()
+	back_prism.size = Vector3(0.064, 0.14, 0.064)
+	back_blade.mesh = back_prism
+	back_blade.material_override = _pickaxe_accent_mat
+	back_blade.position = Vector3(0.0, 0.0, 0.15)
+	back_blade.rotation = Vector3(PI * 0.5, 0.0, 0.0)
+	back_blade.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	back_arm.add_child(back_blade)
+
+	_pickaxe_tip_marker = Marker3D.new()
+	_pickaxe_tip_marker.name = "PickaxeTipMarker"
+	_pickaxe_tip_marker.position = Vector3(0.0, 0.41, -0.42)
+	_pickaxe_root.add_child(_pickaxe_tip_marker)
+
+	_impact_sparks = CPUParticles3D.new()
+	_impact_sparks.name = "PickaxeImpactSparks"
+	_impact_sparks.emitting = false
+	_impact_sparks.one_shot = true
+	_impact_sparks.amount = 28
+	_impact_sparks.lifetime = 0.38
+	_impact_sparks.explosiveness = 0.95
+	var spark_mesh := BoxMesh.new()
+	spark_mesh.size = Vector3(0.14, 0.14, 0.14)
+	var spark_mat := StandardMaterial3D.new()
+	spark_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	spark_mat.albedo_color = Color(1.0, 0.82, 0.32)
+	spark_mesh.material = spark_mat
+	_impact_sparks.mesh = spark_mesh
+	_impact_sparks.direction = Vector3(0.0, 1.0, 0.0)
+	_impact_sparks.spread = 75.0
+	_impact_sparks.initial_velocity_min = 6.0
+	_impact_sparks.initial_velocity_max = 16.0
+	_impact_sparks.gravity = Vector3(0.0, -24.0, 0.0)
+	add_child(_impact_sparks)
+
+func _spawn_pickaxe_impact_sparks(world_pos: Vector3, hit_normal: Vector3) -> void:
+	if _impact_sparks == null:
+		return
+	_impact_sparks.global_position = world_pos
+	_impact_sparks.direction = hit_normal.normalized() if hit_normal.length_squared() > 0.01 else Vector3.UP
+	_impact_sparks.restart()
+	_impact_sparks.emitting = true
+
 func _enter_play() -> void:
 	_mode = Mode.PLAY
 	_tool_pressed = false
 	_swing_active = false
+	_swing_hit_done = false
+	_swing_elapsed = 0.0
+	_swing_hit_solid_recoil = 0.0
+	if _viewmodel_root != null:
+		_viewmodel_root.visible = true
+		_viewmodel_root.position = BASE_VIEWMODEL_POS
+		_shoulder_pivot.rotation = BASE_SHOULDER_ROT
+		_elbow_pivot.rotation = BASE_ELBOW_ROT
+		_wrist_pivot.rotation = BASE_WRIST_ROT
 	var eye := camera.global_position
 	var ground_y := _ground_probe(eye + Vector3(0.0, play_step_height, 0.0), 400.0)
 	_spawn_pending = not is_finite(ground_y)
@@ -848,6 +1243,9 @@ func _enter_play() -> void:
 func _exit_play() -> void:
 	_mode = Mode.FLY
 	_swing_active = false
+	_swing_hit_done = false
+	if _viewmodel_root != null:
+		_viewmodel_root.visible = false
 	_player_vel_y = 0.0
 	_player_grounded = false
 	_velocity = Vector3.ZERO
@@ -863,31 +1261,128 @@ func _start_pickaxe_swing() -> void:
 	_swing_active = true
 	_swing_hit_done = false
 	_swing_elapsed = 0.0
+	_swing_hit_solid_recoil = 0.0
 	_swing_impact_time = PICKAXE_SWING_TIME * pickaxe_impact_fraction
 
 func _update_pickaxe_swing(delta: float) -> void:
-	if not _swing_active:
+	if _viewmodel_root == null:
 		return
-	_swing_elapsed += delta
-	if not _swing_hit_done and _swing_elapsed >= _swing_impact_time:
-		_swing_hit_done = true
-		_apply_pickaxe_hit()
-	if _swing_elapsed >= PICKAXE_SWING_TIME:
-		_swing_active = false
-		_swing_hit_done = false
+	# Allow holding Left Mouse Button in Play mode to continuously swing the pickaxe
+	if _mode == Mode.PLAY and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED and Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
+		if not _swing_active:
+			_start_pickaxe_swing()
 
-func _apply_pickaxe_hit() -> void:
+	_mouse_sway_offset = _mouse_sway_offset.lerp(Vector2.ZERO, minf(1.0, delta * 12.0))
+	var move_factor := clampf(_velocity.length() / maxf(0.1, play_run_speed), 0.0, 1.5)
+	_idle_bob_time += delta * (2.2 + move_factor * 6.5)
+	var bob_x := sin(_idle_bob_time * 0.5) * (0.006 + 0.014 * move_factor)
+	var bob_y := absf(cos(_idle_bob_time)) * (0.008 + 0.018 * move_factor)
+	var air_lag_y := clampf(-_player_vel_y * 0.0025, -0.04, 0.04)
+
+	var target_pos := BASE_VIEWMODEL_POS + Vector3(
+		bob_x + _mouse_sway_offset.x,
+		-bob_y + _mouse_sway_offset.y + air_lag_y,
+		0.0
+	)
+	var shoulder_rot := BASE_SHOULDER_ROT
+	var elbow_rot := BASE_ELBOW_ROT
+	var wrist_rot := BASE_WRIST_ROT
+
+	if _swing_active:
+		_swing_elapsed += delta
+		var u := clampf(_swing_elapsed / maxf(0.05, PICKAXE_SWING_TIME), 0.0, 1.0)
+		var impact_u := clampf(pickaxe_impact_fraction, 0.20, 0.75)
+		var windup_end := impact_u * 0.62
+		var follow_end := minf(0.90, impact_u + 0.24)
+
+		# 1. Windup Pose: arm raises up and cocks back over the right shoulder
+		var windup_shoulder := BASE_SHOULDER_ROT + Vector3(0.68, -0.26, -0.28)
+		var windup_elbow := BASE_ELBOW_ROT + Vector3(0.46, 0.0, 0.16)
+		var windup_wrist := BASE_WRIST_ROT + Vector3(0.42, 0.10, -0.12)
+		var windup_offset := Vector3(0.06, 0.11, 0.08)
+
+		# 2. Downstroke Strike Pose: arm drives forward and across toward the crosshair
+		var strike_shoulder := BASE_SHOULDER_ROT + Vector3(-0.88, 0.48, 0.32)
+		var strike_elbow := BASE_ELBOW_ROT + Vector3(-0.24, 0.12, -0.10)
+		var strike_wrist := BASE_WRIST_ROT + Vector3(-0.92, -0.18, 0.18)
+		var strike_offset := Vector3(-0.14, -0.08, -0.16)
+
+		# 3. Follow-Through / Solid-Hit Recoil Pose
+		var follow_shoulder := BASE_SHOULDER_ROT + Vector3(
+			-0.52 + 0.42 * _swing_hit_solid_recoil,
+			0.30 - 0.15 * _swing_hit_solid_recoil,
+			0.18
+		)
+		var follow_elbow := BASE_ELBOW_ROT + Vector3(
+			-0.12 + 0.30 * _swing_hit_solid_recoil,
+			0.05,
+			0.0
+		)
+		var follow_wrist := BASE_WRIST_ROT + Vector3(
+			-0.55 + 0.48 * _swing_hit_solid_recoil,
+			-0.08,
+			0.10
+		)
+		var follow_offset := Vector3(-0.08, -0.05 + 0.06 * _swing_hit_solid_recoil, -0.06)
+
+		if not _swing_hit_done and _swing_elapsed >= _swing_impact_time:
+			_swing_hit_done = true
+			var hit_surface := _apply_pickaxe_hit()
+			_swing_hit_solid_recoil = 1.0 if hit_surface else 0.0
+
+		if u < windup_end:
+			var t := u / maxf(0.01, windup_end)
+			var e := 1.0 - pow(1.0 - t, 2.5)
+			shoulder_rot = BASE_SHOULDER_ROT.lerp(windup_shoulder, e)
+			elbow_rot = BASE_ELBOW_ROT.lerp(windup_elbow, e)
+			wrist_rot = BASE_WRIST_ROT.lerp(windup_wrist, e)
+			target_pos += windup_offset * e
+		elif u < impact_u:
+			var t := (u - windup_end) / maxf(0.01, impact_u - windup_end)
+			var e := t * t * (3.0 - 2.0 * t)
+			shoulder_rot = windup_shoulder.lerp(strike_shoulder, e)
+			elbow_rot = windup_elbow.lerp(strike_elbow, e)
+			wrist_rot = windup_wrist.lerp(strike_wrist, e)
+			target_pos += windup_offset.lerp(strike_offset, e)
+		elif u < follow_end:
+			var t := (u - impact_u) / maxf(0.01, follow_end - impact_u)
+			var e := sin(t * PI * 0.5)
+			shoulder_rot = strike_shoulder.lerp(follow_shoulder, e)
+			elbow_rot = strike_elbow.lerp(follow_elbow, e)
+			wrist_rot = strike_wrist.lerp(follow_wrist, e)
+			target_pos += strike_offset.lerp(follow_offset, e)
+		else:
+			var t := (u - follow_end) / maxf(0.01, 1.0 - follow_end)
+			var e := t * t * (3.0 - 2.0 * t)
+			shoulder_rot = follow_shoulder.lerp(BASE_SHOULDER_ROT, e)
+			elbow_rot = follow_elbow.lerp(BASE_ELBOW_ROT, e)
+			wrist_rot = follow_wrist.lerp(BASE_WRIST_ROT, e)
+			target_pos += follow_offset * (1.0 - e)
+
+		if _swing_elapsed >= PICKAXE_SWING_TIME:
+			_swing_active = false
+			_swing_hit_done = false
+
+	_viewmodel_root.position = target_pos
+	_shoulder_pivot.rotation = shoulder_rot
+	_elbow_pivot.rotation = elbow_rot
+	_wrist_pivot.rotation = wrist_rot
+
+func _apply_pickaxe_hit() -> bool:
 	var point := _pickaxe_aim_point()
 	if not is_finite(point.x):
-		return
+		return false
 	var hit := _raycast_crosshair()
 	var hit_collider: Object = hit.get("collider") if not hit.is_empty() else null
+	var hit_normal: Vector3 = hit.get("normal", Vector3.UP) if not hit.is_empty() else (camera.global_position - point).normalized()
+	_spawn_pickaxe_impact_sparks(point, hit_normal)
 	if _companion_initialized and _goal_mesh_inst.visible:
 		_rebake_in_progress = true
 	_check_and_swap_opt1_easter_island_on_blast(point, pickaxe_hit_radius, hit_collider)
 	_check_and_swap_atlas_opt1_on_blast(point, pickaxe_hit_radius, hit_collider)
 	_check_and_swap_ape_opt1_on_blast(point, pickaxe_hit_radius, hit_collider)
 	terrain.trigger_explosion(point, pickaxe_hit_radius)
+	return true
 
 func _pickaxe_aim_point() -> Vector3:
 	var from := camera.global_position
@@ -1042,10 +1537,17 @@ func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
 		_yaw -= event.relative.x * mouse_sensitivity
 		_pitch = clamp(_pitch - event.relative.y * mouse_sensitivity, -1.45, 1.45)
+		_mouse_sway_offset.x = clampf(_mouse_sway_offset.x - event.relative.x * 0.00035, -0.04, 0.04)
+		_mouse_sway_offset.y = clampf(_mouse_sway_offset.y + event.relative.y * 0.00035, -0.04, 0.04)
 		if _mode == Mode.FLY:
 			camera.rotation = Vector3(_pitch, _yaw, 0.0)
 
-	elif event is InputEventKey and event.pressed:
+	elif event is InputEventKey and event.pressed and not event.echo:
+		if event.keycode == KEY_M or event.keycode == KEY_F8:
+			_toggle_benchmark_mode()
+			return
+		if _mode == Mode.BENCHMARK and event.keycode not in [KEY_ESCAPE, KEY_H, KEY_F]:
+			return
 		if _mode == Mode.PLAY and event.keycode in [KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_0, KEY_B]:
 			return
 		match event.keycode:
@@ -1099,6 +1601,8 @@ func _unhandled_input(event: InputEvent) -> void:
 			if event.pressed:
 				Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 			return
+		if _mode == Mode.BENCHMARK:
+			return
 		if event.button_index == MOUSE_BUTTON_LEFT:
 			if _mode == Mode.PLAY:
 				_tool_pressed = false
@@ -1120,7 +1624,12 @@ func _unhandled_input(event: InputEvent) -> void:
 				_query_companion_cave_path_to_crosshair()
 
 func _process(delta: float) -> void:
-	if _mode == Mode.PLAY:
+	if _bench_banner_timer > 0.0:
+		_bench_banner_timer = maxf(0.0, _bench_banner_timer - delta)
+
+	if _mode == Mode.BENCHMARK:
+		_process_benchmark(delta)
+	elif _mode == Mode.PLAY:
 		_process_play(delta)
 	else:
 		_process_fly(delta)
@@ -1190,6 +1699,30 @@ func _update_hud(delta: float) -> void:
 	if _active_tool == Tool.ADD_TERRAIN or _active_tool == Tool.PAINT:
 		material_state = " | Material: %s (T)" % MATERIAL_NAMES[_add_material - 1]
 
+	if _mode == Mode.BENCHMARK:
+		var preset: Dictionary = BENCHMARK_PRESETS[_bench_preset_idx]
+		var phase_name: String = BENCHMARK_PHASE_NAMES[_bench_phase]
+		stats_label.text = "=== BENCHMARK MODE (Press M or F8 to abort) ===\nPreset %d/%d: %s\nPhase: %s (%.1fs)\nSettings: view=%d prefetch=%d budget=%.1fms mem=%dMB\nFPS: %.0f (%.2f ms) | Committed: %d (%.0f/s) | %s\nGPU: %s\nCPU: %s (%d threads)" % [
+			_bench_preset_idx + 1,
+			BENCHMARK_PRESETS.size(),
+			String(preset["name"]),
+			phase_name,
+			_bench_phase_elapsed,
+			terrain.view_distance_chunks,
+			terrain.prefetch_distance_chunks,
+			terrain.upload_budget_ms,
+			terrain.resident_memory_budget_mb,
+			_fps_smoothed,
+			1000.0 / max(_fps_smoothed, 1.0),
+			_committed_chunk_count,
+			_commits_per_second,
+			streaming_state,
+			String(_bench_hardware_info.get("gpu_name", "Unknown GPU")),
+			String(_bench_hardware_info.get("cpu_name", "Unknown CPU")),
+			int(_bench_hardware_info.get("cpu_threads", 0)),
+		]
+		return
+
 	var mode_name := "Play" if _mode == Mode.PLAY else "Fly"
 	var tool_text := "Pickaxe (LMB swing)" if _mode == Mode.PLAY \
 		else "[%s] %s%s" % [TOOL_KEYS[_active_tool], TOOL_NAMES[_active_tool], material_state]
@@ -1199,7 +1732,8 @@ func _update_hud(delta: float) -> void:
 		_look_at_accum = 0.0
 		_refresh_look_at_material()
 
-	stats_label.text = "FPS: %.0f  (%.2f ms)\nView dist: %d / %d chunks  (prefetch %d)\nCommitted: %d chunks  (%.0f/s)\nStreaming: %s\nMode: %s (F)\nLooking at: %s\nTool: %s\nControls: H" % [
+	var banner_suffix := ("\n" + _bench_last_summary_banner) if _bench_banner_timer > 0.0 and not _bench_last_summary_banner.is_empty() else ""
+	stats_label.text = "FPS: %.0f  (%.2f ms)\nView dist: %d / %d chunks  (prefetch %d)\nCommitted: %d chunks  (%.0f/s)\nStreaming: %s\nMode: %s (F) | Benchmark: M\nLooking at: %s\nTool: %s\nControls: H%s" % [
 		_fps_smoothed,
 		1000.0 / max(_fps_smoothed, 1.0),
 		terrain.get_effective_view_distance_chunks(),
@@ -1211,6 +1745,7 @@ func _update_hud(delta: float) -> void:
 		mode_name,
 		_look_at_name,
 		tool_text,
+		banner_suffix,
 	]
 
 ## Raycasts the crosshair ray and caches the display name of the material under the
@@ -1549,6 +2084,13 @@ func _on_explosion_requested(pos: Vector3, radius: float) -> void:
 	_print_throttled("[VoxelTerrain3D] Explosion requested at %s radius=%.1f" % [pos, radius])
 
 func _on_explosion_completed(pos: Vector3, radius: float, affected_chunks: int) -> void:
+	if _mode == Mode.BENCHMARK:
+		_bench_affected_chunks_total += affected_chunks
+		if not _bench_pending_blast_start_usec.is_empty():
+			var t0 := _bench_pending_blast_start_usec[0]
+			_bench_pending_blast_start_usec.remove_at(0)
+			var lat_ms := float(Time.get_ticks_usec() - t0) / 1000.0
+			_bench_blast_latencies_ms.push_back(lat_ms)
 	_print_throttled("[VoxelTerrain3D] Explosion completed at %s radius=%.1f chunks=%d" % [pos, radius, affected_chunks])
 	# Snap the goal sphere down if the ground under the goal was carved away
 	if _goal_mesh_inst.visible:
@@ -1569,6 +2111,13 @@ func _on_terrain_add_requested(pos: Vector3, radius: float) -> void:
 	_print_throttled("[VoxelTerrain3D] Add terrain requested at %s radius=%.1f" % [pos, radius])
 
 func _on_terrain_add_completed(pos: Vector3, radius: float, affected_chunks: int) -> void:
+	if _mode == Mode.BENCHMARK:
+		_bench_affected_chunks_total += affected_chunks
+		if not _bench_pending_blast_start_usec.is_empty():
+			var t0 := _bench_pending_blast_start_usec[0]
+			_bench_pending_blast_start_usec.remove_at(0)
+			var lat_ms := float(Time.get_ticks_usec() - t0) / 1000.0
+			_bench_blast_latencies_ms.push_back(lat_ms)
 	_print_throttled("[VoxelTerrain3D] Add terrain completed at %s radius=%.1f chunks=%d" % [pos, radius, affected_chunks])
 
 func _on_terrain_add_failed(reason: String) -> void:
@@ -1577,6 +2126,8 @@ func _on_terrain_add_failed(reason: String) -> void:
 func _on_chunk_committed(_chunk_key: int) -> void:
 	_committed_chunk_count += 1
 	_commits_in_window += 1
+	if _mode == Mode.BENCHMARK:
+		_bench_commits_count += 1
 
 ## A stamped structure was carved by an explosion/elemental reaction. Its
 ## reconstitution timer is now counting down (permanent stamps ignore this).
@@ -1600,3 +2151,574 @@ func _on_structure_removed(structure_id: int, asset_name: String) -> void:
 	])
 	if _companion_initialized and _goal_mesh_inst.visible:
 		_has_pending_path_query = true
+
+
+# ==============================================================================
+# Automated Multi-Setting & Hardware Benchmark Suite (Key M or F8 / --benchmark)
+# ==============================================================================
+
+func _check_cli_benchmark_autostart() -> void:
+	var all_args := OS.get_cmdline_args() + OS.get_cmdline_user_args()
+	for arg in all_args:
+		if arg == "--benchmark-quit":
+			_bench_quit_on_finish = true
+		if arg == "--benchmark" or arg == "--benchmark-quit":
+			call_deferred("_start_benchmark")
+			return
+
+func _toggle_benchmark_mode() -> void:
+	if _mode == Mode.BENCHMARK:
+		_stop_benchmark(true)
+	else:
+		_start_benchmark()
+
+func _collect_hardware_info() -> Dictionary:
+	var mem_info: Dictionary = OS.get_memory_info()
+	var phys_bytes: int = int(mem_info.get("physical", 0))
+	var free_bytes: int = int(mem_info.get("free", 0))
+	var avail_bytes: int = int(mem_info.get("available", 0))
+	var win_size: Vector2i = DisplayServer.window_get_size()
+	var vsync_mode: int = DisplayServer.window_get_vsync_mode()
+	var ver_info: Dictionary = Engine.get_version_info()
+	var cpu_threads: int = OS.get_processor_count()
+	var worker_threads: int = clampi(cpu_threads / 2, 2, 6)
+
+	var adapter_type_code: int = RenderingServer.get_video_adapter_type()
+	var adapter_type_str := "Other"
+	match adapter_type_code:
+		RenderingDevice.DEVICE_TYPE_DISCRETE_GPU:
+			adapter_type_str = "Discrete GPU"
+		RenderingDevice.DEVICE_TYPE_INTEGRATED_GPU:
+			adapter_type_str = "Integrated GPU"
+		RenderingDevice.DEVICE_TYPE_VIRTUAL_GPU:
+			adapter_type_str = "Virtual GPU"
+		RenderingDevice.DEVICE_TYPE_CPU:
+			adapter_type_str = "CPU / Software"
+
+	return {
+		"timestamp_utc": Time.get_datetime_string_from_system(true, true),
+		"timestamp_local": Time.get_datetime_string_from_system(false, true),
+		"os_name": OS.get_name(),
+		"os_distro": OS.get_distribution_name(),
+		"os_version": OS.get_version(),
+		"locale": OS.get_locale(),
+		"cpu_name": OS.get_processor_name(),
+		"cpu_arch": Engine.get_architecture_name(),
+		"cpu_threads": cpu_threads,
+		"voxel_worker_threads": worker_threads,
+		"ram_physical_mb": roundf(float(phys_bytes) / (1024.0 * 1024.0)) if phys_bytes > 0 else 0.0,
+		"ram_free_mb": roundf(float(free_bytes) / (1024.0 * 1024.0)) if free_bytes > 0 else 0.0,
+		"ram_available_mb": roundf(float(avail_bytes) / (1024.0 * 1024.0)) if avail_bytes > 0 else 0.0,
+		"gpu_name": RenderingServer.get_video_adapter_name(),
+		"gpu_vendor": RenderingServer.get_video_adapter_vendor(),
+		"gpu_type": adapter_type_str,
+		"gpu_api_version": RenderingServer.get_video_adapter_api_version(),
+		"rendering_method": RenderingServer.get_current_rendering_method(),
+		"rendering_driver": RenderingServer.get_current_rendering_driver_name(),
+		"window_resolution": "%dx%d" % [win_size.x, win_size.y],
+		"initial_vsync_mode": vsync_mode,
+		"godot_version": String(ver_info.get("string", "4.x")),
+		"voxel_scale_m": terrain.voxel_scale,
+		"world_height_chunks": terrain.get_world_height_chunks() if terrain.has_method("get_world_height_chunks") else 4,
+	}
+
+func _start_benchmark() -> void:
+	if _mode == Mode.PLAY:
+		_exit_play()
+
+	_tool_pressed = false
+	_bench_hardware_info = _collect_hardware_info()
+	_bench_saved_cam_transform = camera.global_transform
+	_bench_saved_yaw = _yaw
+	_bench_saved_pitch = _pitch
+	_bench_saved_vsync = DisplayServer.window_get_vsync_mode()
+	DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
+
+	_bench_saved_settings = {
+		"view_distance_chunks": terrain.view_distance_chunks,
+		"prefetch_distance_chunks": terrain.prefetch_distance_chunks,
+		"upload_budget_ms": terrain.upload_budget_ms,
+		"resident_memory_budget_mb": terrain.resident_memory_budget_mb,
+	}
+	if "collision_distance_chunks" in terrain:
+		_bench_saved_settings["collision_distance_chunks"] = terrain.get("collision_distance_chunks")
+
+	_bench_results.clear()
+	_bench_preset_idx = 0
+	_mode = Mode.BENCHMARK
+
+	print("================================================================================")
+	print("[VoxelBenchmark] STARTING AUTOMATED BENCHMARK SUITE (%d presets)" % BENCHMARK_PRESETS.size())
+	print("[VoxelBenchmark] CPU: %s (%d logical threads, %d voxel workers) | Arch: %s" % [
+		_bench_hardware_info["cpu_name"],
+		_bench_hardware_info["cpu_threads"],
+		_bench_hardware_info["voxel_worker_threads"],
+		_bench_hardware_info["cpu_arch"],
+	])
+	print("[VoxelBenchmark] GPU: %s (%s, %s, API %s, driver=%s/%s)" % [
+		_bench_hardware_info["gpu_name"],
+		_bench_hardware_info["gpu_vendor"],
+		_bench_hardware_info["gpu_type"],
+		_bench_hardware_info["gpu_api_version"],
+		_bench_hardware_info["rendering_driver"],
+		_bench_hardware_info["rendering_method"],
+	])
+	print("[VoxelBenchmark] OS: %s %s (%s) | System RAM: %.0f MiB | Window: %s | voxel_scale=%.2fm" % [
+		_bench_hardware_info["os_name"],
+		_bench_hardware_info["os_distro"],
+		_bench_hardware_info["os_version"],
+		_bench_hardware_info["ram_physical_mb"],
+		_bench_hardware_info["window_resolution"],
+		_bench_hardware_info["voxel_scale_m"],
+	])
+	print("================================================================================")
+
+	_begin_benchmark_preset(0)
+
+func _begin_benchmark_preset(idx: int) -> void:
+	_bench_preset_idx = idx
+	var preset: Dictionary = BENCHMARK_PRESETS[idx]
+
+	_reset_statues()
+	terrain.view_distance_chunks = int(preset["view_distance_chunks"])
+	terrain.prefetch_distance_chunks = int(preset["prefetch_distance_chunks"])
+	terrain.upload_budget_ms = float(preset["upload_budget_ms"])
+	terrain.resident_memory_budget_mb = int(preset["resident_memory_budget_mb"])
+	if "collision_distance_chunks" in terrain and preset.has("collision_distance_chunks"):
+		terrain.set("collision_distance_chunks", int(preset["collision_distance_chunks"]))
+
+	_bench_phase = BenchmarkPhase.SETTLE
+	_bench_phase_elapsed = 0.0
+	_bench_preset_elapsed = 0.0
+	_bench_settle_time_ms = 0.0
+	_bench_frame_times_ms.clear()
+	_bench_phase_frame_times = {
+		BenchmarkPhase.SETTLE: PackedFloat64Array(),
+		BenchmarkPhase.STREAM_FLIGHT: PackedFloat64Array(),
+		BenchmarkPhase.DESTRUCTION_CSG: PackedFloat64Array(),
+		BenchmarkPhase.NAVIGATION_3D: PackedFloat64Array(),
+	}
+	_bench_commits_count = 0
+	_bench_csg_step_idx = 0
+	_bench_csg_next_fire_sec = 0.15
+	_bench_pending_blast_start_usec.clear()
+	_bench_blast_latencies_ms.clear()
+	_bench_affected_chunks_total = 0
+	_bench_nav_query_started = false
+	_bench_nav_start_usec = 0
+	_bench_nav_sync_ms = 0.0
+	_bench_nav_query_ms = 0.0
+	_bench_nav_waypoints = 0
+	_bench_peak_vram_mb = 0.0
+	_bench_peak_ram_mb = 0.0
+	_bench_peak_draw_calls = 0
+	_bench_peak_primitives = 0
+
+	_set_benchmark_camera_pose(Vector3(0.0, 108.0, 38.0), Vector3(0.0, 88.0, -20.0))
+	_velocity = Vector3.ZERO
+	_update_stream_focus(true)
+
+	print("[VoxelBenchmark] >>> Preset %d/%d: '%s' (view=%d, prefetch=%d, upload_budget=%.1fms, collision_dist=%s, mem=%dMB)" % [
+		idx + 1,
+		BENCHMARK_PRESETS.size(),
+		String(preset["name"]),
+		int(preset["view_distance_chunks"]),
+		int(preset["prefetch_distance_chunks"]),
+		float(preset["upload_budget_ms"]),
+		str(preset.get("collision_distance_chunks", "N/A")),
+		int(preset["resident_memory_budget_mb"]),
+	])
+
+func _set_benchmark_camera_pose(pos: Vector3, look_target: Vector3) -> void:
+	camera.global_position = pos
+	camera.look_at(look_target, Vector3.UP)
+	var euler := camera.global_transform.basis.get_euler()
+	_pitch = euler.x
+	_yaw = euler.y
+	if _fly_pcam != null:
+		_fly_pcam.global_transform = camera.global_transform
+
+func _process_benchmark(delta: float) -> void:
+	var dt_ms := delta * 1000.0
+	_bench_phase_elapsed += delta
+	_bench_preset_elapsed += delta
+
+	var phase_arr: PackedFloat64Array = _bench_phase_frame_times[_bench_phase]
+	phase_arr.push_back(dt_ms)
+	_bench_phase_frame_times[_bench_phase] = phase_arr
+	if _bench_phase != BenchmarkPhase.SETTLE:
+		_bench_frame_times_ms.push_back(dt_ms)
+
+	var vram_mb := float(Performance.get_monitor(Performance.RENDER_VIDEO_MEM_USED)) / (1024.0 * 1024.0)
+	var ram_mb := float(Performance.get_monitor(Performance.MEMORY_STATIC)) / (1024.0 * 1024.0)
+	var draw_calls := int(Performance.get_monitor(Performance.RENDER_TOTAL_DRAW_CALLS_IN_FRAME))
+	var primitives := int(Performance.get_monitor(Performance.RENDER_TOTAL_PRIMITIVES_IN_FRAME))
+	_bench_peak_vram_mb = maxf(_bench_peak_vram_mb, vram_mb)
+	_bench_peak_ram_mb = maxf(_bench_peak_ram_mb, ram_mb)
+	_bench_peak_draw_calls = maxi(_bench_peak_draw_calls, draw_calls)
+	_bench_peak_primitives = maxi(_bench_peak_primitives, primitives)
+
+	match _bench_phase:
+		BenchmarkPhase.SETTLE:
+			if (terrain.fully_committed() and _bench_phase_elapsed >= 0.35) or _bench_phase_elapsed >= BENCHMARK_SETTLE_MAX_SEC:
+				_bench_settle_time_ms = _bench_phase_elapsed * 1000.0
+				_bench_phase = BenchmarkPhase.STREAM_FLIGHT
+				_bench_phase_elapsed = 0.0
+
+		BenchmarkPhase.STREAM_FLIGHT:
+			var u := clampf(_bench_phase_elapsed / BENCHMARK_FLIGHT_SEC, 0.0, 1.0)
+			# Sweeping S-curve flight down the statue corridor (z = +38 -> -148)
+			var z_pos := lerpf(38.0, -148.0, u)
+			var x_pos := sin(u * PI * 2.0) * 34.0
+			var y_pos := 110.0 + cos(u * PI * 2.0) * 8.0
+			var next_pos := Vector3(x_pos, y_pos, z_pos)
+			_velocity = (next_pos - camera.global_position) / maxf(delta, 0.001)
+			var look_ahead := Vector3(sin(minf(1.0, u + 0.08) * PI * 2.0) * 18.0, 90.0, lerpf(10.0, -165.0, u))
+			_set_benchmark_camera_pose(next_pos, look_ahead)
+
+			if _bench_phase_elapsed >= BENCHMARK_FLIGHT_SEC:
+				_bench_phase = BenchmarkPhase.DESTRUCTION_CSG
+				_bench_phase_elapsed = 0.0
+				_bench_csg_step_idx = 0
+				_bench_csg_next_fire_sec = 0.10
+				_velocity = Vector3.ZERO
+				_set_benchmark_camera_pose(Vector3(0.0, 96.0, 34.0), Vector3(16.0, 74.0, 12.0))
+				_update_stream_focus(true)
+
+		BenchmarkPhase.DESTRUCTION_CSG:
+			# Orbit gently around the blast arena while firing deterministic CSG & elemental spheres
+			var angle := _bench_phase_elapsed * 0.45
+			var cam_pos := Vector3(sin(angle) * 26.0, 96.0, 28.0 + cos(angle) * 8.0)
+			_set_benchmark_camera_pose(cam_pos, Vector3(16.0, 72.0, 12.0))
+
+			if _bench_phase_elapsed >= _bench_csg_next_fire_sec and _bench_csg_step_idx < 8:
+				_execute_benchmark_csg_step(_bench_csg_step_idx)
+				_bench_csg_step_idx += 1
+				_bench_csg_next_fire_sec += 0.42
+
+			if _bench_phase_elapsed >= BENCHMARK_DESTRUCTION_SEC:
+				_bench_phase = BenchmarkPhase.NAVIGATION_3D
+				_bench_phase_elapsed = 0.0
+				_bench_nav_query_started = false
+
+		BenchmarkPhase.NAVIGATION_3D:
+			_set_benchmark_camera_pose(Vector3(0.0, 102.0, 36.0), Vector3(16.0, 70.0, 16.0))
+			if not _bench_nav_query_started and terrain.core_idle():
+				_bench_nav_query_started = true
+				_bench_nav_start_usec = Time.get_ticks_usec()
+				var start_y := terrain.get_surface_height(4.0, 20.0) + 0.25
+				var goal_y := terrain.get_surface_height(28.0, 20.0) + 0.25
+				ai_companion.global_position = Vector3(4.0, start_y, 20.0)
+				_companion_initialized = true
+				_pending_path_goal = Vector3(28.0, goal_y, 20.0)
+				_goal_mesh_inst.global_position = _pending_path_goal
+				_goal_mesh_inst.visible = true
+				# Prime on-demand corridor groups
+				var _s_ok := ai_companion.is_path_region_synced(ai_companion.global_position)
+				var _g_ok := ai_companion.is_path_region_synced(_pending_path_goal)
+
+			elif _bench_nav_query_started and _bench_nav_waypoints == 0:
+				var start_pos := ai_companion.global_position
+				if terrain.fully_committed() and ai_companion.is_path_region_synced(start_pos) and ai_companion.is_path_region_synced(_pending_path_goal):
+					_bench_nav_sync_ms = float(Time.get_ticks_usec() - _bench_nav_start_usec) / 1000.0
+					var q0 := Time.get_ticks_usec()
+					var raw_path: PackedVector3Array = ai_companion.get_voxel_path(start_pos, _pending_path_goal)
+					_bench_nav_query_ms = float(Time.get_ticks_usec() - q0) / 1000.0
+					_bench_nav_waypoints = raw_path.size()
+					var draped := _drape_path_onto_terrain(raw_path)
+					_active_waypoints = draped
+					_current_waypoint_idx = 0
+					_draw_path_ribbon(draped)
+
+			if _bench_phase_elapsed >= BENCHMARK_NAV_SEC:
+				_finalize_current_benchmark_preset()
+				if _bench_preset_idx + 1 < BENCHMARK_PRESETS.size():
+					_begin_benchmark_preset(_bench_preset_idx + 1)
+				else:
+					_stop_benchmark(false)
+
+func _execute_benchmark_csg_step(step: int) -> void:
+	var surf_y := terrain.get_surface_height(16.0, 16.0)
+	_bench_pending_blast_start_usec.push_back(Time.get_ticks_usec())
+	match step:
+		0:
+			# Small precision chip
+			terrain.trigger_explosion(Vector3(12.0, surf_y, 16.0), small_hit_radius)
+		1:
+			# Standard crater blast on soft terrain
+			terrain.trigger_explosion(Vector3(8.0, surf_y, 14.0), explosion_radius)
+		2:
+			# Hit 1 on 3-hit Hard Rock boulder at (16, 70, 24)
+			terrain.trigger_explosion(Vector3(16.0, 70.0, 24.0), explosion_radius)
+		3:
+			# Hit 2 on 3-hit Hard Rock boulder
+			terrain.trigger_explosion(Vector3(16.0, 70.0, 24.0), explosion_radius)
+		4:
+			# Hit 3 on 3-hit Hard Rock boulder (shatters core)
+			terrain.trigger_explosion(Vector3(16.0, 70.0, 24.0), explosion_radius)
+		5:
+			# Water Quench on Molten Lava dome at (30, 69, 24) -> 3-hit Obsidian
+			terrain.trigger_elemental_sphere(Vector3(30.0, 69.0, 24.0), elemental_radius, ELEMENTAL_WATER)
+		6:
+			# Frost / Ice Bridge across crater
+			terrain.trigger_elemental_sphere(Vector3(12.0, surf_y + 1.0, 16.0), elemental_radius, ELEMENTAL_FROST)
+		7:
+			# Large explosion stress test
+			terrain.trigger_explosion(Vector3(0.0, surf_y, 18.0), large_explosion_radius)
+
+func _compute_frame_stats(samples_ms: PackedFloat64Array) -> Dictionary:
+	if samples_ms.is_empty():
+		return {
+			"frames": 0,
+			"avg_ms": 0.0,
+			"min_ms": 0.0,
+			"p50_ms": 0.0,
+			"p95_ms": 0.0,
+			"p99_ms": 0.0,
+			"max_ms": 0.0,
+			"avg_fps": 0.0,
+			"min_fps": 0.0,
+			"p1_low_fps": 0.0,
+		}
+	var sorted: Array[float] = []
+	sorted.resize(samples_ms.size())
+	var sum_ms := 0.0
+	for i in range(samples_ms.size()):
+		var v := float(samples_ms[i])
+		sorted[i] = v
+		sum_ms += v
+	sorted.sort()
+	var n := sorted.size()
+	var avg_ms := sum_ms / float(n)
+	var min_ms := sorted[0]
+	var p50_ms := sorted[clampi(int(floor(float(n - 1) * 0.50)), 0, n - 1)]
+	var p95_ms := sorted[clampi(int(floor(float(n - 1) * 0.95)), 0, n - 1)]
+	var p99_ms := sorted[clampi(int(floor(float(n - 1) * 0.99)), 0, n - 1)]
+	var max_ms := sorted[n - 1]
+	return {
+		"frames": n,
+		"avg_ms": snappedf(avg_ms, 0.01),
+		"min_ms": snappedf(min_ms, 0.01),
+		"p50_ms": snappedf(p50_ms, 0.01),
+		"p95_ms": snappedf(p95_ms, 0.01),
+		"p99_ms": snappedf(p99_ms, 0.01),
+		"max_ms": snappedf(max_ms, 0.01),
+		"avg_fps": snappedf(1000.0 / maxf(avg_ms, 0.001), 0.1),
+		"min_fps": snappedf(1000.0 / maxf(max_ms, 0.001), 0.1),
+		"p1_low_fps": snappedf(1000.0 / maxf(p99_ms, 0.001), 0.1),
+	}
+
+func _finalize_current_benchmark_preset() -> void:
+	var preset: Dictionary = BENCHMARK_PRESETS[_bench_preset_idx]
+	var overall := _compute_frame_stats(_bench_frame_times_ms)
+	var flight_stats := _compute_frame_stats(_bench_phase_frame_times[BenchmarkPhase.STREAM_FLIGHT])
+	var csg_stats := _compute_frame_stats(_bench_phase_frame_times[BenchmarkPhase.DESTRUCTION_CSG])
+	var nav_stats := _compute_frame_stats(_bench_phase_frame_times[BenchmarkPhase.NAVIGATION_3D])
+
+	var avg_blast_ms := 0.0
+	var max_blast_ms := 0.0
+	if not _bench_blast_latencies_ms.is_empty():
+		var sum_b := 0.0
+		for b in _bench_blast_latencies_ms:
+			sum_b += b
+			max_blast_ms = maxf(max_blast_ms, b)
+		avg_blast_ms = sum_b / float(_bench_blast_latencies_ms.size())
+
+	var active_sec := maxf(0.001, _bench_preset_elapsed - (_bench_settle_time_ms / 1000.0))
+	var record := {
+		"preset_name": String(preset["name"]),
+		"settings": {
+			"view_distance_chunks": terrain.view_distance_chunks,
+			"effective_view_distance_chunks": terrain.get_effective_view_distance_chunks(),
+			"prefetch_distance_chunks": terrain.prefetch_distance_chunks,
+			"upload_budget_ms": snappedf(terrain.upload_budget_ms, 0.1),
+			"collision_distance_chunks": terrain.get("collision_distance_chunks") if "collision_distance_chunks" in terrain else -1,
+			"resident_memory_budget_mb": terrain.resident_memory_budget_mb,
+			"voxel_scale_m": snappedf(terrain.voxel_scale, 0.01),
+		},
+		"overall": overall,
+		"phases": {
+			"stream_flight": flight_stats,
+			"destruction_csg": csg_stats,
+			"navigation_3d": nav_stats,
+		},
+		"streaming": {
+			"settle_time_ms": snappedf(_bench_settle_time_ms, 0.1),
+			"chunks_committed": _bench_commits_count,
+			"commits_per_sec": snappedf(float(_bench_commits_count) / active_sec, 0.1),
+		},
+		"destruction": {
+			"blasts_completed": _bench_blast_latencies_ms.size(),
+			"avg_blast_latency_ms": snappedf(avg_blast_ms, 0.01),
+			"max_blast_latency_ms": snappedf(max_blast_ms, 0.01),
+			"affected_chunks_total": _bench_affected_chunks_total,
+		},
+		"navigation": {
+			"nav_sync_ms": snappedf(_bench_nav_sync_ms, 0.01),
+			"nav_query_ms": snappedf(_bench_nav_query_ms, 0.001),
+			"nav_waypoints": _bench_nav_waypoints,
+		},
+		"resources": {
+			"peak_vram_mb": snappedf(_bench_peak_vram_mb, 0.1),
+			"peak_static_ram_mb": snappedf(_bench_peak_ram_mb, 0.1),
+			"peak_draw_calls": _bench_peak_draw_calls,
+			"peak_primitives": _bench_peak_primitives,
+		},
+	}
+	_bench_results.append(record)
+	print("[VoxelBenchmark] Completed '%s': Avg %.1f FPS (1%% Low %.1f FPS, p99 %.2f ms) | Commits %.1f/s | Blast Avg %.2f ms | Nav Sync %.1f ms | VRAM %.1f MiB" % [
+		record["preset_name"],
+		overall["avg_fps"],
+		overall["p1_low_fps"],
+		overall["p99_ms"],
+		record["streaming"]["commits_per_sec"],
+		record["destruction"]["avg_blast_latency_ms"],
+		record["navigation"]["nav_sync_ms"],
+		record["resources"]["peak_vram_mb"],
+	])
+
+func _stop_benchmark(aborted: bool) -> void:
+	if _mode != Mode.BENCHMARK:
+		return
+	if aborted and not _bench_frame_times_ms.is_empty():
+		_finalize_current_benchmark_preset()
+
+	# Restore pre-benchmark settings, VSync, statues, and camera pose
+	if not _bench_saved_settings.is_empty():
+		terrain.view_distance_chunks = int(_bench_saved_settings["view_distance_chunks"])
+		terrain.prefetch_distance_chunks = int(_bench_saved_settings["prefetch_distance_chunks"])
+		terrain.upload_budget_ms = float(_bench_saved_settings["upload_budget_ms"])
+		terrain.resident_memory_budget_mb = int(_bench_saved_settings["resident_memory_budget_mb"])
+		if "collision_distance_chunks" in terrain and _bench_saved_settings.has("collision_distance_chunks"):
+			terrain.set("collision_distance_chunks", int(_bench_saved_settings["collision_distance_chunks"]))
+
+	DisplayServer.window_set_vsync_mode(_bench_saved_vsync)
+	_mode = Mode.FLY
+	_velocity = Vector3.ZERO
+	camera.global_transform = _bench_saved_cam_transform
+	_yaw = _bench_saved_yaw
+	_pitch = _bench_saved_pitch
+	if _fly_pcam != null:
+		_fly_pcam.global_transform = camera.global_transform
+	_reset_statues()
+	_update_stream_focus(true)
+
+	if not _bench_results.is_empty():
+		_write_and_print_benchmark_report(aborted)
+
+	if _bench_quit_on_finish:
+		get_tree().quit()
+
+func _write_and_print_benchmark_report(aborted: bool) -> void:
+	var md := _build_benchmark_markdown_report(aborted)
+	var payload := {
+		"status": "aborted" if aborted else "completed",
+		"hardware": _bench_hardware_info,
+		"presets": _bench_results,
+	}
+	var json_text := JSON.stringify(payload, "\t")
+
+	var saved_paths: Array[String] = []
+	for path in [BENCHMARK_REPORT_MD_USER, BENCHMARK_REPORT_MD_RES]:
+		var f := FileAccess.open(path, FileAccess.WRITE)
+		if f != null:
+			f.store_string(md)
+			f.close()
+			saved_paths.append(ProjectSettings.globalize_path(path))
+
+	for path in [BENCHMARK_REPORT_JSON_USER, BENCHMARK_REPORT_JSON_RES]:
+		var jf := FileAccess.open(path, FileAccess.WRITE)
+		if jf != null:
+			jf.store_string(json_text)
+			jf.close()
+			saved_paths.append(ProjectSettings.globalize_path(path))
+
+	print("\n" + md)
+	for sp in saved_paths:
+		print("[VoxelBenchmark] Saved benchmark log -> ", sp)
+
+	var best_fps := 0.0
+	var best_name := ""
+	for r in _bench_results:
+		var fps := float(r["overall"]["avg_fps"])
+		if fps > best_fps:
+			best_fps = fps
+			best_name = String(r["preset_name"])
+	_bench_last_summary_banner = "[Benchmark Saved] Best: %s (%.1f FPS) -> user://voxel_benchmark_report.md" % [best_name, best_fps]
+	_bench_banner_timer = 10.0
+
+func _build_benchmark_markdown_report(aborted: bool) -> String:
+	var hw := _bench_hardware_info
+	var lines := PackedStringArray()
+	lines.append("# VoxelTerrain3D Hardware & Multi-Setting Benchmark Report")
+	lines.append("")
+	lines.append("- **Status**: %s" % ("Aborted Early" if aborted else "Completed Full Suite"))
+	lines.append("- **Timestamp (Local / UTC)**: `%s` / `%s`" % [hw.get("timestamp_local", ""), hw.get("timestamp_utc", "")])
+	lines.append("- **CPU**: %s (`%s`, %d logical threads, %d voxel worker threads)" % [
+		hw.get("cpu_name", "Unknown"),
+		hw.get("cpu_arch", ""),
+		int(hw.get("cpu_threads", 0)),
+		int(hw.get("voxel_worker_threads", 0)),
+	])
+	lines.append("- **GPU**: %s — %s (%s, API `%s`, driver `%s` / `%s`)" % [
+		hw.get("gpu_name", "Unknown"),
+		hw.get("gpu_vendor", ""),
+		hw.get("gpu_type", ""),
+		hw.get("gpu_api_version", ""),
+		hw.get("rendering_driver", ""),
+		hw.get("rendering_method", ""),
+	])
+	lines.append("- **System RAM**: %.0f MiB total (%.0f MiB available)" % [
+		float(hw.get("ram_physical_mb", 0.0)),
+		float(hw.get("ram_available_mb", 0.0)),
+	])
+	lines.append("- **OS & Engine**: %s %s (%s) | Godot `%s`" % [
+		hw.get("os_name", ""),
+		hw.get("os_distro", ""),
+		hw.get("os_version", ""),
+		hw.get("godot_version", ""),
+	])
+	lines.append("- **Viewport & Voxel Config**: `%s` | `voxel_scale = %.2f m` | `world_height_chunks = %d`" % [
+		hw.get("window_resolution", ""),
+		float(hw.get("voxel_scale_m", 1.0)),
+		int(hw.get("world_height_chunks", 4)),
+	])
+	lines.append("")
+	lines.append("## Summary Across Settings Presets")
+	lines.append("")
+	lines.append("| Preset | View / Prefetch | Upload Budget | Avg FPS | 1% Low FPS | Avg / p95 / p99 / Max (ms) | Flight FPS | CSG FPS | Settle (ms) | Commits/s | Avg Blast (ms) | Nav Sync / Query (ms) | Peak VRAM (MiB) | Peak Draw Calls |")
+	lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+
+	for r in _bench_results:
+		var s: Dictionary = r["settings"]
+		var o: Dictionary = r["overall"]
+		var fl: Dictionary = r["phases"]["stream_flight"]
+		var cs: Dictionary = r["phases"]["destruction_csg"]
+		var st: Dictionary = r["streaming"]
+		var ds: Dictionary = r["destruction"]
+		var nv: Dictionary = r["navigation"]
+		var rs: Dictionary = r["resources"]
+		lines.append("| **%s** | `%d / %d` | `%.1f ms` | **%.1f** | %.1f | `%.2f / %.2f / %.2f / %.2f` | %.1f | %.1f | %.0f | %.1f | %.2f | `%.1f / %.3f` | %.1f | %d |" % [
+			String(r["preset_name"]),
+			int(s["view_distance_chunks"]),
+			int(s["prefetch_distance_chunks"]),
+			float(s["upload_budget_ms"]),
+			float(o["avg_fps"]),
+			float(o["p1_low_fps"]),
+			float(o["avg_ms"]),
+			float(o["p95_ms"]),
+			float(o["p99_ms"]),
+			float(o["max_ms"]),
+			float(fl["avg_fps"]),
+			float(cs["avg_fps"]),
+			float(st["settle_time_ms"]),
+			float(st["commits_per_sec"]),
+			float(ds["avg_blast_latency_ms"]),
+			float(nv["nav_sync_ms"]),
+			float(nv["nav_query_ms"]),
+			float(rs["peak_vram_mb"]),
+			int(rs["peak_draw_calls"]),
+		])
+
+	lines.append("")
+	return "\n".join(lines)
