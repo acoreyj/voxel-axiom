@@ -89,7 +89,18 @@ if(VOXEL_BUILD_GDEXTENSION)
 endif()
 
 # ==============================================================================
-# 3. CTest Unit & Integration Test Suites (Milestones M0 - M4, Section 7.1 & 7.2)
+# 3. Standalone Offline Asset Baker CLI (`voxel_baker`)
+#    Converts hand-crafted Wavefront .obj meshes into native 8x8x8 .vreg
+#    region files that AssetStampManager can stamp into the live ChunkStore.
+# ==============================================================================
+add_executable(voxel_baker src/voxel_baker_main.cpp)
+target_link_libraries(voxel_baker PRIVATE voxel_core)
+set_target_properties(voxel_baker PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# ==============================================================================
+# 4. CTest Unit & Integration Test Suites (Milestones M0 - M4, Section 7.1 & 7.2)
 # ==============================================================================
 if(VOXEL_BUILD_TESTS)
     enable_testing()
@@ -118,6 +129,7 @@ if(VOXEL_BUILD_TESTS)
     add_voxel_test(test_edit_and_worker_pool     tests/test_edit_and_worker_pool.cpp)
     add_voxel_test(test_procgen_and_surface_nets tests/test_procgen_and_surface_nets.cpp)
     add_voxel_test(test_terrain_raycast          tests/test_terrain_raycast.cpp)
+    add_voxel_test(test_offline_asset_baker      tests/test_offline_asset_baker.cpp)
     add_voxel_test(test_persistence_and_streaming tests/test_persistence_and_streaming.cpp)
     add_voxel_test(test_integration_m3_m4        tests/test_integration_m3_m4.cpp)
     add_voxel_test(test_gdextension_bindings
@@ -126,4 +138,7 @@ if(VOXEL_BUILD_TESTS)
         src/voxel_terrain_3d.cpp
         src/voxel_ai_companion.cpp
     )
+    # Asset-stamping tests load project-relative .vreg files (moai_statue.vreg).
+    set_tests_properties(test_gdextension_bindings PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()

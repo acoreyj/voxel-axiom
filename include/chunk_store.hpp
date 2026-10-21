@@ -104,6 +104,48 @@ struct MaterialHardness {
 };
 
 // ============================================================================
+// Per-Voxel Baked Color Encoding (RGB5551 in uint16_t)
+//   Bit 15 (0x8000): has_color flag (1 = painted voxel, 0 = unpainted procedural)
+//   Bits 10..14:     5-bit Red   [0..31]
+//   Bits 5..9:       5-bit Green [0..31]
+//   Bits 0..4:       5-bit Blue  [0..31]
+// ============================================================================
+struct VoxelColor {
+    static constexpr uint16_t kUnpainted = 0U;
+    static constexpr uint16_t kHasColorBit = 0x8000U;
+
+    [[nodiscard]] static constexpr bool has_color(uint16_t packed) noexcept {
+        return (packed & kHasColorBit) != 0U;
+    }
+
+    [[nodiscard]] static uint16_t encode(float r, float g, float b) noexcept {
+        const uint16_t r5 = static_cast<uint16_t>(std::clamp(std::lround(r * 31.0f), 0L, 31L));
+        const uint16_t g5 = static_cast<uint16_t>(std::clamp(std::lround(g * 31.0f), 0L, 31L));
+        const uint16_t b5 = static_cast<uint16_t>(std::clamp(std::lround(b * 31.0f), 0L, 31L));
+        return static_cast<uint16_t>(kHasColorBit | (r5 << 10U) | (g5 << 5U) | b5);
+    }
+
+    [[nodiscard]] static constexpr uint16_t encode_u8(uint8_t r, uint8_t g, uint8_t b) noexcept {
+        const uint16_t r5 = static_cast<uint16_t>((static_cast<uint32_t>(r) * 31U + 127U) / 255U);
+        const uint16_t g5 = static_cast<uint16_t>((static_cast<uint32_t>(g) * 31U + 127U) / 255U);
+        const uint16_t b5 = static_cast<uint16_t>((static_cast<uint32_t>(b) * 31U + 127U) / 255U);
+        return static_cast<uint16_t>(kHasColorBit | (r5 << 10U) | (g5 << 5U) | b5);
+    }
+
+    static constexpr void decode(uint16_t packed, float& out_r, float& out_g, float& out_b) noexcept {
+        if (!has_color(packed)) {
+            out_r = 0.0f;
+            out_g = 0.0f;
+            out_b = 0.0f;
+            return;
+        }
+        out_r = static_cast<float>((packed >> 10U) & 0x1FU) / 31.0f;
+        out_g = static_cast<float>((packed >> 5U) & 0x1FU) / 31.0f;
+        out_b = static_cast<float>(packed & 0x1FU) / 31.0f;
+    }
+};
+
+// ============================================================================
 // TSDF Sample Format & Constants (HLD v4.0 Section 3.1)
 // ============================================================================
 struct TsdfFormat {
@@ -114,6 +156,9 @@ struct TsdfFormat {
     static constexpr std::size_t kTsdfSlabBytes = kChunkSamples * sizeof(int16_t);     // 65,536 B (64.0 KiB)
     static constexpr std::size_t kMaterialSlabBytes = kChunkSamples * sizeof(uint8_t); // 32,768 B (32.0 KiB)
     static constexpr std::size_t kDamageSlabBytes = kChunkSamples * sizeof(uint8_t);   // 32,768 B (32.0 KiB)
+    // Baked asset albedo: RGB555 + 1 painted bit per canonical sample. Lazily allocated
+    // only for chunks carrying baked UV colors (stamped assets); procedural chunks pay 0 B.
+    static constexpr std::size_t kColorSlabBytes = kChunkSamples * sizeof(uint16_t);   // 65,536 B (64.0 KiB)
 
     /// Encodes a continuous signed distance value into normalized int16_t in [-32767, +32767].
     [[nodiscard]] static int16_t encode(float sdf, float delta = kDefaultTruncationDelta) noexcept {
@@ -336,8 +381,9 @@ enum class ChunkLifecycleState : uint8_t {
 };
 
 /// Authoritative per-chunk storage slot in ChunkStore (HLD v4.0 Sections 3.1, 3.2).
-/// Stores canonical 32^3 TSDF samples, lazily allocated material_data, and lazily
-/// allocated persistent damage_data (`uint8_t[32768]`). Never stores boundary aprons.
+/// Stores canonical 32^3 TSDF samples, lazily allocated material_data, lazily
+/// allocated persistent damage_data (`uint8_t[32768]`), and lazily allocated
+/// per-voxel baked RGB5551 color_data (`uint16_t[32768]`). Never stores boundary aprons.
 struct ChunkSlot {
     ChunkKey key{};
     mutable std::shared_mutex mutex;
@@ -348,6 +394,7 @@ struct ChunkSlot {
     int16_t* tsdf_data = nullptr;     // Non-null iff form == ChunkStorageForm::Dense (64.0 KiB)
     uint8_t* material_data = nullptr; // Lazily allocated (32.0 KiB); null while uniform base_material_id
     uint8_t* damage_data = nullptr;   // Lazily allocated (32.0 KiB); null while all samples have 0 damage
+    uint16_t* color_data = nullptr;   // Lazily allocated (64.0 KiB from TsdfSlabPool); null while unpainted
     uint8_t base_material_id = 0;
 
     std::atomic<uint64_t> version{0};
@@ -368,6 +415,10 @@ struct ChunkSlot {
         return damage_data != nullptr;
     }
 
+    [[nodiscard]] bool has_color_array() const noexcept {
+        return color_data != nullptr;
+    }
+
     /// Returns the authoritative heap bytes currently held by this chunk slot in ChunkStore.
     [[nodiscard]] std::size_t resident_heap_bytes() const noexcept {
         std::size_t bytes = (form == ChunkStorageForm::Dense && tsdf_data != nullptr)
@@ -378,6 +429,9 @@ struct ChunkSlot {
         }
         if (damage_data != nullptr) {
             bytes += TsdfFormat::kDamageSlabBytes;
+        }
+        if (color_data != nullptr) {
+            bytes += TsdfFormat::kColorSlabBytes;
         }
         return bytes;
     }
@@ -420,6 +474,16 @@ struct ChunkSlot {
         return damage_data ? damage_data[idx] : 0U;
     }
 
+    /// Reads a per-voxel baked RGB5551 color (0 = unpainted, procedural fallback).
+    [[nodiscard]] uint16_t get_color(LocalCoord local) const noexcept {
+        return get_color_linear(local.to_linear_index());
+    }
+
+    [[nodiscard]] uint16_t get_color_linear(uint32_t idx) const noexcept {
+        assert(idx < TsdfFormat::kChunkSamples);
+        return color_data ? color_data[idx] : VoxelColor::kUnpainted;
+    }
+
     /// Resets the chunk to uniform EMPTY or SOLID representation, returning any slabs to the pools.
     void reset_to_uniform(ChunkStorageForm uniform_form,
                           uint8_t uniform_material,
@@ -437,6 +501,10 @@ struct ChunkSlot {
         if (damage_data) {
             mat_pool.deallocate(damage_data);
             damage_data = nullptr;
+        }
+        if (color_data) {
+            tsdf_pool.deallocate(reinterpret_cast<int16_t*>(color_data));
+            color_data = nullptr;
         }
         form = uniform_form;
         base_material_id = uniform_material;
@@ -555,6 +623,41 @@ struct ChunkSlot {
         return true;
     }
 
+    /// Writes a per-voxel baked RGB5551 color, lazily allocating the 64.0 KiB `color_data` array
+    /// from `tsdf_pool` only when `col != 0` (0 B overhead on unpainted chunks).
+    [[nodiscard]] bool set_color(LocalCoord local, uint16_t col, TsdfSlabPool& tsdf_pool) noexcept {
+        return set_color_linear(local.to_linear_index(), col, tsdf_pool);
+    }
+
+    [[nodiscard]] bool set_color_linear(uint32_t idx, uint16_t col, TsdfSlabPool& tsdf_pool) noexcept {
+        assert(idx < TsdfFormat::kChunkSamples);
+        if (!color_data) {
+            if (col == VoxelColor::kUnpainted) {
+                return true;
+            }
+            int16_t* raw_slab = tsdf_pool.allocate();
+            if (!raw_slab) {
+                return false;
+            }
+            std::memset(raw_slab, 0, TsdfFormat::kColorSlabBytes);
+            color_data = reinterpret_cast<uint16_t*>(raw_slab);
+        }
+        color_data[idx] = col;
+        return true;
+    }
+
+    /// Clears any baked color at `local` without allocating a slab if none exists.
+    /// Returns true if a painted color was actually reset.
+    bool clear_color(LocalCoord local) noexcept {
+        const uint32_t idx = local.to_linear_index();
+        assert(idx < TsdfFormat::kChunkSamples);
+        if (!color_data || color_data[idx] == VoxelColor::kUnpainted) {
+            return false;
+        }
+        color_data[idx] = VoxelColor::kUnpainted;
+        return true;
+    }
+
     /// Accumulates `delta_damage` onto sample `local`, clamping at 255, and returns the new damage total.
     [[nodiscard]] uint8_t add_damage(LocalCoord local,
                                      uint8_t delta_damage,
@@ -629,6 +732,20 @@ struct ChunkSlot {
             if (all_zero_dmg || form == ChunkStorageForm::Empty) {
                 mat_pool.deallocate(damage_data);
                 damage_data = nullptr;
+            }
+        }
+
+        if (color_data != nullptr) {
+            bool all_unpainted = true;
+            for (std::size_t i = 0; i < TsdfFormat::kChunkSamples; ++i) {
+                if (color_data[i] != VoxelColor::kUnpainted) {
+                    all_unpainted = false;
+                    break;
+                }
+            }
+            if (all_unpainted || form == ChunkStorageForm::Empty) {
+                tsdf_pool.deallocate(reinterpret_cast<int16_t*>(color_data));
+                color_data = nullptr;
             }
         }
         return demoted_tsdf;

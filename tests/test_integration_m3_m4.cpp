@@ -232,15 +232,20 @@ void test_sloped_cave_vertical_boundary_halo_gathering() {
     REQUIRE(cfg.filter_low_hanging_obstacles);
     REQUIRE(cfg.filter_ledge_spans);
     REQUIRE(cfg.filter_walkable_low_height_spans);
-    REQUIRE(std::abs(cfg.agent_max_slope - 45.0f) < 1e-5f);
+    REQUIRE(std::abs(cfg.agent_max_slope - 70.0f) < 1e-5f);
+    REQUIRE(std::abs(cfg.agent_max_climb - 1.5f) < 1e-5f);
+    REQUIRE(std::abs(cfg.cell_size - 0.50f) < 1e-5f);
+    REQUIRE(std::abs(cfg.cell_height - 0.25f) < 1e-5f);
+    REQUIRE(std::abs(cfg.agent_radius - 0.35f) < 1e-5f);
     REQUIRE(std::abs(cfg.region_min_size - 8.0f) < 1e-5f);
-    REQUIRE(cfg.vertical_padding() > 4.0f);   // P_y = 1.8 + 0.5 + 2.0 = 4.3 m
-    REQUIRE(cfg.horizontal_padding() == 3.0f); // P_xz = 0.6 + 0.4 + 2.0 = 3.0 m
+    REQUIRE(cfg.vertical_padding() > 4.0f);   // P_y = 1.8 + 1.5 + 2.0 = 5.3 m
+    // P_xz = 0.35 + 0.4 + 2.0 = 2.75 m, quantized up to 6 * cell_size = 3.00 m.
+    REQUIRE(std::abs(cfg.horizontal_padding() - 3.00f) < 1e-5f);
 
     // Carve a sloped ramp connecting Cy = 1 (gy = 0, y in [32, 64]) and Cy = 2 (gy = 1, y in [64, 96]).
-    // Because gy = 0 has owned_aabb y in [0, 64] and vertical padding P_y = 4.3 m (baking_aabb y up to 68.3),
+    // Because gy = 0 has owned_aabb y in [0, 64] and vertical padding P_y = 5.3 m (baking_aabb y up to 69.3),
     // gy = 0's baking_aabb intersects Cy = 2 (y in [64, 96])!
-    // Conversely, gy = 1's baking_aabb (y down to 64 - 4.3 = 59.7) intersects Cy = 1 (y in [32, 64])!
+    // Conversely, gy = 1's baking_aabb (y down to 64 - 5.3 = 58.7) intersects Cy = 1 (y in [32, 64])!
     const ChunkKey lower_ramp_chunk = ChunkKey::from_coords(0, 1, 0); // gy = 0
     const ChunkKey upper_ramp_chunk = ChunkKey::from_coords(0, 2, 0); // gy = 1
 

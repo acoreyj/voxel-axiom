@@ -141,6 +141,32 @@ void test_ray_starting_inside_solid_misses() {
     std::printf("[PASS] test_ray_starting_inside_solid_misses (no self-hit from inside rock)\n");
 }
 
+void test_raycast_respects_voxel_scale() {
+    ++g_tests_run;
+
+    MemoryLedger ledger;
+    ChunkStore store(ledger, /*world_height_chunks=*/8);
+    // Grid samples are unchanged; at 0.5 m/voxel the same flat plane sits at world y=8.
+    build_flat_ground_chunk(store, ChunkKey::from_coords(0, 0, 0), /*surface_local_y=*/16);
+
+    const auto hit = raycast_terrain(
+        store, Vec3f{8.0f, 12.0f, 8.0f}, Vec3f{8.0f, 0.0f, 8.0f}, 0.5f, /*voxel_scale=*/0.5f);
+    REQUIRE(hit.has_value());
+    // Grid surface at y=15.3333 -> world y=7.6667; grid x=16 -> world x=8.
+    REQUIRE(std::abs(hit->y - 7.6667f) < 0.05f);
+    REQUIRE(std::abs(hit->x - 8.0f) < 0.02f);
+    REQUIRE(std::abs(hit->z - 8.0f) < 0.02f);
+
+    const auto material_hit = raycast_terrain_material(
+        store, Vec3f{8.0f, 12.0f, 8.0f}, Vec3f{8.0f, 0.0f, 8.0f}, 0.5f, /*voxel_scale=*/0.5f);
+    REQUIRE(material_hit.has_value());
+    REQUIRE(material_hit->material_id == MaterialHardness::kMaterialSoil);
+    REQUIRE(std::abs(material_hit->position.y - 7.6667f) < 0.05f);
+
+    std::printf("[PASS] test_raycast_respects_voxel_scale (world hit at y=%.3f for 0.5 m voxels)\n",
+                hit->y);
+}
+
 void test_raycast_reports_solid_material() {
     ++g_tests_run;
 
@@ -193,6 +219,7 @@ int main() {
     test_ray_into_sky_misses();
     test_ray_crosses_chunk_boundary();
     test_ray_starting_inside_solid_misses();
+    test_raycast_respects_voxel_scale();
     test_raycast_reports_solid_material();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",
                 g_tests_run, g_assertions_checked);

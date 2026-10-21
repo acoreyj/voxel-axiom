@@ -22,6 +22,7 @@ SIMPLE_TESTS=(
     "test_edit_and_worker_pool"
     "test_procgen_and_surface_nets"
     "test_persistence_and_streaming"
+    "test_offline_asset_baker"
     "test_integration_m3_m4"
 )
 
@@ -30,6 +31,11 @@ for t in "${SIMPLE_TESTS[@]}"; do
         "${SCRIPT_DIR}/tests/${t}.cpp" -o "${BUILD_DIR}/${t}"
     "${BUILD_DIR}/${t}"
 done
+
+echo "[Build] Building standalone voxel_baker CLI tool..."
+"${CXX}" "${CXXFLAGS[@]}" \
+    "${SCRIPT_DIR}/src/voxel_baker_main.cpp" -o "${BUILD_DIR}/voxel_baker"
+echo "[Build] voxel_baker compiled and tested successfully!"
 
 "${CXX}" "${CXXFLAGS[@]}" "${ASAN_FLAGS[@]}" \
     "${SCRIPT_DIR}/tests/test_gdextension_bindings.cpp" \
@@ -57,5 +63,5 @@ echo "=================================================================="
 "${BUILD_DIR}/test_gdextension_bindings_tsan"
 
 echo "=================================================================="
-echo " ALL 8 TEST SUITES PASSED UNDER ASAN/UBSAN AND TSAN!"
+echo " ALL TEST SUITES PASSED UNDER ASAN/UBSAN AND TSAN!"
 echo "=================================================================="

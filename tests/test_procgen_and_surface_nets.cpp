@@ -391,6 +391,59 @@ void test_collision_subsample_stride() {
 }
 
 // ============================================================================
+// 5b. Configurable Voxel Size (0.5 m Samples)
+// ============================================================================
+void test_voxel_scale_world_geometry() {
+    ++g_tests_run;
+
+    MemoryLedger ledger;
+    ChunkStore store(ledger, /*world_height_chunks=*/8);
+    WorkerDensityGrid34 grid34(ledger);
+    WorkerScratchWindow36 scratch(ledger);
+    CaveNoiseGenerator gen;
+    gen.voxel_scale = 0.5f;
+    gen.surface_amplitude = 0.0f;
+
+    // A world-space plane at y=68 m. At 0.5 m/voxel it intersects chunk (0,4,0)
+    // around canonical sample y=136, so the chunk spans y in [64, 80) meters.
+    auto plane_at_68 = [](float /*wx*/, float wy, float /*wz*/) -> float { return wy - 68.0f; };
+    for (int32_t dz = -1; dz <= 1; ++dz) {
+        for (int32_t dy = 3; dy <= 5; ++dy) {
+            for (int32_t dx = -1; dx <= 1; ++dx) {
+                gen.generate_chunk_from_density_fn(
+                    store, ChunkKey::from_coords(dx, dy, dz), grid34, plane_at_68);
+            }
+        }
+    }
+
+    // Canonical TSDF stays normalized in voxel units around sample y=136.
+    const ChunkKey ck = ChunkKey::from_coords(0, 4, 0);
+    const ChunkSlot* slot = store.find_slot(ck);
+    REQUIRE(slot != nullptr);
+    REQUIRE(slot->get_tsdf(LocalCoord{16, 9, 16}) > 0);
+    REQUIRE(slot->get_tsdf(LocalCoord{16, 8, 16}) <= 0);
+    REQUIRE(slot->get_tsdf(LocalCoord{16, 7, 16}) < 0);
+
+    const auto stamp = gather_scratch_window_36(store, ck, scratch);
+    const ChunkMeshPayload mesh = SurfaceNetsMesher::mesh_chunk_from_scratch_36(
+        ck, scratch, 1, stamp.captured_terrain_revision, /*voxel_scale=*/0.5f,
+        TsdfFormat::kDefaultTruncationDelta, /*collision_stride=*/1);
+
+    REQUIRE(!mesh.vertices.empty());
+    // Every vertex sits on the world-space plane. Dual vertices cover cells
+    // [0..32], so the seam cell can reach one extra 0.5 m step past the 16 m face.
+    for (const Vec3f& v : mesh.vertices) {
+        REQUIRE(std::abs(v.y - 68.0f) <= 0.05f);
+        REQUIRE(v.x >= -0.01f && v.x <= 16.51f);
+        REQUIRE(v.z >= -0.01f && v.z <= 16.51f);
+    }
+    REQUIRE(mesh.collision_faces.size() == mesh.indices.size());
+
+    std::printf("[PASS] test_voxel_scale_world_geometry (%zu verts at world y=68 for 0.5 m voxels; chunk footprint %.1f m)\n",
+                mesh.vertices.size(), 32.0f * 0.5f);
+}
+
+// ============================================================================
 // 6. World-Space Surface Height Query (sample_top_surface_y)
 // ============================================================================
 void test_surface_height_query() {
@@ -457,6 +510,7 @@ int main() {
     test_procgen_caves_toggle();
     test_procgen_seed_determinism();
     test_collision_subsample_stride();
+    test_voxel_scale_world_geometry();
     test_surface_height_query();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",
                 g_tests_run, g_assertions_checked);

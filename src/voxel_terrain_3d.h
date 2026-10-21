@@ -2,6 +2,7 @@
 
 #include "register_types.h"
 #include "godot_wrapper_and_nav3d.hpp"
+#include "asset_stamp_manager.hpp"
 #include "stage_timings.hpp"
 
 #if defined(VOXEL_WITH_GODOT_CPP)
@@ -32,6 +33,8 @@ struct EmittedSignalRecord {
     int affected_chunks = 0;
     std::string reason;
     int64_t chunk_key = 0;
+    int64_t structure_id = 0;
+    std::string structure_name{};
 };
 
 /// VoxelTerrain3D Node (HLD v4.0 Sections 4.2, 5.2).
@@ -66,6 +69,17 @@ public:
     /// Places a 5-hit boulder: fills a sphere of MaterialHardness::kMaterialBoulder
     /// that shatters only after 5 explosions.
     void place_boulder(Vector3 p_position, float p_radius);
+    /// Stamps an offline-baked `.vreg` asset region (see the `voxel_baker` CLI)
+    /// into the live world: `p_chunk_coords` is the region's origin chunk
+    /// (region-local chunk 0, 0, 0). `p_recreate_delay_seconds > 0` reconstitutes
+    /// the structure from its exact pre-damage TSDF after that quiet period;
+    /// values <= 0 keep it permanently destroyed. Returns the structure ID,
+    /// or 0 when the engine is not ready or the file cannot be loaded.
+    int64_t stamp_asset(const String& p_vreg_path, Vector3 p_chunk_coords, float p_recreate_delay_seconds);
+    /// Removes a stamped structure and restores every affected chunk to its exact
+    /// pre-stamp TSDF, material, and color state. Returns false when the engine is
+    /// not ready or `p_structure_id` is unknown.
+    bool remove_structure(int64_t p_structure_id);
     /// Engine-side voxel raycast against resident TSDF chunks. Returns the
     /// interpolated surface point, or a Vector3 of +INF when nothing is hit
     /// (ray starts inside solid, ends in air, or crosses only unloaded space).
@@ -117,6 +131,12 @@ public:
     void set_world_height_chunks(int p_height) { world_height_chunks = p_height; }
     [[nodiscard]] int get_world_height_chunks() const { return world_height_chunks; }
 
+    /// Physical size of one voxel sample in meters. Must be set before the node
+    /// enters the tree: resident chunks, meshes, and navigation groups are all
+    /// built from this value, so changing it mid-session would mix resolutions.
+    void set_voxel_scale(float p_scale);
+    [[nodiscard]] float get_voxel_scale() const { return voxel_scale; }
+
     void set_surface_base_height(float p_height);
     [[nodiscard]] float get_surface_base_height() const { return surface_base_height; }
 
@@ -132,6 +152,18 @@ public:
 
     void set_generate_caves(bool p_enabled);
     [[nodiscard]] bool get_generate_caves() const { return generate_caves; }
+
+    /// Maximum walkable terrain angle in degrees baked into each navigation group.
+    /// Raise it to keep steep Surface Nets hillsides walkable instead of eroding
+    /// barriers across them; changes trigger a live rebake of resident groups.
+    void set_agent_max_slope(float p_degrees);
+    [[nodiscard]] float get_agent_max_slope() const { return agent_max_slope; }
+
+    /// Maximum vertical step in meters Recast accepts between heightfield cells.
+    /// Keep it above cell_size * tan(agent_max_slope) on steep grades, otherwise
+    /// rasterized steps are filtered out as ledges. Triggers a live rebake.
+    void set_agent_max_climb(float p_meters);
+    [[nodiscard]] float get_agent_max_climb() const { return agent_max_climb; }
 
     // Instrumentation (HLD v4.0 Section 7.3): per-operation wall-clock logging.
     void set_instrumentation_enabled(bool p_enabled);
@@ -161,6 +193,9 @@ public:
     [[nodiscard]] voxel::ServerSlotManager& get_server_slot_manager() noexcept {
         return server_slot_manager;
     }
+    [[nodiscard]] voxel::AssetStampManager& get_stamp_manager() noexcept {
+        return stamp_manager_;
+    }
     [[nodiscard]] const std::vector<EmittedSignalRecord>& emitted_signals() const noexcept {
         return emitted_signals_;
     }
@@ -176,22 +211,24 @@ private:
         std::unique_ptr<voxel::StreamingManager> streaming_manager;
 
         CoreEngineBundle(std::size_t budget_bytes, int32_t height_chunks,
-                         const std::string& save_dir, const int* collision_stride)
+                         const std::string& save_dir, float scale,
+                         const int* collision_stride)
             : ledger(budget_bytes),
               store(ledger, height_chunks) {
+            procgen.voxel_scale = scale;
             save_manager = std::make_unique<voxel::RegionSaveManager>(ledger, save_dir);
             worker_pool = std::make_unique<voxel::CoreWorkerPool>(
                 store,
                 dirty_scheduler,
                 // Reads the live collision_subsample_stride so a runtime toggle applies
                 // to chunks meshed afterwards (same read-at-mesh-time contract as caves).
-                [collision_stride](const voxel::ChunkStore&,
+                [collision_stride, scale](const voxel::ChunkStore&,
                    voxel::ChunkKey ck,
                    voxel::WorkerScratchWindow36& scratch,
                    const voxel::NeighborhoodVersionStamp& stamp) {
                     const int32_t stride = (collision_stride != nullptr) ? *collision_stride : 1;
                     return voxel::SurfaceNetsMesher::mesh_chunk_from_scratch_36(
-                        ck, scratch, 1, stamp.captured_terrain_revision, 1.0f,
+                        ck, scratch, 1, stamp.captured_terrain_revision, scale,
                         voxel::TsdfFormat::kDefaultTruncationDelta, stride);
                 },
                 // Audit F10: thread-local WorkerDensityGrid34 preallocated per worker thread
@@ -201,7 +238,7 @@ private:
                     (void)save_manager->load_or_generate_chunk(s, ck, procgen, thread_grid34);
                 });
             streaming_manager = std::make_unique<voxel::StreamingManager>(
-                store, dirty_scheduler, *save_manager, *worker_pool);
+                store, dirty_scheduler, *save_manager, *worker_pool, scale);
             worker_pool->set_shutdown_save_hook([this](voxel::ChunkStore& s) {
                 (void)s;
                 save_manager->flush_all_dirty_regions();
@@ -218,10 +255,13 @@ private:
     int resident_memory_budget_mb = 512;
     float upload_budget_ms = 2.0f;
     int world_height_chunks = 4;
+    float voxel_scale = 1.0f;
     float surface_base_height = 68.0f;
     int world_seed = 1337;
     bool save_on_exit = true;
     bool generate_caves = true;
+    float agent_max_slope = 70.0f;
+    float agent_max_climb = 1.5f;
 
 #if defined(VOXEL_WITH_GODOT_CPP)
     Ref<Material> terrain_material;
@@ -247,6 +287,7 @@ private:
     std::unique_ptr<CoreEngineBundle> core_engine;
     voxel::ServerSlotManager server_slot_manager;
     voxel::VoxelNavigationManager navigation_manager;
+    voxel::AssetStampManager stamp_manager_;
     std::vector<EmittedSignalRecord> emitted_signals_;
 
     bool instrumentation_enabled = true;

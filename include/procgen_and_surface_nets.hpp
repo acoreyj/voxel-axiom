@@ -393,9 +393,11 @@ private:
     float wx,
     float wz) {
 
-    const float ceiling = static_cast<float>(store.world_height_chunks() * ChunkKey::kChunkDim) - 1.0f;
+    const float scale = (procgen.voxel_scale > 0.0f) ? procgen.voxel_scale : 1.0f;
+    const float ceiling =
+        (static_cast<float>(store.world_height_chunks() * ChunkKey::kChunkDim) - 1.0f) * scale;
     if (const std::optional<Vec3f> hit =
-            raycast_terrain(store, Vec3f{wx, ceiling, wz}, Vec3f{wx, 0.0f, wz})) {
+            raycast_terrain(store, Vec3f{wx, ceiling, wz}, Vec3f{wx, 0.0f, wz}, 0.5f, scale)) {
         return hit->y;
     }
 
@@ -440,6 +442,8 @@ public:
         Vec3f normal{};
         uint8_t material_id = 0;
         uint8_t damage = 0;
+        Vec3f baked_albedo{};
+        float baked_albedo_weight = 0.0f;
     };
 
     /// Meshes chunk `chunk_key` from its populated 36^3 (`-1..34`) scratch window:
@@ -506,6 +510,12 @@ public:
                     int16_t best_solid_q = INT16_MIN;
                     uint8_t best_material = 0;
                     uint8_t max_hard_rock_damage = 0;
+                    uint16_t best_solid_color = VoxelColor::kUnpainted;
+
+                    float painted_r_sum = 0.0f;
+                    float painted_g_sum = 0.0f;
+                    float painted_b_sum = 0.0f;
+                    float painted_w_sum = 0.0f;
 
                     for (int c = 0; c < 8; ++c) {
                         const int32_t cx = i + (c & 1);
@@ -516,13 +526,25 @@ public:
                         if (q < 0) {
                             mask |= static_cast<uint8_t>(1U << c);
                             const uint8_t mat = scratch.get_material(cx, cy, cz);
+                            const uint16_t col = scratch.get_color(cx, cy, cz);
                             if (MaterialHardness::supports_persistent_damage(mat)) {
                                 max_hard_rock_damage =
                                     std::max(max_hard_rock_damage, scratch.get_damage(cx, cy, cz));
                             }
+                            if (VoxelColor::has_color(col)) {
+                                float cr = 0.0f, cg = 0.0f, cb = 0.0f;
+                                VoxelColor::decode(col, cr, cg, cb);
+                                const float dist_w =
+                                    1.0f / (0.05f + std::abs(TsdfFormat::decode(q, truncation_delta)));
+                                painted_r_sum += cr * dist_w;
+                                painted_g_sum += cg * dist_w;
+                                painted_b_sum += cb * dist_w;
+                                painted_w_sum += dist_w;
+                            }
                             if (q > best_solid_q) {
                                 best_solid_q = q;
                                 best_material = mat;
+                                best_solid_color = col;
                             }
                         }
                     }
@@ -605,6 +627,24 @@ public:
                     cell.damage = MaterialHardness::supports_persistent_damage(best_material)
                                       ? max_hard_rock_damage
                                       : 0U;
+
+                    // Keep painted albedo at ground seams (where a painted statue corner
+                    // meets unpainted kMaterialSoil terrain) while leaving unpainted
+                    // interior HardRock crater walls at weight = 0.0f so craters expose
+                    // raw rock.
+                    if ((VoxelColor::has_color(best_solid_color) ||
+                         best_material == MaterialHardness::kMaterialSoil) &&
+                        painted_w_sum > 0.0f) {
+                        cell.baked_albedo = Vec3f{
+                            painted_r_sum / painted_w_sum,
+                            painted_g_sum / painted_w_sum,
+                            painted_b_sum / painted_w_sum
+                        };
+                        cell.baked_albedo_weight = 1.0f;
+                    } else {
+                        cell.baked_albedo = Vec3f{0.0f, 0.0f, 0.0f};
+                        cell.baked_albedo_weight = 0.0f;
+                    }
                 }
             }
         }
@@ -634,6 +674,8 @@ public:
                                             ? mat_code
                                             : (static_cast<float>(MaterialHardness::hits_to_break(cell.material_id)) / 255.0f);
                 out.colors.push_back(Vec3f{dmg_ratio, is_rock, hits_norm});
+                out.baked_albedos.push_back(cell.baked_albedo);
+                out.baked_albedo_weights.push_back(cell.baked_albedo_weight);
             }
             return cell.vertex_index;
         };

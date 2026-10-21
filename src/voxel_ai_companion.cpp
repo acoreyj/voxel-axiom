@@ -33,9 +33,8 @@ PackedVector3Array VoxelAICompanion::get_voxel_path(Vector3 p_start, Vector3 p_e
     PackedVector3Array path;
 #if defined(VOXEL_WITH_GODOT_CPP)
     if (terrain_node_) {
-        terrain_node_->get_navigation_manager().ensure_group_baked_for_position(
-            voxel::Vec3f{p_start.x, p_start.y, p_start.z});
-        terrain_node_->get_navigation_manager().ensure_group_baked_for_position(
+        terrain_node_->get_navigation_manager().ensure_corridor_groups_baked(
+            voxel::Vec3f{p_start.x, p_start.y, p_start.z},
             voxel::Vec3f{p_end.x, p_end.y, p_end.z});
     }
     if (get_world_3d().is_valid()) {
@@ -57,10 +56,12 @@ PackedVector3Array VoxelAICompanion::get_voxel_path(Vector3 p_start, Vector3 p_e
 
         if (terrain_node_) {
             const auto& nav_mgr = terrain_node_->get_navigation_manager();
+            const float nav_scale = nav_mgr.voxel_scale();
+            const float inv_scale = (nav_scale > 0.0f) ? (1.0f / nav_scale) : 1.0f;
             const voxel::ChunkKey mid_ck = voxel::ChunkKey::from_world_sample(
-                static_cast<int32_t>(std::floor(midpoint.x)),
-                static_cast<int32_t>(std::floor(midpoint.y)),
-                static_cast<int32_t>(std::floor(midpoint.z)));
+                static_cast<int32_t>(std::floor(midpoint.x * inv_scale)),
+                static_cast<int32_t>(std::floor(midpoint.y * inv_scale)),
+                static_cast<int32_t>(std::floor(midpoint.z * inv_scale)));
             const voxel::NavigationGroupKey gk = voxel::NavigationGroupKey::from_chunk_key(mid_ck);
             if (const voxel::NavigationGroupState* g = nav_mgr.find_group(gk);
                 g != nullptr && g->assembled_source_faces.size() >= 3ULL) {
@@ -121,8 +122,15 @@ bool VoxelAICompanion::is_path_region_synced(Vector3 p_position) {
     }
     auto& nav_mgr = terrain_node_->get_navigation_manager();
     const voxel::Vec3f pos{p_position.x, p_position.y, p_position.z};
+#if defined(VOXEL_WITH_GODOT_CPP)
+    const Vector3 self_pos = get_global_position();
+    const voxel::Vec3f start_pos{self_pos.x, self_pos.y, self_pos.z};
+    nav_mgr.ensure_corridor_groups_baked(start_pos, pos);
+    return nav_mgr.is_corridor_synced(start_pos, pos);
+#else
     nav_mgr.ensure_group_baked_for_position(pos);
     return nav_mgr.is_path_region_synced(pos);
+#endif
 }
 
 } // namespace godot

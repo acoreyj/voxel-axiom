@@ -29,9 +29,11 @@
 #include <godot_cpp/variant/color.hpp>
 #include <godot_cpp/variant/packed_color_array.hpp>
 #include <godot_cpp/variant/packed_int32_array.hpp>
+#include <godot_cpp/variant/packed_vector2_array.hpp>
 #include <godot_cpp/variant/packed_vector3_array.hpp>
 #include <godot_cpp/variant/rid.hpp>
 #include <godot_cpp/variant/transform3d.hpp>
+#include <godot_cpp/variant/vector2.hpp>
 #endif
 
 namespace voxel {
@@ -164,12 +166,29 @@ public:
                 norms.resize(static_cast<int64_t>(mesh.normals.size()));
                 std::memcpy(norms.ptrw(), mesh.normals.data(), mesh.normals.size() * sizeof(Vec3f));
 
+                const int64_t vcount = static_cast<int64_t>(mesh.vertices.size());
+
                 godot::PackedColorArray colors;
-                colors.resize(static_cast<int64_t>(mesh.vertices.size()));
+                colors.resize(vcount);
                 godot::Color* color_ptr = colors.ptrw();
+
+                godot::PackedVector2Array uvs;
+                uvs.resize(vcount);
+                godot::Vector2* uv_ptr = uvs.ptrw();
+
+                godot::PackedVector2Array uv2s;
+                uv2s.resize(vcount);
+                godot::Vector2* uv2_ptr = uv2s.ptrw();
+
                 for (std::size_t i = 0; i < mesh.vertices.size(); ++i) {
                     const Vec3f c = (i < mesh.colors.size()) ? mesh.colors[i] : Vec3f{};
-                    color_ptr[i] = godot::Color(c.x, c.y, c.z, 1.0f);
+                    const Vec3f alb = (i < mesh.baked_albedos.size()) ? mesh.baked_albedos[i] : Vec3f{};
+                    const float w = (i < mesh.baked_albedo_weights.size()) ? mesh.baked_albedo_weights[i] : 0.0f;
+                    // COLOR.rgb = (damage_ratio, is_hard_rock, material_code), COLOR.a = baked_albedo_weight
+                    color_ptr[i] = godot::Color(c.x, c.y, c.z, w);
+                    // UV.xy = baked_albedo.rg, UV2.xy = (baked_albedo.b, baked_albedo_weight)
+                    uv_ptr[i] = godot::Vector2(alb.x, alb.y);
+                    uv2_ptr[i] = godot::Vector2(alb.z, w);
                 }
 
                 godot::PackedInt32Array indices;
@@ -178,10 +197,12 @@ public:
 
                 godot::Array surface_arrays;
                 surface_arrays.resize(godot::RenderingServer::ARRAY_MAX);
-                surface_arrays[godot::RenderingServer::ARRAY_VERTEX] = verts;
-                surface_arrays[godot::RenderingServer::ARRAY_NORMAL] = norms;
-                surface_arrays[godot::RenderingServer::ARRAY_COLOR]  = colors;
-                surface_arrays[godot::RenderingServer::ARRAY_INDEX]  = indices;
+                surface_arrays[godot::RenderingServer::ARRAY_VERTEX]  = verts;
+                surface_arrays[godot::RenderingServer::ARRAY_NORMAL]  = norms;
+                surface_arrays[godot::RenderingServer::ARRAY_COLOR]   = colors;
+                surface_arrays[godot::RenderingServer::ARRAY_TEX_UV]  = uvs;
+                surface_arrays[godot::RenderingServer::ARRAY_TEX_UV2] = uv2s;
+                surface_arrays[godot::RenderingServer::ARRAY_INDEX]   = indices;
 
                 rs->mesh_add_surface_from_arrays(
                     slot.mesh_rid.native_rid,
@@ -327,12 +348,15 @@ private:
 
 struct CaveNavMeshConfig {
     float voxel_scale = 1.0f;
-    float cell_size = 0.25f;   // 0.25 * s
-    float cell_height = 0.20f; // 0.20 * s
-    float agent_radius = 0.6f;
+    // Exact IEEE-754 power-of-two values: they match NavigationServer3D's map
+    // cell size/height (set in initialize()), eliminate the cell-size mismatch
+    // warnings, and cut the Recast heightfield voxel count by ~49%.
+    float cell_size = 0.50f;
+    float cell_height = 0.25f;
+    float agent_radius = 0.35f;
     float agent_height = 1.8f;
-    float agent_max_climb = 0.5f;
-    float agent_max_slope = 45.0f;
+    float agent_max_climb = 1.5f;
+    float agent_max_slope = 70.0f;
     float region_connection_margin = 0.4f;
     float region_min_size = 8.0f;
 
@@ -340,8 +364,15 @@ struct CaveNavMeshConfig {
     bool filter_ledge_spans = true;
     bool filter_walkable_low_height_spans = true;
 
-    [[nodiscard]] constexpr float horizontal_padding() const noexcept {
-        return agent_radius + region_connection_margin + 2.0f * voxel_scale;
+    /// Always quantized up to an exact integer multiple of `cell_size` (e.g. 3.00m = 6 * 0.50m
+    /// at 1.0m scale, or 2.00m = 4 * 0.50m at 0.5m scale). In Godot's NavMeshGenerator3D,
+    /// Recast floors `border_size / cell_size` to an integer cell count; if `horizontal_padding()`
+    /// is not an exact multiple of `cell_size` (such as 2.75m / 0.50m = 5.5), Recast clips only
+    /// 2.50m from a 2.75m-expanded box, shifting the cell grid by 0.25m and leaving a 0.50m
+    /// overlap between adjacent groups that prevents NavigationServer3D from stitching edges.
+    [[nodiscard]] float horizontal_padding() const noexcept {
+        const float raw = agent_radius + region_connection_margin + 2.0f * voxel_scale;
+        return (cell_size > 0.0f) ? (std::ceil(raw / cell_size) * cell_size) : raw;
     }
 
     [[nodiscard]] constexpr float vertical_padding() const noexcept {
@@ -396,13 +427,72 @@ public:
     void initialize(ServerRid nav_map_rid, CaveNavMeshConfig cfg = {}) noexcept {
         nav_map_rid_ = nav_map_rid;
         config_ = cfg;
+        if (config_.cell_height > 0.0f) {
+            config_.agent_max_climb = std::max(
+                config_.cell_height,
+                std::round(config_.agent_max_climb / config_.cell_height) * config_.cell_height);
+        }
         map_iteration_id_ = 1;
         initialized_ = true;
+#if defined(VOXEL_WITH_GODOT_CPP)
+        if (auto* ns = godot::NavigationServer3D::get_singleton();
+            ns != nullptr && nav_map_rid_.native_rid.is_valid()) {
+            // Sync the NavigationServer3D map cell_size (0.50f), cell_height (0.25f), and
+            // edge_connection_margin (1.25f = 2.5 * cell_size) so adjacent horizontal (gx/gz)
+            // and vertical (gy) NavigationGroups weld seamlessly across group boundaries.
+            ns->map_set_cell_size(nav_map_rid_.native_rid, config_.cell_size);
+            ns->map_set_cell_height(nav_map_rid_.native_rid, config_.cell_height);
+            ns->map_set_edge_connection_margin(
+                nav_map_rid_.native_rid, std::max(1.25f, config_.cell_size * 2.5f));
+        }
+#endif
     }
 
     void set_bake_on_stream_enabled(bool enabled) noexcept {
         bake_on_stream_enabled_ = enabled;
     }
+
+    /// Applies new walkable-slope and step-height limits to every existing group and
+    /// marks each one dirty so NavigationServer3D rebakes with the new limits.
+    void set_agent_limits(float max_slope_degrees, float max_climb) noexcept {
+        const float quantized_climb =
+            (config_.cell_height > 0.0f)
+                ? std::max(config_.cell_height,
+                           std::round(max_climb / config_.cell_height) * config_.cell_height)
+                : max_climb;
+        if (config_.agent_max_slope == max_slope_degrees &&
+            config_.agent_max_climb == quantized_climb) {
+            return;
+        }
+        const bool climb_changed = config_.agent_max_climb != quantized_climb;
+        config_.agent_max_slope = max_slope_degrees;
+        config_.agent_max_climb = quantized_climb;
+
+        for (auto& [gk, g] : groups_) {
+            g.nav_mesh_config.agent_max_slope = max_slope_degrees;
+            g.nav_mesh_config.agent_max_climb = quantized_climb;
+            if (climb_changed) {
+                g.baking_aabb = compute_baking_aabb(gk);
+            }
+#if defined(VOXEL_WITH_GODOT_CPP)
+            if (g.nav_mesh.is_valid()) {
+                g.nav_mesh->set_agent_max_slope(max_slope_degrees);
+                g.nav_mesh->set_agent_max_climb(quantized_climb);
+                if (climb_changed) {
+                    const Aabb3f filter_box = compute_recast_filter_aabb(gk);
+                    g.nav_mesh->set_filter_baking_aabb(godot::AABB(
+                        godot::Vector3(filter_box.min.x, filter_box.min.y, filter_box.min.z),
+                        godot::Vector3(filter_box.max.x - filter_box.min.x,
+                                       filter_box.max.y - filter_box.min.y,
+                                       filter_box.max.z - filter_box.min.z)));
+                }
+            }
+#endif
+            g.desired_source_epoch += 1;
+        }
+    }
+
+    [[nodiscard]] float voxel_scale() const noexcept { return config_.voxel_scale; }
 
     void shutdown() noexcept {
 #if defined(VOXEL_WITH_GODOT_CPP)
@@ -434,6 +524,9 @@ public:
         };
     }
 
+    /// 3D source-triangle gathering AABB: expands `owned_aabb` by `horizontal_padding()` in X/Z
+    /// and `vertical_padding()` in Y so chunks across vertical and horizontal seams contribute
+    /// their triangles to `source_data`.
     [[nodiscard]] Aabb3f compute_baking_aabb(NavigationGroupKey key) const noexcept {
         const Aabb3f owned = compute_owned_aabb(key);
         const float pxz = config_.horizontal_padding();
@@ -441,6 +534,27 @@ public:
         return Aabb3f{
             Vec3f{owned.min.x - pxz, owned.min.y - py, owned.min.z - pxz},
             Vec3f{owned.max.x + pxz, owned.max.y + py, owned.max.z + pxz}
+        };
+    }
+
+    /// Computes the Recast heightfield `filter_baking_aabb` for a NavigationGroup:
+    ///   - In X and Z, expands `owned_aabb` by `horizontal_padding()` (`border_size`), which
+    ///     Recast clips back to `owned_aabb` after eroding walkable spans.
+    ///   - In Y, Recast does NOT clip by `border_size`; using the full `vertical_padding()` (5.3m)
+    ///     in `filter_baking_aabb` caused adjacent `gy` layers to overlap by >10m vertically,
+    ///     putting their outer free boundary edges ~10m apart so NavigationServer3D could never
+    ///     connect `gy` and `gy + 1`. Instead, we pad Y by `y_seam_pad` (an exact multiple of
+    ///     `cell_height` matching `agent_radius` erosion) so that after Recast's 1-cell open-edge
+    ///     erosion, the upper boundary edge of `gy` and lower boundary edge of `gy + 1` meet right
+    ///     along `owned_aabb.max.y` within `edge_connection_margin`.
+    [[nodiscard]] Aabb3f compute_recast_filter_aabb(NavigationGroupKey key) const noexcept {
+        const Aabb3f owned = compute_owned_aabb(key);
+        const float pxz = config_.horizontal_padding();
+        const float ch = (config_.cell_height > 0.0f) ? config_.cell_height : 0.25f;
+        const float y_seam_pad = std::max(ch * 2.0f, std::ceil(config_.agent_radius / ch) * ch);
+        return Aabb3f{
+            Vec3f{owned.min.x - pxz, owned.min.y - y_seam_pad, owned.min.z - pxz},
+            Vec3f{owned.max.x + pxz, owned.max.y + y_seam_pad, owned.max.z + pxz}
         };
     }
 
@@ -460,15 +574,47 @@ public:
         }
     }
 
+    /// Ensures all `4 x 2 x 4` NavigationGroups overlapping the 3D corridor between
+    /// `start_pos` and `end_pos` (expanded by a 3D terrain-undulation margin so hills
+    /// rising into `gy + 1`, valleys dipping into `gy - 1`, or paths curving across
+    /// nearby `gx/gz` seams are always included) are created and queued for baking.
+    void ensure_corridor_groups_baked(Vec3f start_pos, Vec3f end_pos) {
+        int32_t gx_min = 0, gx_max = 0, gy_min = 0, gy_max = 0, gz_min = 0, gz_max = 0;
+        compute_corridor_group_bounds(start_pos, end_pos, gx_min, gx_max, gy_min, gy_max, gz_min, gz_max);
+
+        for (int32_t gz = gz_min; gz <= gz_max; ++gz) {
+            for (int32_t gy = gy_min; gy <= gy_max; ++gy) {
+                for (int32_t gx = gx_min; gx <= gx_max; ++gx) {
+                    NavigationGroupState& g = get_or_create_group(NavigationGroupKey{gx, gy, gz});
+                    if (g.total_bakes_submitted == 0 && g.desired_source_epoch == 0) {
+                        g.desired_source_epoch = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    [[nodiscard]] bool is_corridor_synced(Vec3f start_pos, Vec3f end_pos) const noexcept {
+        int32_t gx_min = 0, gx_max = 0, gy_min = 0, gy_max = 0, gz_min = 0, gz_max = 0;
+        compute_corridor_group_bounds(start_pos, end_pos, gx_min, gx_max, gy_min, gy_max, gz_min, gz_max);
+
+        for (int32_t gz = gz_min; gz <= gz_max; ++gz) {
+            for (int32_t gy = gy_min; gy <= gy_max; ++gy) {
+                for (int32_t gx = gx_min; gx <= gx_max; ++gx) {
+                    if (!is_group_synced(NavigationGroupKey{gx, gy, gz})) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
     void note_chunk_mesh_committed(ChunkKey key,
                                    uint64_t captured_terrain_revision,
                                    const std::vector<Vec3f>& /*faces*/) {
         chunk_revisions_[key] = captured_terrain_revision;
         waiting_chunks_.insert(key);
-
-        if (!bake_on_stream_enabled_ && captured_terrain_revision == 0) {
-            return;
-        }
 
         const Aabb3f chunk_box = chunk_aabb(key);
         const NavigationGroupKey owner_gk = NavigationGroupKey::from_chunk_key(key);
@@ -478,13 +624,19 @@ public:
                 for (int32_t dgx = -1; dgx <= 1; ++dgx) {
                     const NavigationGroupKey candidate{
                         owner_gk.gx + dgx, owner_gk.gy + dgy, owner_gk.gz + dgz};
-                    if (compute_baking_aabb(candidate).intersects(chunk_box)) {
-                        if (candidate == owner_gk || groups_.find(candidate) != groups_.end()) {
-                            NavigationGroupState& g = get_or_create_group(candidate);
-                            g.desired_source_epoch += 1;
-                            g.desired_terrain_revision =
-                                std::max(g.desired_terrain_revision, captured_terrain_revision);
-                        }
+                    const bool group_exists = (groups_.find(candidate) != groups_.end());
+                    // When bake_on_stream_enabled_ is false (Godot runtime), only mark
+                    // already-live NavigationGroups dirty instead of creating groups
+                    // for every streamed chunk in the world after terrain_revision >= 1.
+                    if (!bake_on_stream_enabled_ && !group_exists) {
+                        continue;
+                    }
+                    if ((candidate == owner_gk || group_exists) &&
+                        compute_baking_aabb(candidate).intersects(chunk_box)) {
+                        NavigationGroupState& g = get_or_create_group(candidate);
+                        g.desired_source_epoch += 1;
+                        g.desired_terrain_revision =
+                            std::max(g.desired_terrain_revision, captured_terrain_revision);
                     }
                 }
             }
@@ -511,14 +663,18 @@ public:
                 std::max(required_chunk_revisions_[dk], tx.terrain_revision);
         }
         for (const NavigationGroupKey gk : tx.affected_nav_groups) {
+            if (!bake_on_stream_enabled_ && groups_.find(gk) == groups_.end()) {
+                continue;
+            }
             NavigationGroupState& g = get_or_create_group(gk);
             g.desired_terrain_revision = std::max(g.desired_terrain_revision, tx.terrain_revision);
         }
     }
 
     void submit_ready_groups_to_server(const ServerSlotManager& slot_mgr) {
-        // Throttle to at most 1 navigation group submission per frame so Recast never
-        // floods Godot's worker threads or blocks NavigationServer3D synchronization.
+        // Submit up to 4 ready navigation groups per frame in parallel on Godot's
+        // WorkerThreadPool: enough to clear a multi-group blast without serializing
+        // Recast bakes one frame at a time.
         std::size_t groups_submitted_this_frame = 0;
 
         for (auto& [gk, g] : groups_) {
@@ -531,9 +687,13 @@ public:
                 continue;
             }
 
+            // Ensure ALL dirtied chunks that belong to this group OR intersect its
+            // halo baking_aabb have been committed before starting an async Recast bake,
+            // preventing premature partial bakes while explosion meshes are still committing.
             bool all_chunks_ready = true;
             for (const auto& [ck, req_rev] : required_chunk_revisions_) {
-                if (NavigationGroupKey::from_chunk_key(ck) == gk) {
+                if (NavigationGroupKey::from_chunk_key(ck) == gk ||
+                    g.baking_aabb.intersects(chunk_aabb(ck))) {
                     const auto rev_it = chunk_revisions_.find(ck);
                     const uint64_t cur_rev = (rev_it != chunk_revisions_.end()) ? rev_it->second : 0ULL;
                     if (cur_rev < req_rev) {
@@ -552,6 +712,7 @@ public:
             if (g.source_data.is_valid()) {
                 g.source_data->clear();
             }
+            bool added_any_faces = false;
 #endif
             const int32_t cx_min = gk.gx * 4 - 1;
             const int32_t cx_max = (gk.gx + 1) * 4;
@@ -575,11 +736,31 @@ public:
                         if (const ChunkServerSlot* cslot = slot_mgr.find_slot(ck);
                             cslot != nullptr && !cslot->godot_nav_faces.is_empty() && g.source_data.is_valid()) {
                             g.source_data->add_faces(cslot->godot_nav_faces, godot::Transform3D());
+                            added_any_faces = true;
                         }
 #endif
                     }
                 }
             }
+
+#if defined(VOXEL_WITH_GODOT_CPP)
+            // Fast path: if this group's baking volume contains 0 triangles (e.g. an empty
+            // sky layer or solid underground layer), mark it synced immediately without
+            // queuing an empty async Recast job or waiting on a map iteration tick.
+            if (!added_any_faces) {
+                if (g.nav_mesh.is_valid()) {
+                    g.nav_mesh->clear_polygons();
+                }
+                g.submitted_terrain_revision = g.desired_terrain_revision;
+                g.submitted_source_epoch = g.desired_source_epoch;
+                g.synced_terrain_revision = g.submitted_terrain_revision;
+                g.synced_source_epoch = g.submitted_source_epoch;
+                g.rebuild_in_flight = false;
+                g.bake_callback_received = false;
+                g.total_bakes_submitted += 1;
+                continue;
+            }
+#endif
 
             g.rebuild_in_flight = true;
             g.bake_callback_received = false;
@@ -595,7 +776,7 @@ public:
                     g.source_data,
                     godot::Callable());
             }
-            if (++groups_submitted_this_frame >= 1ULL) {
+            if (++groups_submitted_this_frame >= 4ULL) {
                 break;
             }
 #else
@@ -621,6 +802,8 @@ public:
         if (ns != nullptr && nav_map_rid_.native_rid.is_valid()) {
             map_iteration_id_ = ns->map_get_iteration_id(nav_map_rid_.native_rid);
         }
+
+        bool pushed_any_region_this_frame = false;
         for (auto& [gk, g] : groups_) {
             if (g.rebuild_in_flight && !g.bake_callback_received) {
                 // Step 1: Wait until the async Recast bake on WorkerThreadPool finishes, then
@@ -629,17 +812,43 @@ public:
                     if (g.region_rid.native_rid.is_valid()) {
                         ns->region_set_navigation_mesh(g.region_rid.native_rid, g.nav_mesh);
                     }
-                    g.bake_callback_received = true;
+                    if (g.nav_mesh->get_polygon_count() == 0) {
+                        // A 0-polygon mesh does not trigger NavMap edge welding, so mark synced immediately.
+                        g.synced_terrain_revision = g.submitted_terrain_revision;
+                        g.synced_source_epoch = g.submitted_source_epoch;
+                        g.rebuild_in_flight = false;
+                        g.bake_callback_received = false;
+                    } else {
+                        g.bake_callback_received = true;
+                        g.pending_callback_map_iteration = map_iteration_id_;
+                        pushed_any_region_this_frame = true;
+                    }
+                }
+            }
+        }
+
+        // If any region pushed a new NavigationMesh on this frame, align the required map
+        // iteration barrier across all groups currently awaiting map sync so an earlier
+        // group's map-iteration increment never prematurely marks a later group synced
+        // before NavigationServer3D has welded all corridor regions together.
+        if (pushed_any_region_this_frame) {
+            for (auto& [gk, g] : groups_) {
+                if (g.rebuild_in_flight && g.bake_callback_received) {
                     g.pending_callback_map_iteration = map_iteration_id_;
                 }
-            } else if (g.rebuild_in_flight && g.bake_callback_received) {
-                // Step 2: Once region_set_navigation_mesh has been called, NavigationServer3D
-                // increments map_get_iteration_id on its next sync step (or immediately if >=).
-                if (map_iteration_id_ > g.pending_callback_map_iteration) {
-                    g.synced_terrain_revision = g.submitted_terrain_revision;
-                    g.synced_source_epoch = g.submitted_source_epoch;
-                    g.rebuild_in_flight = false;
-                    g.bake_callback_received = false;
+            }
+        } else {
+            for (auto& [gk, g] : groups_) {
+                if (g.rebuild_in_flight && g.bake_callback_received) {
+                    // Step 2: Once region_set_navigation_mesh has been called and no new
+                    // regions were pushed this frame, wait for NavigationServer3D's map
+                    // iteration to advance past the barrier.
+                    if (map_iteration_id_ > g.pending_callback_map_iteration) {
+                        g.synced_terrain_revision = g.submitted_terrain_revision;
+                        g.synced_source_epoch = g.submitted_source_epoch;
+                        g.rebuild_in_flight = false;
+                        g.bake_callback_received = false;
+                    }
                 }
             }
         }
@@ -710,6 +919,48 @@ public:
     }
 
 private:
+    void compute_corridor_group_bounds(Vec3f start_pos,
+                                       Vec3f end_pos,
+                                       int32_t& out_gx_min,
+                                       int32_t& out_gx_max,
+                                       int32_t& out_gy_min,
+                                       int32_t& out_gy_max,
+                                       int32_t& out_gz_min,
+                                       int32_t& out_gz_max) const noexcept {
+        const float s = (config_.voxel_scale > 0.0f) ? config_.voxel_scale : 1.0f;
+        // Expand the world-space corridor box by 24 voxel units horizontally and 20 voxel units
+        // vertically so hills rising into `gy + 1`, valleys/craters dipping into `gy - 1`, or
+        // paths curving around obstacles near a `gx`/`gz` border are always baked and synced.
+        const float margin_xz = 24.0f * s;
+        const float margin_y  = 20.0f * s;
+
+        const float min_x = std::min(start_pos.x, end_pos.x) - margin_xz;
+        const float max_x = std::max(start_pos.x, end_pos.x) + margin_xz;
+        const float min_y = std::max(0.0f, std::min(start_pos.y, end_pos.y) - margin_y);
+        const float max_y = std::max(start_pos.y, end_pos.y) + margin_y;
+        const float min_z = std::min(start_pos.z, end_pos.z) - margin_xz;
+        const float max_z = std::max(start_pos.z, end_pos.z) + margin_xz;
+
+        const ChunkKey ck_min = ChunkKey::from_world_sample(
+            static_cast<int32_t>(std::floor(min_x / s)),
+            static_cast<int32_t>(std::floor(min_y / s)),
+            static_cast<int32_t>(std::floor(min_z / s)));
+        const ChunkKey ck_max = ChunkKey::from_world_sample(
+            static_cast<int32_t>(std::floor(max_x / s)),
+            static_cast<int32_t>(std::floor(max_y / s)),
+            static_cast<int32_t>(std::floor(max_z / s)));
+
+        const NavigationGroupKey gk_min = NavigationGroupKey::from_chunk_key(ck_min);
+        const NavigationGroupKey gk_max = NavigationGroupKey::from_chunk_key(ck_max);
+
+        out_gx_min = std::min(gk_min.gx, gk_max.gx);
+        out_gx_max = std::max(gk_min.gx, gk_max.gx);
+        out_gy_min = std::max<int32_t>(0, std::min(gk_min.gy, gk_max.gy));
+        out_gy_max = std::max(gk_min.gy, gk_max.gy);
+        out_gz_min = std::min(gk_min.gz, gk_max.gz);
+        out_gz_max = std::max(gk_min.gz, gk_max.gz);
+    }
+
     [[nodiscard]] Aabb3f chunk_aabb(ChunkKey ck) const noexcept {
         const float s = config_.voxel_scale;
         const IVec3 min_s = ck.min_world_sample();
@@ -744,22 +995,24 @@ private:
             }
         }
         g.nav_mesh.instantiate();
-        // Configure Recast heightfield so 30-45 deg ramps and narrow Ice Bridges across caverns
-        // never get disconnected by quantized height steps (walkableClimb = floor(0.90 / 0.20) = 4 cells)
-        // or eroded away on bridge edges (filter_ledge_spans = false).
-        g.nav_mesh->set_cell_size(0.4f);
-        g.nav_mesh->set_cell_height(0.2f);
+        // Use exact power-of-two IEEE-754 floats (cell_size = 0.50f, cell_height = 0.25f,
+        // agent_max_climb = 1.50f = 6 * 0.25f) and grid-aligned border_size (3.00f at 1m scale,
+        // 2.00f at 0.5m scale) so Recast tiles meet edge-to-edge without overlap or warnings.
+        g.nav_mesh->set_cell_size(config_.cell_size);
+        g.nav_mesh->set_cell_height(config_.cell_height);
         g.nav_mesh->set_agent_radius(config_.agent_radius);
         g.nav_mesh->set_agent_height(config_.agent_height);
-        g.nav_mesh->set_agent_max_climb(0.9f);
-        g.nav_mesh->set_agent_max_slope(52.0f);
+        g.nav_mesh->set_agent_max_climb(config_.agent_max_climb);
+        g.nav_mesh->set_agent_max_slope(config_.agent_max_slope);
         g.nav_mesh->set_region_min_size(2.0f);
         g.nav_mesh->set_border_size(g.border_size);
+
+        const Aabb3f filter_box = compute_recast_filter_aabb(gk);
         g.nav_mesh->set_filter_baking_aabb(godot::AABB(
-            godot::Vector3(g.baking_aabb.min.x, g.baking_aabb.min.y, g.baking_aabb.min.z),
-            godot::Vector3(g.baking_aabb.max.x - g.baking_aabb.min.x,
-                           g.baking_aabb.max.y - g.baking_aabb.min.y,
-                           g.baking_aabb.max.z - g.baking_aabb.min.z)));
+            godot::Vector3(filter_box.min.x, filter_box.min.y, filter_box.min.z),
+            godot::Vector3(filter_box.max.x - filter_box.min.x,
+                           filter_box.max.y - filter_box.min.y,
+                           filter_box.max.z - filter_box.min.z)));
         g.nav_mesh->set_filter_low_hanging_obstacles(config_.filter_low_hanging_obstacles);
         g.nav_mesh->set_filter_ledge_spans(false);
         g.nav_mesh->set_filter_walkable_low_height_spans(config_.filter_walkable_low_height_spans);

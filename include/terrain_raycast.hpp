@@ -21,11 +21,21 @@ struct TerrainMaterialHit {
 /// solid sample behind it, or std::nullopt when the ray starts inside solid,
 /// ends without crossing a surface, or is degenerate.
 /// Sampling is Godot-free so both the extension and unit tests share it.
+/// @param step  March step in world meters.
+/// @param voxel_scale  Meters per voxel sample. Input and output positions are
+///   world-space; internally the ray is mapped into canonical sample space.
 [[nodiscard]] inline std::optional<TerrainMaterialHit> raycast_terrain_material(
     const ChunkStore& store,
     Vec3f origin,
     Vec3f target,
-    float step = 0.5f) {
+    float step = 0.5f,
+    float voxel_scale = 1.0f) {
+
+    const float scale = (voxel_scale > 0.0f) ? voxel_scale : 1.0f;
+    const float inv_scale = 1.0f / scale;
+    origin = Vec3f{origin.x * inv_scale, origin.y * inv_scale, origin.z * inv_scale};
+    target = Vec3f{target.x * inv_scale, target.y * inv_scale, target.z * inv_scale};
+    step *= inv_scale;
 
     const float dx = target.x - origin.x;
     const float dy = target.y - origin.y;
@@ -87,9 +97,9 @@ struct TerrainMaterialHit {
             const float frac = (denom > 1e-6f) ? (prev_f / denom) : 0.5f;
             TerrainMaterialHit hit{};
             hit.position = Vec3f{
-                static_cast<float>(prev.x) + static_cast<float>(cur.x - prev.x) * frac,
-                static_cast<float>(prev.y) + static_cast<float>(cur.y - prev.y) * frac,
-                static_cast<float>(prev.z) + static_cast<float>(cur.z - prev.z) * frac};
+                (static_cast<float>(prev.x) + static_cast<float>(cur.x - prev.x) * frac) * scale,
+                (static_cast<float>(prev.y) + static_cast<float>(cur.y - prev.y) * frac) * scale,
+                (static_cast<float>(prev.z) + static_cast<float>(cur.z - prev.z) * frac) * scale};
             hit.material_id = cur.material;
             return hit;
         }
@@ -105,10 +115,11 @@ struct TerrainMaterialHit {
     const ChunkStore& store,
     Vec3f origin,
     Vec3f target,
-    float step = 0.5f) {
+    float step = 0.5f,
+    float voxel_scale = 1.0f) {
 
     const std::optional<TerrainMaterialHit> hit =
-        raycast_terrain_material(store, origin, target, step);
+        raycast_terrain_material(store, origin, target, step, voxel_scale);
     if (!hit.has_value()) {
         return std::nullopt;
     }

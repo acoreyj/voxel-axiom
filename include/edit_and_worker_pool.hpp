@@ -180,6 +180,8 @@ struct ChunkMeshPayload {
     //           0.75=Obsidian, 1.0=Ice); rock materials keep hits-to-break / 255
     //           (3/255 hard rock, 5/255 boulder, else 1/255), which can never reach 0.25.
     std::vector<Vec3f> colors;
+    std::vector<Vec3f> baked_albedos;        // Per-vertex baked RGB albedo in [0, 1] (sent via UV.xy / UV2.x)
+    std::vector<float> baked_albedo_weights; // COLOR.a: 1.0 if painted voxel, 0.0 if procedural
     std::vector<int32_t> indices;
     std::vector<Vec3f> collision_faces;
     std::size_t reserved_ledger_bytes = 0;
@@ -297,10 +299,12 @@ inline bool step_elemental_automata_in_chunk(
             }
             (void)slot->set_material(tr.lc, MaterialHardness::kMaterialAir, store.material_pool());
             (void)slot->clear_damage(tr.lc);
+            (void)slot->clear_color(tr.lc);
         } else {
             if (slot->get_material(tr.lc) != tr.new_material) {
                 (void)slot->set_material(tr.lc, tr.new_material, store.material_pool());
                 (void)slot->clear_damage(tr.lc);
+                (void)slot->clear_color(tr.lc);
                 modified = true;
                 dirty_mask.record_mutated_sample(tr.lc);
             }
@@ -485,6 +489,7 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                             }
                             if (d_fill_min <= 0.0f) {
                                 (void)slot->set_material(lc, chosen_fill_mat, store.material_pool());
+                                (void)slot->clear_color(lc);
                             }
                             if (slot->clear_damage(lc)) {
                                 chunk_modified = true;
@@ -532,6 +537,7 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                                     if (cur_mat == MaterialHardness::kMaterialLava) {
                                         if (slot->set_material(
                                                 lc, MaterialHardness::kMaterialObsidian, store.material_pool())) {
+                                            (void)slot->clear_color(lc);
                                             chunk_modified = true;
                                             local_dirty_mask.record_mutated_sample(lc);
                                         }
@@ -551,12 +557,14 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                                         (void)slot->set_material(
                                             lc, MaterialHardness::kMaterialObsidian, store.material_pool());
                                         (void)slot->clear_damage(lc);
+                                        (void)slot->clear_color(lc);
                                         chunk_modified = true;
                                         local_dirty_mask.record_mutated_sample(lc);
                                     } else if (cur_mat == MaterialHardness::kMaterialWater) {
                                         (void)slot->set_material(
                                             lc, MaterialHardness::kMaterialIce, store.material_pool());
                                         (void)slot->clear_damage(lc);
+                                        (void)slot->clear_color(lc);
                                         chunk_modified = true;
                                         local_dirty_mask.record_mutated_sample(lc);
                                     }
@@ -574,6 +582,7 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                                         (void)slot->set_material(
                                             lc, MaterialHardness::kMaterialIce, store.material_pool());
                                         (void)slot->clear_damage(lc);
+                                        (void)slot->clear_color(lc);
                                     }
                                 }
                             } else if (s.elemental_kind == ElementalKind::Lava) {
@@ -595,6 +604,7 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                                         if (q_new >= 0) {
                                             (void)slot->set_material(
                                                 lc, MaterialHardness::kMaterialAir, store.material_pool());
+                                            (void)slot->clear_color(lc);
                                         }
                                         (void)slot->clear_damage(lc);
                                     } else if (d_elem <= 0.0f) {
@@ -602,12 +612,14 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                                             (void)slot->set_material(
                                                 lc, MaterialHardness::kMaterialObsidian, store.material_pool());
                                             (void)slot->clear_damage(lc);
+                                            (void)slot->clear_color(lc);
                                             chunk_modified = true;
                                             local_dirty_mask.record_mutated_sample(lc);
                                         } else if (cur_mat == MaterialHardness::kMaterialSoil) {
                                             (void)slot->set_material(
                                                 lc, MaterialHardness::kMaterialLava, store.material_pool());
                                             (void)slot->clear_damage(lc);
+                                            (void)slot->clear_color(lc);
                                             chunk_modified = true;
                                             local_dirty_mask.record_mutated_sample(lc);
                                         }
@@ -651,6 +663,9 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                                         local_dirty_mask.record_mutated_sample(lc);
                                     }
                                 }
+                                if (q_new >= 0) {
+                                    (void)slot->clear_color(lc);
+                                }
                                 continue;
                             }
 
@@ -680,6 +695,7 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                                         chunk_modified = true;
                                         local_dirty_mask.record_mutated_sample(lc);
                                     }
+                                    (void)slot->clear_color(lc);
                                     if (q_cur >= 0) {
                                         const int16_t q_blast = TsdfFormat::encode(d_blast, delta);
                                         const int16_t q_new = std::max(q_cur, q_blast);
@@ -833,6 +849,9 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                             local_dirty_mask.record_mutated_sample(u.lc);
                         }
                     }
+                    if (u.q_new >= 0) {
+                        (void)slot->clear_color(u.lc);
+                    }
                     if (u.clear_underground_damage && slot->clear_damage(u.lc)) {
                         chunk_modified = true;
                         local_dirty_mask.record_mutated_sample(u.lc);
@@ -902,6 +921,7 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
             for (const LocalCoord& lc : crumbs_to_prune) {
                 (void)slot->set_tsdf(lc, TsdfFormat::kClampedAir, store.tsdf_pool());
                 (void)slot->clear_damage(lc);
+                (void)slot->clear_color(lc);
                 dirty_mask.record_mutated_sample(lc);
             }
             slot->try_demote_if_uniform(store.tsdf_pool(), store.material_pool());
@@ -1225,6 +1245,8 @@ private:
                 rec.chunk_mesh.vertices.size() * sizeof(Vec3f) +
                 rec.chunk_mesh.normals.size() * sizeof(Vec3f) +
                 rec.chunk_mesh.colors.size() * sizeof(Vec3f) +
+                rec.chunk_mesh.baked_albedos.size() * sizeof(Vec3f) +
+                rec.chunk_mesh.baked_albedo_weights.size() * sizeof(float) +
                 rec.chunk_mesh.indices.size() * sizeof(int32_t) +
                 rec.chunk_mesh.collision_faces.size() * sizeof(Vec3f);
             if (bytes > 0 && store_.ledger().try_reserve(bytes, MemoryPoolId::CompletionQueue)) {
