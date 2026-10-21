@@ -3,9 +3,10 @@
 importer="texture"
 type="CompressedTexture2D"
 uid="uid://cwox75aoqyghs"
-path="res://.godot/imported/pickaxe_0.jpg-244253c2a2afc8459f5da6518af8b8d0.ctex"
+path.s3tc="res://.godot/imported/pickaxe_0.jpg-244253c2a2afc8459f5da6518af8b8d0.s3tc.ctex"
 metadata={
-"vram_texture": false
+"imported_formats": ["s3tc_bptc"],
+"vram_texture": true
 }
 generator_parameters={
 "md5": "167c67b400942c21d85b5da26cef2467"
@@ -14,11 +15,11 @@ generator_parameters={
 [deps]
 
 source_file="res://models/pickaxe/pickaxe_0.jpg"
-dest_files=["res://.godot/imported/pickaxe_0.jpg-244253c2a2afc8459f5da6518af8b8d0.ctex"]
+dest_files=["res://.godot/imported/pickaxe_0.jpg-244253c2a2afc8459f5da6518af8b8d0.s3tc.ctex"]
 
 [params]
 
-compress/mode=0
+compress/mode=2
 compress/high_quality=false
 compress/lossy_quality=0.7
 compress/uastc_level=0
@@ -40,4 +41,4 @@ process/normal_map_invert_y=false
 process/hdr_as_srgb=false
 process/hdr_clamp_exposure=false
 process/size_limit=0
-detect_3d/compress_to=1
+detect_3d/compress_to=0
