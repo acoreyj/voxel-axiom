@@ -134,6 +134,7 @@ const BENCHMARK_SETTLE_MAX_SEC := 3.5
 const BENCHMARK_FLIGHT_SEC := 4.5
 const BENCHMARK_DESTRUCTION_SEC := 4.0
 const BENCHMARK_NAV_SEC := 2.5
+const BENCHMARK_NAV_MAX_SEC := 5.5
 const BENCHMARK_REPORT_JSON_USER := "user://voxel_benchmark_results.json"
 const BENCHMARK_REPORT_MD_USER := "user://voxel_benchmark_report.md"
 const BENCHMARK_REPORT_JSON_RES := "res://voxel_benchmark_results.json"
@@ -193,6 +194,7 @@ Build   1 Add terrain   2 Paint   3 Paint delete   4 Boulder
 Carve   5 Small hit     6 Explode   7 Large explode
 Element 8 Water   9 Frost/Ice   0 Lava/Magma
 Stamps  B timed ruin   Shift+B permanent ruin
+History Z (or Ctrl+Z) undo   Y (or Ctrl+Y) redo   Shift+R undo all & reset
 World   R reset statues   T material   P place companion
 Mouse   Play LMB pickaxe   Fly LMB tool   RMB cave path   Shift+RMB place companion"""
 const MATERIAL_NAMES := ["Soil", "Rock"]
@@ -389,6 +391,21 @@ var _bench_peak_primitives: int = 0
 var _bench_results: Array[Dictionary] = []
 var _bench_last_summary_banner: String = ""
 var _bench_banner_timer: float = 0.0
+var _bench_suite_started_utc: String = ""
+var _bench_suite_started_local: String = ""
+var _bench_suite_started_unix: float = 0.0
+var _bench_preset_started_utc: String = ""
+var _bench_preset_started_local: String = ""
+var _bench_preset_started_unix: float = 0.0
+var _bench_last_reset_method: String = "undo_all"
+
+## Undo / Redo action stack (groups continuous brush strokes & Option 1 PristineMesh swaps
+## with C++ chunk-snapshot undo/redo entries, and provides a GDScript fallback if the
+## loaded GDExtension binary was built before VoxelUndoRedoManager was added).
+const MAX_UNDO_ACTIONS := 64
+var _undo_stack: Array[Dictionary] = []
+var _redo_stack: Array[Dictionary] = []
+var _active_undo_action: Dictionary = {}
 
 func _ready() -> void:
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
@@ -403,6 +420,10 @@ func _ready() -> void:
 	terrain.structure_recreated.connect(_on_structure_recreated)
 	if terrain.has_signal("structure_removed"):
 		terrain.connect("structure_removed", Callable(self, "_on_structure_removed"))
+	if terrain.has_signal("undo_completed"):
+		terrain.connect("undo_completed", Callable(self, "_on_undo_completed"))
+	if terrain.has_signal("redo_completed"):
+		terrain.connect("redo_completed", Callable(self, "_on_redo_completed"))
 
 	_setup_pickaxe_viewmodel()
 	_setup_path_debug_visuals()
@@ -411,6 +432,9 @@ func _ready() -> void:
 	_setup_side_by_side_easter_island_statues()
 	_setup_side_by_side_atlas_statues()
 	_setup_side_by_side_ape_statues()
+	# Treat the freshly stamped Option 2 statues as the pristine world baseline
+	# so Undo / undo_all() never erases the initial showcase statues.
+	_clear_undo_history_to_current_baseline()
 	_setup_phantom_camera()
 	_update_stream_focus(true)
 	_check_cli_benchmark_autostart()
@@ -705,6 +729,13 @@ func _check_and_swap_opt1_easter_island_on_blast(blast_pos: Vector3, blast_radiu
 	if direct_hit or dist_to_box <= blast_radius + 2.0:
 		_opt1_structure_id = _stamp_structure(easter_island_vreg_path, _opt1_origin_chunk, 0.0)
 		_opt1_swapped_to_voxels = true
+		_note_undo_cpp_op({
+			"kind": "opt1_swap",
+			"statue": "easter_island",
+			"structure_id": _opt1_structure_id,
+			"vreg_path": easter_island_vreg_path,
+			"origin_chunk": _opt1_origin_chunk,
+		})
 		_queue_pristine_hide(opt1_mesh_inst, opt1_col_shape, opt1_label,
 			"Easter Island Option 1 (16x Scale): SWAPPED TO VOXELS (#%d)\n(Carve freely | Press R to restore Pristine Mesh)" % _opt1_structure_id)
 		print("[EasterIslandSwap] Option 1 statue hit at ", blast_pos, " -> Stamped Voxel Structure #", _opt1_structure_id, ", hiding PristineMesh when committed!")
@@ -722,6 +753,13 @@ func _check_and_swap_atlas_opt1_on_blast(blast_pos: Vector3, blast_radius: float
 	if direct_hit or dist_to_box <= blast_radius + 2.0:
 		_atlas_opt1_structure_id = _stamp_structure(atlas_vreg_path, _atlas_opt1_origin_chunk, 0.0)
 		_atlas_opt1_swapped_to_voxels = true
+		_note_undo_cpp_op({
+			"kind": "opt1_swap",
+			"statue": "atlas",
+			"structure_id": _atlas_opt1_structure_id,
+			"vreg_path": atlas_vreg_path,
+			"origin_chunk": _atlas_opt1_origin_chunk,
+		})
 		_queue_pristine_hide(atlas_opt1_mesh_inst, atlas_opt1_col_shape, atlas_opt1_label,
 			"Atlas Option 1 (5.33x Scale): SWAPPED TO VOXELS (#%d)\n(Carve freely | Press R to restore Pristine Mesh)" % _atlas_opt1_structure_id)
 		print("[AtlasSwap] Option 1 Atlas hit at ", blast_pos, " -> Stamped Voxel Structure #", _atlas_opt1_structure_id, ", hiding PristineMesh when committed!")
@@ -739,6 +777,13 @@ func _check_and_swap_ape_opt1_on_blast(blast_pos: Vector3, blast_radius: float, 
 	if direct_hit or dist_to_box <= blast_radius + 2.0:
 		_ape_opt1_structure_id = _stamp_structure(ape_vreg_path, _ape_opt1_origin_chunk, 0.0)
 		_ape_opt1_swapped_to_voxels = true
+		_note_undo_cpp_op({
+			"kind": "opt1_swap",
+			"statue": "ape",
+			"structure_id": _ape_opt1_structure_id,
+			"vreg_path": ape_vreg_path,
+			"origin_chunk": _ape_opt1_origin_chunk,
+		})
 		_queue_pristine_hide(ape_opt1_mesh_inst, ape_opt1_col_shape, ape_opt1_label,
 			"Ape Option 1 (5.33x Scale): SWAPPED TO VOXELS (#%d)\n(Carve freely | Press R to restore Pristine Mesh)" % _ape_opt1_structure_id)
 		print("[ApeSwap] Option 1 Ape hit at ", blast_pos, " -> Stamped Voxel Structure #", _ape_opt1_structure_id, ", hiding PristineMesh when committed!")
@@ -1378,10 +1423,17 @@ func _apply_pickaxe_hit() -> bool:
 	_spawn_pickaxe_impact_sparks(point, hit_normal)
 	if _companion_initialized and _goal_mesh_inst.visible:
 		_rebake_in_progress = true
+	_begin_undo_action("Pickaxe hit")
 	_check_and_swap_opt1_easter_island_on_blast(point, pickaxe_hit_radius, hit_collider)
 	_check_and_swap_atlas_opt1_on_blast(point, pickaxe_hit_radius, hit_collider)
 	_check_and_swap_ape_opt1_on_blast(point, pickaxe_hit_radius, hit_collider)
 	terrain.trigger_explosion(point, pickaxe_hit_radius)
+	_note_undo_cpp_op({
+		"kind": "explosion",
+		"point": point,
+		"radius": pickaxe_hit_radius,
+	})
+	_end_undo_action()
 	return true
 
 func _pickaxe_aim_point() -> Vector3:
@@ -1553,7 +1605,9 @@ func _unhandled_input(event: InputEvent) -> void:
 		match event.keycode:
 			KEY_ESCAPE:
 				if Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
-					_tool_pressed = false
+					if _tool_pressed:
+						_tool_pressed = false
+						_end_undo_action()
 					Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 				else:
 					Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
@@ -1586,8 +1640,18 @@ func _unhandled_input(event: InputEvent) -> void:
 			KEY_H:
 				_controls_visible = not _controls_visible
 				controls_label.visible = _controls_visible
+			KEY_Z:
+				if event.shift_pressed and (event.ctrl_pressed or event.meta_pressed):
+					_perform_redo()
+				else:
+					_perform_undo()
+			KEY_Y:
+				_perform_redo()
 			KEY_R:
-				_reset_statues()
+				if event.shift_pressed or event.ctrl_pressed or event.meta_pressed:
+					_perform_undo_all_and_reset()
+				else:
+					_reset_statues()
 			KEY_T:
 				_toggle_add_material()
 			KEY_P:
@@ -1597,7 +1661,9 @@ func _unhandled_input(event: InputEvent) -> void:
 		# While the cursor is released, a click recaptures instead of firing a
 		# tool, so Esc / alt-tab can never carve terrain by accident.
 		if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
-			_tool_pressed = false
+			if _tool_pressed:
+				_tool_pressed = false
+				_end_undo_action()
 			if event.pressed:
 				Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 			return
@@ -1612,11 +1678,17 @@ func _unhandled_input(event: InputEvent) -> void:
 			_tool_pressed = event.pressed
 			if event.pressed:
 				if _is_drag_tool():
+					_begin_undo_action(TOOL_NAMES[_active_tool] + " stroke")
 					_last_brush_point = Vector3(INF, INF, INF)
 					_brush_cooldown = 0.0
 					_process_brush(0.0)
 				else:
+					_begin_undo_action(TOOL_NAMES[_active_tool])
 					_apply_click_tool()
+					_end_undo_action()
+			else:
+				if not _active_undo_action.is_empty():
+					_end_undo_action()
 		elif event.button_index == MOUSE_BUTTON_RIGHT and event.pressed:
 			if Input.is_key_pressed(KEY_SHIFT):
 				_place_companion_at_crosshair()
@@ -1732,8 +1804,10 @@ func _update_hud(delta: float) -> void:
 		_look_at_accum = 0.0
 		_refresh_look_at_material()
 
+	var undo_depth := _get_undo_depth_display()
+	var redo_depth := _get_redo_depth_display()
 	var banner_suffix := ("\n" + _bench_last_summary_banner) if _bench_banner_timer > 0.0 and not _bench_last_summary_banner.is_empty() else ""
-	stats_label.text = "FPS: %.0f  (%.2f ms)\nView dist: %d / %d chunks  (prefetch %d)\nCommitted: %d chunks  (%.0f/s)\nStreaming: %s\nMode: %s (F) | Benchmark: M\nLooking at: %s\nTool: %s\nControls: H%s" % [
+	stats_label.text = "FPS: %.0f  (%.2f ms)\nView dist: %d / %d chunks  (prefetch %d)\nCommitted: %d chunks  (%.0f/s)\nStreaming: %s\nMode: %s (F) | Benchmark: M\nLooking at: %s\nTool: %s\nHistory: Undo %d (Z) | Redo %d (Y) | Reset All (Shift+R)\nControls: H%s" % [
 		_fps_smoothed,
 		1000.0 / max(_fps_smoothed, 1.0),
 		terrain.get_effective_view_distance_chunks(),
@@ -1745,6 +1819,8 @@ func _update_hud(delta: float) -> void:
 		mode_name,
 		_look_at_name,
 		tool_text,
+		undo_depth,
+		redo_depth,
 		banner_suffix,
 	]
 
@@ -1874,24 +1950,34 @@ func _apply_tool_at(point: Vector3) -> void:
 	match _active_tool:
 		Tool.ADD_TERRAIN:
 			terrain.add_terrain_with_material(point, add_radius, _add_material)
+			_note_undo_cpp_op({"kind": "add_terrain", "point": point, "radius": add_radius, "material": _add_material})
 		Tool.LARGE_EXPLODE:
 			terrain.trigger_explosion(point, large_explosion_radius)
+			_note_undo_cpp_op({"kind": "explosion", "point": point, "radius": large_explosion_radius})
 		Tool.PAINT:
 			terrain.add_terrain_with_material(point, paint_radius, _add_material)
+			_note_undo_cpp_op({"kind": "add_terrain", "point": point, "radius": paint_radius, "material": _add_material})
 		Tool.PAINT_DELETE:
 			terrain.trigger_explosion(point, paint_delete_radius)
+			_note_undo_cpp_op({"kind": "explosion", "point": point, "radius": paint_delete_radius})
 		Tool.BOULDER:
 			terrain.place_boulder(point, boulder_radius)
+			_note_undo_cpp_op({"kind": "boulder", "point": point, "radius": boulder_radius})
 		Tool.SMALL_HIT:
 			terrain.trigger_explosion(point, small_hit_radius)
+			_note_undo_cpp_op({"kind": "explosion", "point": point, "radius": small_hit_radius})
 		Tool.WATER_QUENCH:
 			terrain.trigger_elemental_sphere(point, elemental_radius, ELEMENTAL_WATER)
+			_note_undo_cpp_op({"kind": "elemental", "point": point, "radius": elemental_radius, "element": ELEMENTAL_WATER})
 		Tool.FROST_ICE:
 			terrain.trigger_elemental_sphere(point, elemental_radius, ELEMENTAL_FROST)
+			_note_undo_cpp_op({"kind": "elemental", "point": point, "radius": elemental_radius, "element": ELEMENTAL_FROST})
 		Tool.LAVA_MAGMA:
 			terrain.trigger_elemental_sphere(point, elemental_radius, ELEMENTAL_LAVA)
+			_note_undo_cpp_op({"kind": "elemental", "point": point, "radius": elemental_radius, "element": ELEMENTAL_LAVA})
 		_:
 			terrain.trigger_explosion(point, explosion_radius)
+			_note_undo_cpp_op({"kind": "explosion", "point": point, "radius": explosion_radius})
 
 func _raycast_crosshair() -> Dictionary:
 	var space_state := get_world_3d().direct_space_state
@@ -1950,12 +2036,22 @@ func _stamp_asset_at_crosshair(recreate_delay: float) -> void:
 		int(floor(hit_pos.y / chunk_size)) - 4,
 		int(floor(hit_pos.z / chunk_size)) - 4
 	)
+	_begin_undo_action("Stamp asset")
 	var structure_id := _stamp_structure(stamp_asset_path, Vector3(origin), recreate_delay)
 	if structure_id > 0:
+		_note_undo_cpp_op({
+			"kind": "stamp_asset",
+			"structure_id": structure_id,
+			"vreg_path": stamp_asset_path,
+			"origin_chunk": Vector3(origin),
+			"recreate_delay": recreate_delay,
+		})
+		_end_undo_action()
 		print("[VoxelTerrain3D] Stamped asset '%s' structure_id=%d at chunk %s delay=%.1fs" % [
 			stamp_asset_path, structure_id, str(origin), recreate_delay
 		])
 	else:
+		_active_undo_action.clear()
 		push_warning("[VoxelTerrain3D] Failed to stamp '%s' — bake one first: voxel_baker <model.obj> %s" % [
 			stamp_asset_path, stamp_asset_path
 		])
@@ -1992,8 +2088,6 @@ func _query_companion_cave_path_to_crosshair() -> void:
 
 func _poll_pending_path_query() -> void:
 	if not _has_pending_path_query:
-		return
-	if not terrain.fully_committed():
 		return
 	var start_pos := ai_companion.global_position
 	var start_synced := ai_companion.is_path_region_synced(start_pos)
@@ -2153,6 +2247,372 @@ func _on_structure_removed(structure_id: int, asset_name: String) -> void:
 		_has_pending_path_query = true
 
 
+func _on_undo_completed(restored_chunks: int, remaining_undo: int, available_redo: int) -> void:
+	print("[UndoRedo] Undo completed -> restored %d chunk(s) (undo=%d, redo=%d)" % [
+		restored_chunks, remaining_undo, available_redo
+	])
+	if _companion_initialized and _goal_mesh_inst.visible:
+		_has_pending_path_query = true
+
+func _on_redo_completed(restored_chunks: int, available_undo: int, remaining_redo: int) -> void:
+	print("[UndoRedo] Redo completed -> re-applied %d chunk(s) (undo=%d, redo=%d)" % [
+		restored_chunks, available_undo, remaining_redo
+	])
+	if _companion_initialized and _goal_mesh_inst.visible:
+		_has_pending_path_query = true
+
+# ==============================================================================
+# Full Undo / Redo System (Keys Z / Y / Shift+R & Benchmark Pass Reset)
+# ==============================================================================
+
+func _has_native_undo_redo() -> bool:
+	return terrain != null and terrain.has_method("undo") and terrain.has_method("redo")
+
+func _get_undo_depth_display() -> int:
+	if not _undo_stack.is_empty():
+		return _undo_stack.size()
+	if _has_native_undo_redo() and terrain.has_method("get_undo_count"):
+		return int(terrain.call("get_undo_count"))
+	return 0
+
+func _get_redo_depth_display() -> int:
+	if not _redo_stack.is_empty():
+		return _redo_stack.size()
+	if _has_native_undo_redo() and terrain.has_method("get_redo_count"):
+		return int(terrain.call("get_redo_count"))
+	return 0
+
+func _clear_undo_history_to_current_baseline() -> void:
+	_active_undo_action.clear()
+	_undo_stack.clear()
+	_redo_stack.clear()
+	if terrain != null and terrain.has_method("clear_undo_history"):
+		terrain.call("clear_undo_history")
+
+func _begin_undo_action(label: String) -> void:
+	if _mode == Mode.BENCHMARK:
+		return
+	_active_undo_action = {
+		"label": label,
+		"cpp_ops": 0,
+		"ops": [],
+	}
+
+func _note_undo_cpp_op(op_record: Dictionary) -> void:
+	if _mode == Mode.BENCHMARK or _active_undo_action.is_empty():
+		return
+	_active_undo_action["cpp_ops"] = int(_active_undo_action.get("cpp_ops", 0)) + 1
+	var ops_arr: Array = _active_undo_action["ops"]
+	ops_arr.append(op_record)
+
+func _end_undo_action() -> void:
+	if _active_undo_action.is_empty():
+		return
+	var cpp_ops := int(_active_undo_action.get("cpp_ops", 0))
+	if cpp_ops > 0:
+		_undo_stack.append(_active_undo_action.duplicate(true))
+		if _undo_stack.size() > MAX_UNDO_ACTIONS:
+			_undo_stack.pop_front()
+		_redo_stack.clear()
+	_active_undo_action.clear()
+
+func _restore_opt1_visual_state_after_undo(statue_id: String) -> void:
+	match statue_id:
+		"easter_island":
+			_opt1_swapped_to_voxels = false
+			_opt1_structure_id = 0
+			_cancel_pending_pristine_hide(opt1_mesh_inst)
+			opt1_mesh_inst.visible = true
+			opt1_col_shape.disabled = false
+			opt1_label.text = "Easter Island Option 1 (16x Scale): Pristine Mesh -> Voxel Swap\n(Shoot to fracture into voxels | Press R to Reset)"
+		"atlas":
+			_atlas_opt1_swapped_to_voxels = false
+			_atlas_opt1_structure_id = 0
+			_cancel_pending_pristine_hide(atlas_opt1_mesh_inst)
+			atlas_opt1_mesh_inst.visible = true
+			atlas_opt1_col_shape.disabled = false
+			atlas_opt1_label.text = "Atlas Option 1 (5.33x Scale): Pristine Mesh -> Voxel Swap\n(Shoot to fracture into voxels | Press R to Reset)"
+		"ape":
+			_ape_opt1_swapped_to_voxels = false
+			_ape_opt1_structure_id = 0
+			_cancel_pending_pristine_hide(ape_opt1_mesh_inst)
+			ape_opt1_mesh_inst.visible = true
+			ape_opt1_col_shape.disabled = false
+			ape_opt1_label.text = "Ape Option 1 (5.33x Scale): Pristine Mesh -> Voxel Swap\n(Shoot to fracture into voxels | Press R to Reset)"
+
+func _reapply_opt1_visual_state_after_redo(statue_id: String, struct_id: int) -> void:
+	match statue_id:
+		"easter_island":
+			_opt1_swapped_to_voxels = true
+			_opt1_structure_id = struct_id
+			_queue_pristine_hide(opt1_mesh_inst, opt1_col_shape, opt1_label,
+				"Easter Island Option 1 (16x Scale): SWAPPED TO VOXELS (#%d)\n(Carve freely | Press R to restore Pristine Mesh)" % _opt1_structure_id)
+		"atlas":
+			_atlas_opt1_swapped_to_voxels = true
+			_atlas_opt1_structure_id = struct_id
+			_queue_pristine_hide(atlas_opt1_mesh_inst, atlas_opt1_col_shape, atlas_opt1_label,
+				"Atlas Option 1 (5.33x Scale): SWAPPED TO VOXELS (#%d)\n(Carve freely | Press R to restore Pristine Mesh)" % _atlas_opt1_structure_id)
+		"ape":
+			_ape_opt1_swapped_to_voxels = true
+			_ape_opt1_structure_id = struct_id
+			_queue_pristine_hide(ape_opt1_mesh_inst, ape_opt1_col_shape, ape_opt1_label,
+				"Ape Option 1 (5.33x Scale): SWAPPED TO VOXELS (#%d)\n(Carve freely | Press R to restore Pristine Mesh)" % _ape_opt1_structure_id)
+
+func _perform_undo() -> bool:
+	if _tool_pressed:
+		_tool_pressed = false
+		_end_undo_action()
+	_last_boom_point = Vector3(INF, INF, INF)
+
+	if not _undo_stack.is_empty():
+		var action: Dictionary = _undo_stack.pop_back()
+		var cpp_ops := int(action.get("cpp_ops", 1))
+		var ops: Array = action.get("ops", [])
+		var any_undone := false
+
+		if _has_native_undo_redo():
+			for _i in range(cpp_ops):
+				if bool(terrain.call("undo")):
+					any_undone = true
+			for i in range(ops.size() - 1, -1, -1):
+				var op: Dictionary = ops[i]
+				if String(op.get("kind", "")) == "opt1_swap":
+					_restore_opt1_visual_state_after_undo(String(op.get("statue", "")))
+		else:
+			# Fallback when running against an older GDExtension binary without C++ undo()
+			for i in range(ops.size() - 1, -1, -1):
+				var op: Dictionary = ops[i]
+				var kind := String(op.get("kind", ""))
+				if kind == "opt1_swap":
+					var sid := int(op.get("structure_id", 0))
+					if sid > 0:
+						_remove_structure(sid)
+					_restore_opt1_visual_state_after_undo(String(op.get("statue", "")))
+					any_undone = true
+				elif kind == "stamp_asset":
+					var sid := int(op.get("structure_id", 0))
+					if sid > 0 and _remove_structure(sid):
+						any_undone = true
+				elif kind == "add_terrain" or kind == "boulder":
+					terrain.trigger_explosion(op.get("point", Vector3.ZERO), float(op.get("radius", 4.0)))
+					any_undone = true
+				elif kind == "explosion":
+					terrain.add_terrain_with_material(op.get("point", Vector3.ZERO), float(op.get("radius", 4.0)), MATERIAL_SOIL)
+					any_undone = true
+
+		_redo_stack.append(action)
+		_bench_last_summary_banner = "[Undo] %s (Undo: %d | Redo: %d)" % [
+			String(action.get("label", "Edit")),
+			_get_undo_depth_display(),
+			_get_redo_depth_display(),
+		]
+		_bench_banner_timer = 3.5
+		return any_undone
+
+	if _has_native_undo_redo() and bool(terrain.call("can_undo")):
+		var ok := bool(terrain.call("undo"))
+		if ok:
+			_bench_last_summary_banner = "[Undo] Restored previous terrain state (Undo: %d | Redo: %d)" % [
+				_get_undo_depth_display(),
+				_get_redo_depth_display(),
+			]
+			_bench_banner_timer = 3.5
+		return ok
+
+	print("[UndoRedo] Nothing to undo.")
+	return false
+
+func _perform_redo() -> bool:
+	if _tool_pressed:
+		_tool_pressed = false
+		_end_undo_action()
+	_last_boom_point = Vector3(INF, INF, INF)
+
+	if not _redo_stack.is_empty():
+		var action: Dictionary = _redo_stack.pop_back()
+		var cpp_ops := int(action.get("cpp_ops", 1))
+		var ops: Array = action.get("ops", [])
+		var any_redone := false
+
+		if _has_native_undo_redo():
+			for _i in range(cpp_ops):
+				if bool(terrain.call("redo")):
+					any_redone = true
+			for op_var in ops:
+				var op: Dictionary = op_var
+				if String(op.get("kind", "")) == "opt1_swap":
+					_reapply_opt1_visual_state_after_redo(
+						String(op.get("statue", "")),
+						int(op.get("structure_id", 0))
+					)
+		else:
+			# Fallback when running against an older GDExtension binary without C++ redo()
+			for op_var in ops:
+				var op: Dictionary = op_var
+				var kind := String(op.get("kind", ""))
+				if kind == "opt1_swap":
+					var new_sid := _stamp_structure(
+						String(op.get("vreg_path", "")),
+						op.get("origin_chunk", Vector3.ZERO),
+						0.0
+					)
+					op["structure_id"] = new_sid
+					_reapply_opt1_visual_state_after_redo(String(op.get("statue", "")), new_sid)
+					any_redone = true
+				elif kind == "stamp_asset":
+					var new_sid := _stamp_structure(
+						String(op.get("vreg_path", "")),
+						op.get("origin_chunk", Vector3.ZERO),
+						float(op.get("recreate_delay", 0.0))
+					)
+					op["structure_id"] = new_sid
+					any_redone = true
+				elif kind == "add_terrain":
+					terrain.add_terrain_with_material(
+						op.get("point", Vector3.ZERO),
+						float(op.get("radius", 4.0)),
+						int(op.get("material", MATERIAL_SOIL))
+					)
+					any_redone = true
+				elif kind == "boulder":
+					terrain.place_boulder(op.get("point", Vector3.ZERO), float(op.get("radius", 4.0)))
+					any_redone = true
+				elif kind == "explosion":
+					terrain.trigger_explosion(op.get("point", Vector3.ZERO), float(op.get("radius", 4.0)))
+					any_redone = true
+				elif kind == "elemental":
+					terrain.trigger_elemental_sphere(
+						op.get("point", Vector3.ZERO),
+						float(op.get("radius", 4.0)),
+						int(op.get("element", ELEMENTAL_WATER))
+					)
+					any_redone = true
+
+		_undo_stack.append(action)
+		_bench_last_summary_banner = "[Redo] %s (Undo: %d | Redo: %d)" % [
+			String(action.get("label", "Edit")),
+			_get_undo_depth_display(),
+			_get_redo_depth_display(),
+		]
+		_bench_banner_timer = 3.5
+		return any_redone
+
+	if _has_native_undo_redo() and bool(terrain.call("can_redo")):
+		var ok := bool(terrain.call("redo"))
+		if ok:
+			_bench_last_summary_banner = "[Redo] Re-applied terrain state (Undo: %d | Redo: %d)" % [
+				_get_undo_depth_display(),
+				_get_redo_depth_display(),
+			]
+			_bench_banner_timer = 3.5
+		return ok
+
+	print("[UndoRedo] Nothing to redo.")
+	return false
+
+func _perform_undo_all_and_reset() -> void:
+	if _tool_pressed:
+		_tool_pressed = false
+		_end_undo_action()
+	_last_boom_point = Vector3(INF, INF, INF)
+
+	var steps_undone := 0
+	if terrain != null and terrain.has_method("undo_all"):
+		steps_undone = int(terrain.call("undo_all"))
+	elif _has_native_undo_redo():
+		while bool(terrain.call("can_undo")):
+			if bool(terrain.call("undo")):
+				steps_undone += 1
+			else:
+				break
+	else:
+		while not _undo_stack.is_empty():
+			if _perform_undo():
+				steps_undone += 1
+
+	_restore_opt1_visual_state_after_undo("easter_island")
+	_restore_opt1_visual_state_after_undo("atlas")
+	_restore_opt1_visual_state_after_undo("ape")
+	_reset_statues()
+	_clear_undo_history_to_current_baseline()
+
+	_bench_last_summary_banner = "[World Reset] Reverted %d edit(s) & restored all statues to pristine state" % steps_undone
+	_bench_banner_timer = 4.0
+	print("[UndoRedo] Reverted all %d edit(s) and restored pristine world baseline." % steps_undone)
+
+## Guarantees every benchmark preset pass starts from an identical, un-carved
+## terrain state (restoring the 3-hit Hard Rock boulder, Molten Lava dome, soft
+## soil craters, Frost Ice bridges, and all stamped statues).
+## Primary path: uses `terrain.undo_all()` + `terrain.clear_undo_history()` for
+## instant, bit-exact chunk baseline restoration without re-allocating the engine.
+## Fallback path (if running an older GDExtension binary without `undo_all`):
+## removes any disk save files and cycles `terrain` out of and back into the
+## SceneTree with `save_on_exit = false`.
+func _reset_terrain_for_benchmark_pass() -> void:
+	_active_waypoints.clear()
+	_current_waypoint_idx = 0
+	_has_pending_path_query = false
+	_rebake_in_progress = false
+	if _path_immediate_mesh != null:
+		_path_immediate_mesh.clear_surfaces()
+	if _goal_mesh_inst != null:
+		_goal_mesh_inst.visible = false
+
+	if terrain != null and terrain.has_method("undo_all"):
+		var reverted: int = int(terrain.call("undo_all"))
+		_restore_opt1_visual_state_after_undo("easter_island")
+		_restore_opt1_visual_state_after_undo("atlas")
+		_restore_opt1_visual_state_after_undo("ape")
+		_reset_statues()
+		_clear_undo_history_to_current_baseline()
+		_last_focus_chunk = Vector3i(999999, 999999, 999999)
+		_bench_last_reset_method = "undo_all (%d edits reverted)" % reverted
+		print("[VoxelBenchmark] Reset terrain before pass via undo_all() (%d edit transactions reverted)." % reverted)
+		return
+
+	# Fallback for an older GDExtension binary built before undo_all() was added:
+	var prev_save_on_exit: bool = terrain.get_save_on_exit() if terrain.has_method("get_save_on_exit") else true
+	if terrain.has_method("set_save_on_exit"):
+		terrain.set_save_on_exit(false)
+
+	var save_dir_path: String = terrain.get_save_directory_path() if terrain.has_method("get_save_directory_path") else "/tmp/voxel_world_saves"
+	var parent_node := terrain.get_parent()
+	var terrain_idx := terrain.get_index()
+	parent_node.remove_child(terrain)
+
+	var dir := DirAccess.open(save_dir_path)
+	if dir != null:
+		dir.list_dir_begin()
+		var fname := dir.get_next()
+		while not fname.is_empty():
+			if not dir.current_is_dir() and (fname.ends_with(".vreg") or fname.ends_with(".tmp")):
+				dir.remove(fname)
+			fname = dir.get_next()
+		dir.list_dir_end()
+
+	parent_node.add_child(terrain)
+	parent_node.move_child(terrain, terrain_idx)
+	if terrain.has_method("set_save_on_exit"):
+		terrain.set_save_on_exit(prev_save_on_exit)
+
+	_opt1_swapped_to_voxels = false
+	_opt1_structure_id = 0
+	_opt2_structure_id = 0
+	_atlas_opt1_swapped_to_voxels = false
+	_atlas_opt1_structure_id = 0
+	_atlas_opt2_structure_id = 0
+	_ape_opt1_swapped_to_voxels = false
+	_ape_opt1_structure_id = 0
+	_ape_opt2_structure_id = 0
+	_setup_side_by_side_easter_island_statues()
+	_setup_side_by_side_atlas_statues()
+	_setup_side_by_side_ape_statues()
+	_clear_undo_history_to_current_baseline()
+	_last_focus_chunk = Vector3i(999999, 999999, 999999)
+	_bench_last_reset_method = "engine_reinit_fallback"
+	print("[VoxelBenchmark] Reset terrain before pass via engine_reinit_fallback.")
+
+
 # ==============================================================================
 # Automated Multi-Setting & Hardware Benchmark Suite (Key M or F8 / --benchmark)
 # ==============================================================================
@@ -2245,10 +2705,17 @@ func _start_benchmark() -> void:
 
 	_bench_results.clear()
 	_bench_preset_idx = 0
+	_bench_suite_started_utc = Time.get_datetime_string_from_system(true, true)
+	_bench_suite_started_local = Time.get_datetime_string_from_system(false, true)
+	_bench_suite_started_unix = Time.get_unix_time_from_system()
 	_mode = Mode.BENCHMARK
 
 	print("================================================================================")
-	print("[VoxelBenchmark] STARTING AUTOMATED BENCHMARK SUITE (%d presets)" % BENCHMARK_PRESETS.size())
+	print("[VoxelBenchmark] STARTING AUTOMATED BENCHMARK SUITE (%d presets) at %s (UTC: %s)" % [
+		BENCHMARK_PRESETS.size(),
+		_bench_suite_started_local,
+		_bench_suite_started_utc,
+	])
 	print("[VoxelBenchmark] CPU: %s (%d logical threads, %d voxel workers) | Arch: %s" % [
 		_bench_hardware_info["cpu_name"],
 		_bench_hardware_info["cpu_threads"],
@@ -2263,11 +2730,12 @@ func _start_benchmark() -> void:
 		_bench_hardware_info["rendering_driver"],
 		_bench_hardware_info["rendering_method"],
 	])
-	print("[VoxelBenchmark] OS: %s %s (%s) | System RAM: %.0f MiB | Window: %s | voxel_scale=%.2fm" % [
+	print("[VoxelBenchmark] OS: %s %s (%s) | System RAM: %.0f MiB total (%.0f MiB free) | Window: %s | voxel_scale=%.2fm" % [
 		_bench_hardware_info["os_name"],
 		_bench_hardware_info["os_distro"],
 		_bench_hardware_info["os_version"],
 		_bench_hardware_info["ram_physical_mb"],
+		_bench_hardware_info["ram_free_mb"],
 		_bench_hardware_info["window_resolution"],
 		_bench_hardware_info["voxel_scale_m"],
 	])
@@ -2279,7 +2747,15 @@ func _begin_benchmark_preset(idx: int) -> void:
 	_bench_preset_idx = idx
 	var preset: Dictionary = BENCHMARK_PRESETS[idx]
 
-	_reset_statues()
+	_bench_preset_started_utc = Time.get_datetime_string_from_system(true, true)
+	_bench_preset_started_local = Time.get_datetime_string_from_system(false, true)
+	_bench_preset_started_unix = Time.get_unix_time_from_system()
+
+	# Reset all voxel edits, craters, 3-hit Hard Rock damage, Lava->Obsidian quench,
+	# Frost Ice bridges, and statues before each pass so every preset runs on
+	# 100% identical pristine terrain.
+	_reset_terrain_for_benchmark_pass()
+
 	terrain.view_distance_chunks = int(preset["view_distance_chunks"])
 	terrain.prefetch_distance_chunks = int(preset["prefetch_distance_chunks"])
 	terrain.upload_budget_ms = float(preset["upload_budget_ms"])
@@ -2403,7 +2879,7 @@ func _process_benchmark(delta: float) -> void:
 
 		BenchmarkPhase.NAVIGATION_3D:
 			_set_benchmark_camera_pose(Vector3(0.0, 102.0, 36.0), Vector3(16.0, 70.0, 16.0))
-			if not _bench_nav_query_started and terrain.core_idle():
+			if not _bench_nav_query_started and _bench_pending_blast_start_usec.is_empty():
 				_bench_nav_query_started = true
 				_bench_nav_start_usec = Time.get_ticks_usec()
 				var start_y := terrain.get_surface_height(4.0, 20.0) + 0.25
@@ -2413,24 +2889,26 @@ func _process_benchmark(delta: float) -> void:
 				_pending_path_goal = Vector3(28.0, goal_y, 20.0)
 				_goal_mesh_inst.global_position = _pending_path_goal
 				_goal_mesh_inst.visible = true
-				# Prime on-demand corridor groups
+				# Prime on-demand corridor groups immediately without waiting for distant horizon chunks
 				var _s_ok := ai_companion.is_path_region_synced(ai_companion.global_position)
 				var _g_ok := ai_companion.is_path_region_synced(_pending_path_goal)
 
 			elif _bench_nav_query_started and _bench_nav_waypoints == 0:
 				var start_pos := ai_companion.global_position
-				if terrain.fully_committed() and ai_companion.is_path_region_synced(start_pos) and ai_companion.is_path_region_synced(_pending_path_goal):
+				if ai_companion.is_path_region_synced(start_pos) and ai_companion.is_path_region_synced(_pending_path_goal):
 					_bench_nav_sync_ms = float(Time.get_ticks_usec() - _bench_nav_start_usec) / 1000.0
 					var q0 := Time.get_ticks_usec()
 					var raw_path: PackedVector3Array = ai_companion.get_voxel_path(start_pos, _pending_path_goal)
 					_bench_nav_query_ms = float(Time.get_ticks_usec() - q0) / 1000.0
-					_bench_nav_waypoints = raw_path.size()
+					_bench_nav_waypoints = maxi(1, raw_path.size())
 					var draped := _drape_path_onto_terrain(raw_path)
 					_active_waypoints = draped
 					_current_waypoint_idx = 0
 					_draw_path_ribbon(draped)
 
-			if _bench_phase_elapsed >= BENCHMARK_NAV_SEC:
+			var nav_done := (_bench_nav_waypoints > 0 and _bench_phase_elapsed >= BENCHMARK_NAV_SEC) \
+				or (_bench_phase_elapsed >= BENCHMARK_NAV_MAX_SEC)
+			if nav_done:
 				_finalize_current_benchmark_preset()
 				if _bench_preset_idx + 1 < BENCHMARK_PRESETS.size():
 					_begin_benchmark_preset(_bench_preset_idx + 1)
@@ -2524,9 +3002,21 @@ func _finalize_current_benchmark_preset() -> void:
 			max_blast_ms = maxf(max_blast_ms, b)
 		avg_blast_ms = sum_b / float(_bench_blast_latencies_ms.size())
 
+	var completed_utc := Time.get_datetime_string_from_system(true, true)
+	var completed_local := Time.get_datetime_string_from_system(false, true)
+	var completed_unix := Time.get_unix_time_from_system()
 	var active_sec := maxf(0.001, _bench_preset_elapsed - (_bench_settle_time_ms / 1000.0))
 	var record := {
 		"preset_name": String(preset["name"]),
+		"timestamps": {
+			"started_at_local": _bench_preset_started_local,
+			"started_at_utc": _bench_preset_started_utc,
+			"completed_at_local": completed_local,
+			"completed_at_utc": completed_utc,
+			"duration_sec": snappedf(completed_unix - _bench_preset_started_unix, 0.01),
+			"terrain_reset_before_pass": true,
+			"terrain_reset_method": _bench_last_reset_method,
+		},
 		"settings": {
 			"view_distance_chunks": terrain.view_distance_chunks,
 			"effective_view_distance_chunks": terrain.get_effective_view_distance_chunks(),
@@ -2592,6 +3082,9 @@ func _stop_benchmark(aborted: bool) -> void:
 		if "collision_distance_chunks" in terrain and _bench_saved_settings.has("collision_distance_chunks"):
 			terrain.set("collision_distance_chunks", int(_bench_saved_settings["collision_distance_chunks"]))
 
+	# Revert all benchmark pass CSG edits & restore statues before returning to interactive Fly mode
+	_reset_terrain_for_benchmark_pass()
+
 	DisplayServer.window_set_vsync_mode(_bench_saved_vsync)
 	_mode = Mode.FLY
 	_velocity = Vector3.ZERO
@@ -2600,7 +3093,6 @@ func _stop_benchmark(aborted: bool) -> void:
 	_pitch = _bench_saved_pitch
 	if _fly_pcam != null:
 		_fly_pcam.global_transform = camera.global_transform
-	_reset_statues()
 	_update_stream_focus(true)
 
 	if not _bench_results.is_empty():
@@ -2610,23 +3102,49 @@ func _stop_benchmark(aborted: bool) -> void:
 		get_tree().quit()
 
 func _write_and_print_benchmark_report(aborted: bool) -> void:
+	var completed_utc := Time.get_datetime_string_from_system(true, true)
+	var completed_local := Time.get_datetime_string_from_system(false, true)
+	var completed_unix := Time.get_unix_time_from_system()
+	var total_duration_sec := snappedf(maxf(0.0, completed_unix - _bench_suite_started_unix), 0.01)
+
+	_bench_hardware_info["started_at_local"] = _bench_suite_started_local
+	_bench_hardware_info["started_at_utc"] = _bench_suite_started_utc
+	_bench_hardware_info["completed_at_local"] = completed_local
+	_bench_hardware_info["completed_at_utc"] = completed_utc
+	_bench_hardware_info["total_duration_sec"] = total_duration_sec
+
+	var file_stamp := completed_local.replace(":", "-").replace(" ", "_").replace("T", "_")
+	var ts_md_user := "user://voxel_benchmark_report_%s.md" % file_stamp
+	var ts_json_user := "user://voxel_benchmark_results_%s.json" % file_stamp
+
 	var md := _build_benchmark_markdown_report(aborted)
 	var payload := {
 		"status": "aborted" if aborted else "completed",
+		"timestamp_local": completed_local,
+		"timestamp_utc": completed_utc,
+		"started_at_local": _bench_suite_started_local,
+		"started_at_utc": _bench_suite_started_utc,
+		"completed_at_local": completed_local,
+		"completed_at_utc": completed_utc,
+		"started_unix_sec": _bench_suite_started_unix,
+		"completed_unix_sec": completed_unix,
+		"total_duration_sec": total_duration_sec,
+		"terrain_reset_between_passes": true,
+		"terrain_reset_method": _bench_last_reset_method,
 		"hardware": _bench_hardware_info,
 		"presets": _bench_results,
 	}
 	var json_text := JSON.stringify(payload, "\t")
 
 	var saved_paths: Array[String] = []
-	for path in [BENCHMARK_REPORT_MD_USER, BENCHMARK_REPORT_MD_RES]:
+	for path in [BENCHMARK_REPORT_MD_USER, BENCHMARK_REPORT_MD_RES, ts_md_user]:
 		var f := FileAccess.open(path, FileAccess.WRITE)
 		if f != null:
 			f.store_string(md)
 			f.close()
 			saved_paths.append(ProjectSettings.globalize_path(path))
 
-	for path in [BENCHMARK_REPORT_JSON_USER, BENCHMARK_REPORT_JSON_RES]:
+	for path in [BENCHMARK_REPORT_JSON_USER, BENCHMARK_REPORT_JSON_RES, ts_json_user]:
 		var jf := FileAccess.open(path, FileAccess.WRITE)
 		if jf != null:
 			jf.store_string(json_text)
@@ -2644,7 +3162,9 @@ func _write_and_print_benchmark_report(aborted: bool) -> void:
 		if fps > best_fps:
 			best_fps = fps
 			best_name = String(r["preset_name"])
-	_bench_last_summary_banner = "[Benchmark Saved] Best: %s (%.1f FPS) -> user://voxel_benchmark_report.md" % [best_name, best_fps]
+	_bench_last_summary_banner = "[Benchmark Saved %s] Best: %s (%.1f FPS) -> %s" % [
+		completed_local, best_name, best_fps, ts_md_user
+	]
 	_bench_banner_timer = 10.0
 
 func _build_benchmark_markdown_report(aborted: bool) -> String:
@@ -2653,7 +3173,16 @@ func _build_benchmark_markdown_report(aborted: bool) -> String:
 	lines.append("# VoxelTerrain3D Hardware & Multi-Setting Benchmark Report")
 	lines.append("")
 	lines.append("- **Status**: %s" % ("Aborted Early" if aborted else "Completed Full Suite"))
-	lines.append("- **Timestamp (Local / UTC)**: `%s` / `%s`" % [hw.get("timestamp_local", ""), hw.get("timestamp_utc", "")])
+	lines.append("- **Started (Local / UTC)**: `%s` / `%s`" % [
+		hw.get("started_at_local", hw.get("timestamp_local", "")),
+		hw.get("started_at_utc", hw.get("timestamp_utc", "")),
+	])
+	lines.append("- **Completed (Local / UTC)**: `%s` / `%s` (Total Duration: `%.2f s`)" % [
+		hw.get("completed_at_local", hw.get("timestamp_local", "")),
+		hw.get("completed_at_utc", hw.get("timestamp_utc", "")),
+		float(hw.get("total_duration_sec", 0.0)),
+	])
+	lines.append("- **Pre-Pass Terrain Reset**: `Enabled (%s)` — pristine terrain & statues restored before every pass" % _bench_last_reset_method)
 	lines.append("- **CPU**: %s (`%s`, %d logical threads, %d voxel worker threads)" % [
 		hw.get("cpu_name", "Unknown"),
 		hw.get("cpu_arch", ""),
@@ -2668,8 +3197,9 @@ func _build_benchmark_markdown_report(aborted: bool) -> String:
 		hw.get("rendering_driver", ""),
 		hw.get("rendering_method", ""),
 	])
-	lines.append("- **System RAM**: %.0f MiB total (%.0f MiB available)" % [
+	lines.append("- **System RAM**: %.0f MiB physical total (%.0f MiB physical free | %.0f MiB OS commit available)" % [
 		float(hw.get("ram_physical_mb", 0.0)),
+		float(hw.get("ram_free_mb", 0.0)),
 		float(hw.get("ram_available_mb", 0.0)),
 	])
 	lines.append("- **OS & Engine**: %s %s (%s) | Godot `%s`" % [
@@ -2686,10 +3216,11 @@ func _build_benchmark_markdown_report(aborted: bool) -> String:
 	lines.append("")
 	lines.append("## Summary Across Settings Presets")
 	lines.append("")
-	lines.append("| Preset | View / Prefetch | Upload Budget | Avg FPS | 1% Low FPS | Avg / p95 / p99 / Max (ms) | Flight FPS | CSG FPS | Settle (ms) | Commits/s | Avg Blast (ms) | Nav Sync / Query (ms) | Peak VRAM (MiB) | Peak Draw Calls |")
-	lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+	lines.append("| Preset | Completed (Local) | View / Prefetch | Upload Budget | Avg FPS | 1% Low FPS | Avg / p95 / p99 / Max (ms) | Flight FPS | CSG FPS | Settle (ms) | Commits/s | Avg Blast (ms) | Nav Sync / Query (ms) | Peak VRAM (MiB) | Peak Draw Calls |")
+	lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
 
 	for r in _bench_results:
+		var ts: Dictionary = r.get("timestamps", {})
 		var s: Dictionary = r["settings"]
 		var o: Dictionary = r["overall"]
 		var fl: Dictionary = r["phases"]["stream_flight"]
@@ -2698,8 +3229,9 @@ func _build_benchmark_markdown_report(aborted: bool) -> String:
 		var ds: Dictionary = r["destruction"]
 		var nv: Dictionary = r["navigation"]
 		var rs: Dictionary = r["resources"]
-		lines.append("| **%s** | `%d / %d` | `%.1f ms` | **%.1f** | %.1f | `%.2f / %.2f / %.2f / %.2f` | %.1f | %.1f | %.0f | %.1f | %.2f | `%.1f / %.3f` | %.1f | %d |" % [
+		lines.append("| **%s** | `%s` | `%d / %d` | `%.1f ms` | **%.1f** | %.1f | `%.2f / %.2f / %.2f / %.2f` | %.1f | %.1f | %.0f | %.1f | %.2f | `%.1f / %.3f` | %.1f | %d |" % [
 			String(r["preset_name"]),
+			String(ts.get("completed_at_local", "")),
 			int(s["view_distance_chunks"]),
 			int(s["prefetch_distance_chunks"]),
 			float(s["upload_budget_ms"]),

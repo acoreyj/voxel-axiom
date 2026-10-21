@@ -101,6 +101,12 @@ public:
     ///   built for it. Used to gate distant chunks under `collision_distance_chunks`.
     void commit_chunk_mesh_and_collision(const ChunkMeshPayload& mesh, bool build_collision = true) {
         assert(initialized_);
+        if (auto existing_it = slots_.find(mesh.key);
+            existing_it != slots_.end() &&
+            existing_it->second.mesh_rid.is_valid() &&
+            mesh.captured_terrain_revision < existing_it->second.committed_terrain_revision) {
+            return;
+        }
         if (commit_hook_) {
             commit_hook_(mesh);
         }

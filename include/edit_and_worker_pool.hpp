@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <mutex>
@@ -68,6 +69,84 @@ struct SphereCsgTerm {
     ElementalKind elemental_kind = ElementalKind::None;
 };
 
+/// Bit-exact per-chunk state captured for Undo / Redo. Captures and restores all
+/// four voxel planes plus the storage form and base material of one chunk.
+struct ChunkStateSnapshot {
+    ChunkStorageForm form = ChunkStorageForm::Empty;
+    uint8_t base_material_id = 0;
+    bool has_material_plane = false;
+    bool has_damage_plane = false;
+    bool has_color_plane = false;
+    std::vector<int16_t> tsdf_data;
+    std::vector<uint8_t> material_data;
+    std::vector<uint8_t> damage_data;
+    std::vector<uint16_t> color_data;
+
+    [[nodiscard]] static ChunkStateSnapshot capture_unlocked(const ChunkSlot& slot) {
+        ChunkStateSnapshot snap{};
+        snap.form = slot.form;
+        snap.base_material_id = slot.base_material_id;
+        snap.has_material_plane = slot.has_material_array();
+        snap.has_damage_plane = slot.has_damage_array();
+        snap.has_color_plane = slot.has_color_array();
+        if (slot.form == ChunkStorageForm::Dense && slot.tsdf_data) {
+            snap.tsdf_data.assign(slot.tsdf_data, slot.tsdf_data + TsdfFormat::kChunkSamples);
+        }
+        if (slot.has_material_array()) {
+            snap.material_data.assign(slot.material_data, slot.material_data + TsdfFormat::kChunkSamples);
+        }
+        if (slot.has_damage_array()) {
+            snap.damage_data.assign(slot.damage_data, slot.damage_data + TsdfFormat::kChunkSamples);
+        }
+        if (slot.has_color_array()) {
+            snap.color_data.assign(slot.color_data, slot.color_data + TsdfFormat::kChunkSamples);
+        }
+        return snap;
+    }
+
+    static void restore_unlocked(ChunkSlot& slot, const ChunkStateSnapshot& snap, ChunkStore& store) {
+        if (snap.form == ChunkStorageForm::Empty) {
+            slot.reset_to_uniform(ChunkStorageForm::Empty, snap.base_material_id,
+                                  store.tsdf_pool(), store.material_pool());
+        } else if (snap.form == ChunkStorageForm::Solid) {
+            slot.reset_to_uniform(ChunkStorageForm::Solid, snap.base_material_id,
+                                  store.tsdf_pool(), store.material_pool());
+        } else if (snap.form == ChunkStorageForm::Dense) {
+            slot.reset_to_uniform(ChunkStorageForm::Solid, snap.base_material_id,
+                                  store.tsdf_pool(), store.material_pool());
+            (void)slot.promote_to_dense(store.tsdf_pool());
+            if (!snap.tsdf_data.empty()) {
+                std::memcpy(slot.tsdf_data, snap.tsdf_data.data(), TsdfFormat::kTsdfSlabBytes);
+            }
+        }
+
+        if (snap.has_material_plane && !snap.material_data.empty()) {
+            for (uint32_t s = 0; s < TsdfFormat::kChunkSamples; ++s) {
+                (void)slot.set_material_linear(s, snap.material_data[s], store.material_pool());
+            }
+        }
+        if (snap.has_damage_plane && !snap.damage_data.empty()) {
+            for (uint32_t s = 0; s < TsdfFormat::kChunkSamples; ++s) {
+                if (snap.damage_data[s] != 0U) {
+                    (void)slot.set_damage_linear(s, snap.damage_data[s], store.material_pool());
+                }
+            }
+        }
+        if (snap.has_color_plane && !snap.color_data.empty()) {
+            for (uint32_t s = 0; s < TsdfFormat::kChunkSamples; ++s) {
+                if (snap.color_data[s] != VoxelColor::kUnpainted) {
+                    (void)slot.set_color_linear(s, snap.color_data[s], store.tsdf_pool());
+                }
+            }
+        }
+
+        slot.try_demote_if_uniform(store.tsdf_pool(), store.material_pool());
+        slot.version.fetch_add(1, std::memory_order_release);
+        slot.state = ChunkLifecycleState::Resident;
+        slot.dirty_persist = true;
+    }
+};
+
 struct EditTransaction {
     static constexpr std::size_t kMaxCoalescedSpheres = 16;
     static constexpr std::size_t kMaxPhaseChunks = ChunkStore::kMaxEditPhaseCoreChunks; // 32
@@ -83,6 +162,8 @@ struct EditTransaction {
 
     std::unordered_map<ChunkKey, SelectiveDirtyMask, ChunkKeyHash> modified_chunk_masks;
     std::unordered_set<NavigationGroupKey, NavigationGroupKeyHash> affected_nav_groups;
+    std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash> pre_edit_snapshots;
+    std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash> post_edit_snapshots;
     std::size_t max_locks_acquired_in_any_phase = 0;
 
     [[nodiscard]] static EditTransaction create_from_spheres(
@@ -193,10 +274,13 @@ struct EditTransactionCompletedPayload {
     /// True when the completed transaction was an add-terrain / fill (so the Godot
     /// wrapper can emit terrain_add_completed instead of explosion_completed).
     bool is_fill = false;
+    ElementalKind elemental_kind = ElementalKind::None;
     uint64_t terrain_revision = 0;
     std::size_t total_affected_chunks = 0;
     std::vector<ChunkKey> dirtied_chunks;
     std::vector<NavigationGroupKey> affected_nav_groups;
+    std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash> pre_edit_snapshots;
+    std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash> post_edit_snapshots;
 };
 
 struct CompletionRecord {
@@ -423,6 +507,11 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
         for (ChunkSlot* slot : phase_lock.slots()) {
             if (slot->form == ChunkStorageForm::Empty && !has_any_fill && !has_any_elemental) {
                 continue;
+            }
+
+            std::optional<ChunkStateSnapshot> maybe_pre_snap;
+            if (tx.pre_edit_snapshots.find(slot->key) == tx.pre_edit_snapshots.end()) {
+                maybe_pre_snap = ChunkStateSnapshot::capture_unlocked(*slot);
             }
 
             const IVec3 chunk_min = slot->key.min_world_sample();
@@ -866,6 +955,9 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
             }
 
             if (chunk_modified) {
+                if (maybe_pre_snap.has_value()) {
+                    tx.pre_edit_snapshots.emplace(slot->key, std::move(*maybe_pre_snap));
+                }
                 slot->try_demote_if_uniform(store.tsdf_pool(), store.material_pool());
                 slot->dirty_persist = true;
                 slot->version.fetch_add(1, std::memory_order_release);
@@ -886,47 +978,46 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
             continue;
         }
         std::unique_lock<std::shared_mutex> lock(slot->mutex);
-        if (slot->form != ChunkStorageForm::Dense) {
-            continue;
-        }
+        if (slot->form == ChunkStorageForm::Dense) {
+            std::vector<LocalCoord> crumbs_to_prune;
+            for (int32_t lz = 0; lz < 32; ++lz) {
+                for (int32_t ly = 0; ly < 32; ++ly) {
+                    for (int32_t lx = 0; lx < 32; ++lx) {
+                        const LocalCoord lc{lx, ly, lz};
+                        const int16_t q = slot->get_tsdf(lc);
+                        if (q > TsdfFormat::kClampedSolid && q < 0) {
+                            auto sample_at = [&](int32_t nx, int32_t ny, int32_t nz) -> int16_t {
+                                if (nx >= 0 && nx < 32 && ny >= 0 && ny < 32 && nz >= 0 && nz < 32) {
+                                    return slot->get_tsdf(LocalCoord{nx, ny, nz});
+                                }
+                                return -1;
+                            };
 
-        std::vector<LocalCoord> crumbs_to_prune;
-        for (int32_t lz = 0; lz < 32; ++lz) {
-            for (int32_t ly = 0; ly < 32; ++ly) {
-                for (int32_t lx = 0; lx < 32; ++lx) {
-                    const LocalCoord lc{lx, ly, lz};
-                    const int16_t q = slot->get_tsdf(lc);
-                    if (q > TsdfFormat::kClampedSolid && q < 0) {
-                        auto sample_at = [&](int32_t nx, int32_t ny, int32_t nz) -> int16_t {
-                            if (nx >= 0 && nx < 32 && ny >= 0 && ny < 32 && nz >= 0 && nz < 32) {
-                                return slot->get_tsdf(LocalCoord{nx, ny, nz});
+                            if (sample_at(lx - 1, ly, lz) >= 0 &&
+                                sample_at(lx + 1, ly, lz) >= 0 &&
+                                sample_at(lx, ly - 1, lz) >= 0 &&
+                                sample_at(lx, ly + 1, lz) >= 0 &&
+                                sample_at(lx, ly, lz - 1) >= 0 &&
+                                sample_at(lx, ly, lz + 1) >= 0) {
+                                crumbs_to_prune.push_back(lc);
                             }
-                            return -1;
-                        };
-
-                        if (sample_at(lx - 1, ly, lz) >= 0 &&
-                            sample_at(lx + 1, ly, lz) >= 0 &&
-                            sample_at(lx, ly - 1, lz) >= 0 &&
-                            sample_at(lx, ly + 1, lz) >= 0 &&
-                            sample_at(lx, ly, lz - 1) >= 0 &&
-                            sample_at(lx, ly, lz + 1) >= 0) {
-                            crumbs_to_prune.push_back(lc);
                         }
                     }
                 }
             }
-        }
 
-        if (!crumbs_to_prune.empty()) {
-            for (const LocalCoord& lc : crumbs_to_prune) {
-                (void)slot->set_tsdf(lc, TsdfFormat::kClampedAir, store.tsdf_pool());
-                (void)slot->clear_damage(lc);
-                (void)slot->clear_color(lc);
-                dirty_mask.record_mutated_sample(lc);
+            if (!crumbs_to_prune.empty()) {
+                for (const LocalCoord& lc : crumbs_to_prune) {
+                    (void)slot->set_tsdf(lc, TsdfFormat::kClampedAir, store.tsdf_pool());
+                    (void)slot->clear_damage(lc);
+                    (void)slot->clear_color(lc);
+                    dirty_mask.record_mutated_sample(lc);
+                }
+                slot->try_demote_if_uniform(store.tsdf_pool(), store.material_pool());
+                slot->version.fetch_add(1, std::memory_order_release);
             }
-            slot->try_demote_if_uniform(store.tsdf_pool(), store.material_pool());
-            slot->version.fetch_add(1, std::memory_order_release);
         }
+        tx.post_edit_snapshots[ck] = ChunkStateSnapshot::capture_unlocked(*slot);
     }
 
     uint64_t new_revision = store.terrain_revision();
@@ -977,6 +1068,7 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
     if (!tx.spheres.empty()) {
         payload.position = tx.spheres.front().center;
         payload.radius = tx.spheres.front().radius;
+        payload.elemental_kind = tx.spheres.front().elemental_kind;
     }
     payload.is_fill = has_any_fill;
     payload.terrain_revision = new_revision;
@@ -984,6 +1076,8 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
     payload.dirtied_chunks = std::move(deduplicated_dirty);
     payload.affected_nav_groups.assign(tx.affected_nav_groups.begin(), tx.affected_nav_groups.end());
     std::sort(payload.affected_nav_groups.begin(), payload.affected_nav_groups.end());
+    payload.pre_edit_snapshots = std::move(tx.pre_edit_snapshots);
+    payload.post_edit_snapshots = std::move(tx.post_edit_snapshots);
     return payload;
 }
 
@@ -1115,6 +1209,41 @@ public:
 
     [[nodiscard]] std::size_t completion_queue_depth() const noexcept {
         return completion_depth_.load(std::memory_order_acquire);
+    }
+
+    /// Blocks until every queued edit transaction has finished executing.
+    void wait_until_edits_idle() {
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+        cv_.wait(lock, [this]() {
+            return shutting_down_.load(std::memory_order_acquire) ||
+                   (edit_queue_.empty() && !edit_queue_in_progress_);
+        });
+    }
+
+    /// Drains every pending EditTransactionCompleted completion through `on_edit_done`
+    /// without consuming mesh/unload completions, so Undo/Redo can be sure all
+    /// pre-edit snapshots have been recorded before restoring a chunk.
+    template <typename EditHandlerFn>
+    void drain_edit_completions(EditHandlerFn&& on_edit_done) {
+        std::deque<EditTransactionCompletedPayload> ready_edits;
+        {
+            std::lock_guard<std::mutex> lock(completion_mutex_);
+            for (auto it = completion_queue_.begin(); it != completion_queue_.end();) {
+                if (it->kind == CompletionKind::EditTransactionCompleted) {
+                    ready_edits.push_back(std::move(it->edit_transaction));
+                    it = completion_queue_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            completion_depth_.store(completion_queue_.size(), std::memory_order_release);
+        }
+        if (!ready_edits.empty()) {
+            cv_.notify_all();
+        }
+        for (auto& tx : ready_edits) {
+            on_edit_done(tx);
+        }
     }
 
     [[nodiscard]] bool core_idle() const noexcept {

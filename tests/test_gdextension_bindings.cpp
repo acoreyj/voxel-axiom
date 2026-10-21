@@ -589,6 +589,136 @@ void test_gdextension_moai_stamp_baked_colors_and_remove_structure() {
                 painted_vertices_committed);
 }
 
+// ============================================================================
+// 4. End-to-End Undo/Redo Stack, 3-Hit Hard Rock & Lava Quench Undo, and
+//    Coalesced undo_all() Benchmark Pass Terrain Reset via VoxelTerrain3D
+// ============================================================================
+void test_gdextension_undo_redo_and_benchmark_pass_reset() {
+    ++g_tests_run;
+
+    const std::filesystem::path save_dir = "/tmp/voxel_gdextension_undo_redo_test";
+    std::filesystem::remove_all(save_dir);
+
+    VoxelTerrain3D terrain;
+    terrain.set_save_directory_path(save_dir.string());
+    terrain.set_view_distance_chunks(2);
+    terrain.set_prefetch_distance_chunks(0);
+    terrain.set_world_height_chunks(4);
+    terrain.set_upload_budget_ms(8.0f);
+    terrain._enter_tree();
+
+    terrain.set_stream_focus(Vector3(16.0f, 70.0f, 16.0f), Vector3(0.0f, 0.0f, 0.0f));
+    wait_until_terrain_fully_committed(terrain);
+
+    // Build the same pristine showcase features terrain_demo.gd stamps at startup:
+    // a 3-hit Hard Rock boulder and a Molten Lava dome. Seat them on the local
+    // surface so the ray probes and shatter test exercise above-ground geometry.
+    const float boulder_surf_y = terrain.get_surface_height(16.0f, 24.0f);
+    const float lava_surf_y = terrain.get_surface_height(30.0f, 24.0f);
+    terrain.add_terrain_with_material(Vector3(16.0f, boulder_surf_y, 24.0f), 4.0f,
+                                      voxel::MaterialHardness::kMaterialHardRock);
+    terrain.add_terrain_with_material(Vector3(30.0f, lava_surf_y, 24.0f), 4.0f,
+                                      voxel::MaterialHardness::kMaterialLava);
+    wait_until_terrain_fully_committed(terrain);
+    terrain.clear_undo_history();
+    REQUIRE(!terrain.can_undo());
+    REQUIRE(!terrain.can_redo());
+    REQUIRE(terrain.get_undo_count() == 0);
+    REQUIRE(terrain.get_redo_count() == 0);
+
+    // 1. Sample pristine surface height at (8, 14) and verify the baseline features.
+    const float pristine_surf_y = terrain.get_surface_height(8.0f, 14.0f);
+    const Vector3 boulder_probe_from(16.0f, boulder_surf_y + 15.0f, 24.0f);
+    const Vector3 boulder_probe_to(16.0f, 40.0f, 24.0f);
+    const Vector3 pristine_boulder_hit = terrain.raycast_terrain(boulder_probe_from, boulder_probe_to);
+    REQUIRE(std::isfinite(pristine_boulder_hit.y));
+    REQUIRE(terrain.raycast_terrain_material(boulder_probe_from, boulder_probe_to) ==
+            static_cast<int>(voxel::MaterialHardness::kMaterialHardRock));
+
+    const Vector3 lava_probe_from(30.0f, lava_surf_y + 15.0f, 24.0f);
+    const Vector3 lava_probe_to(30.0f, 40.0f, 24.0f);
+    REQUIRE(terrain.raycast_terrain_material(lava_probe_from, lava_probe_to) ==
+            static_cast<int>(voxel::MaterialHardness::kMaterialLava));
+
+    // 2. Carve a crater at (8, pristine_surf_y, 14) and verify Undo / Redo.
+    terrain.trigger_explosion(Vector3(8.0f, pristine_surf_y, 14.0f), 8.5f);
+    wait_until_terrain_fully_committed(terrain);
+    REQUIRE(terrain.can_undo());
+    REQUIRE(terrain.get_undo_count() == 1);
+    const float carved_surf_y = terrain.get_surface_height(8.0f, 14.0f);
+    REQUIRE(carved_surf_y < pristine_surf_y - 2.0f);
+
+    // Undo the crater -> surface height must return to pristine_surf_y!
+    REQUIRE(terrain.undo());
+    wait_until_terrain_fully_committed(terrain);
+    REQUIRE(!terrain.can_undo());
+    REQUIRE(terrain.can_redo());
+    REQUIRE(terrain.get_undo_count() == 0);
+    REQUIRE(terrain.get_redo_count() == 1);
+    REQUIRE(std::abs(terrain.get_surface_height(8.0f, 14.0f) - pristine_surf_y) < 0.05f);
+
+    // Redo the crater -> surface height must drop back to carved_surf_y!
+    REQUIRE(terrain.redo());
+    wait_until_terrain_fully_committed(terrain);
+    REQUIRE(terrain.can_undo());
+    REQUIRE(!terrain.can_redo());
+    REQUIRE(std::abs(terrain.get_surface_height(8.0f, 14.0f) - carved_surf_y) < 0.05f);
+
+    // 3. Simulate the rest of the benchmark pass CSG & Elemental sequence:
+    //    - 3 hits on the Hard Rock boulder at (16, 70, 24) to shatter it
+    //    - Water quench on the Lava dome at (30, 69, 24) -> turns Lava into Obsidian
+    for (int hit = 0; hit < 3; ++hit) {
+        terrain.trigger_explosion(Vector3(16.0f, boulder_surf_y, 24.0f), 8.5f);
+        wait_until_terrain_fully_committed(terrain);
+    }
+    const Vector3 shattered_boulder_hit = terrain.raycast_terrain(boulder_probe_from, boulder_probe_to);
+    REQUIRE(shattered_boulder_hit.y < pristine_boulder_hit.y - 3.0f);
+
+    terrain.trigger_elemental_sphere(
+        Vector3(30.0f, lava_surf_y, 24.0f), 8.5f, static_cast<int>(voxel::ElementalKind::Water));
+    wait_until_terrain_fully_committed(terrain);
+    REQUIRE(terrain.raycast_terrain_material(lava_probe_from, lava_probe_to) ==
+            static_cast<int>(voxel::MaterialHardness::kMaterialObsidian));
+
+    REQUIRE(terrain.get_undo_count() == 5);
+
+    // 4. Call undo_all() to reset the entire terrain before the next benchmark pass!
+    const int undone_steps = terrain.undo_all();
+    REQUIRE(undone_steps == 5);
+    wait_until_terrain_fully_committed(terrain);
+    REQUIRE(terrain.get_undo_count() == 0);
+    REQUIRE(terrain.get_redo_count() == 5);
+
+    // Verify all terrain features are 100% restored to their pre-pass state:
+    REQUIRE(std::abs(terrain.get_surface_height(8.0f, 14.0f) - pristine_surf_y) < 0.05f);
+    const Vector3 restored_boulder_hit = terrain.raycast_terrain(boulder_probe_from, boulder_probe_to);
+    REQUIRE(std::abs(restored_boulder_hit.y - pristine_boulder_hit.y) < 0.05f);
+    REQUIRE(terrain.raycast_terrain_material(boulder_probe_from, boulder_probe_to) ==
+            static_cast<int>(voxel::MaterialHardness::kMaterialHardRock));
+    REQUIRE(terrain.raycast_terrain_material(lava_probe_from, lava_probe_to) ==
+            static_cast<int>(voxel::MaterialHardness::kMaterialLava));
+
+    // redo_all() re-applies all 5 steps in one coalesced batch, then undo_all() +
+    // clear_undo_history() resets cleanly back to the pristine baseline.
+    REQUIRE(terrain.redo_all() == 5);
+    wait_until_terrain_fully_committed(terrain);
+    REQUIRE(terrain.raycast_terrain_material(lava_probe_from, lava_probe_to) ==
+            static_cast<int>(voxel::MaterialHardness::kMaterialObsidian));
+
+    REQUIRE(terrain.undo_all() == 5);
+    terrain.clear_undo_history();
+    wait_until_terrain_fully_committed(terrain);
+    REQUIRE(!terrain.can_undo());
+    REQUIRE(!terrain.can_redo());
+    REQUIRE(terrain.raycast_terrain_material(lava_probe_from, lava_probe_to) ==
+            static_cast<int>(voxel::MaterialHardness::kMaterialLava));
+
+    terrain._exit_tree();
+    std::filesystem::remove_all(save_dir);
+
+    std::printf("[PASS] test_gdextension_undo_redo_and_benchmark_pass_reset (undo/redo/undo_all/redo_all + 3-hit boulder & Lava->Obsidian reset verified)\n");
+}
+
 } // namespace
 
 int main() {
@@ -603,6 +733,7 @@ int main() {
     test_gdextension_streaming_explosion_and_nav_lifecycle();
     test_gdextension_mid_path_terrain_removal_and_frost_bridge_addition();
     test_gdextension_moai_stamp_baked_colors_and_remove_structure();
+    test_gdextension_undo_redo_and_benchmark_pass_reset();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",
                 g_tests_run, g_assertions_checked);
     return EXIT_SUCCESS;

@@ -35,6 +35,8 @@ struct EmittedSignalRecord {
     int64_t chunk_key = 0;
     int64_t structure_id = 0;
     std::string structure_name{};
+    int undo_count = 0;
+    int redo_count = 0;
 };
 
 /// VoxelTerrain3D Node (HLD v4.0 Sections 4.2, 5.2).
@@ -95,6 +97,20 @@ public:
     [[nodiscard]] float get_surface_height(float p_x, float p_z) const;
     void save_world();
     void set_stream_focus(Vector3 p_position, Vector3 p_velocity);
+
+    // Undo / Redo API
+    bool undo();
+    bool redo();
+    int undo_all();
+    int redo_all();
+    void clear_undo_history();
+    [[nodiscard]] bool can_undo() const;
+    [[nodiscard]] bool can_redo() const;
+    [[nodiscard]] int get_undo_count() const;
+    [[nodiscard]] int get_redo_count() const;
+    void set_max_undo_steps(int p_steps);
+    [[nodiscard]] int get_max_undo_steps() const;
+
     [[nodiscard]] bool core_idle() const;
     [[nodiscard]] bool fully_committed() const;
     [[nodiscard]] int get_effective_view_distance_chunks() const;
@@ -262,6 +278,7 @@ private:
     bool generate_caves = true;
     float agent_max_slope = 70.0f;
     float agent_max_climb = 1.5f;
+    int max_undo_steps = 64;
 
 #if defined(VOXEL_WITH_GODOT_CPP)
     Ref<Material> terrain_material;
@@ -276,6 +293,8 @@ private:
     void _log(const std::string& p_message) const;
     /// Shared fill entry point for add_terrain / add_terrain_with_material / place_boulder.
     void _enqueue_fill(Vector3 p_position, float p_radius, uint8_t p_material);
+    void handle_completed_edit_transaction(voxel::EditTransactionCompletedPayload& tx);
+    void drain_pending_edits_for_undo_redo();
 
     /// True when `p_key` should own a physics collision body under the current
     /// `collision_distance_chunks` (3D Chebyshev distance from the focus chunk).
@@ -288,6 +307,7 @@ private:
     voxel::ServerSlotManager server_slot_manager;
     voxel::VoxelNavigationManager navigation_manager;
     voxel::AssetStampManager stamp_manager_;
+    voxel::VoxelUndoRedoManager undo_redo_manager_;
     std::vector<EmittedSignalRecord> emitted_signals_;
 
     bool instrumentation_enabled = true;

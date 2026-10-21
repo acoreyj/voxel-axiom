@@ -46,11 +46,24 @@ void VoxelTerrain3D::_bind_methods() {
                          &VoxelTerrain3D::stamp_asset);
     ClassDB::bind_method(D_METHOD("remove_structure", "structure_id"),
                          &VoxelTerrain3D::remove_structure);
+    ClassDB::bind_method(D_METHOD("undo"), &VoxelTerrain3D::undo);
+    ClassDB::bind_method(D_METHOD("redo"), &VoxelTerrain3D::redo);
+    ClassDB::bind_method(D_METHOD("undo_all"), &VoxelTerrain3D::undo_all);
+    ClassDB::bind_method(D_METHOD("redo_all"), &VoxelTerrain3D::redo_all);
+    ClassDB::bind_method(D_METHOD("clear_undo_history"), &VoxelTerrain3D::clear_undo_history);
+    ClassDB::bind_method(D_METHOD("can_undo"), &VoxelTerrain3D::can_undo);
+    ClassDB::bind_method(D_METHOD("can_redo"), &VoxelTerrain3D::can_redo);
+    ClassDB::bind_method(D_METHOD("get_undo_count"), &VoxelTerrain3D::get_undo_count);
+    ClassDB::bind_method(D_METHOD("get_redo_count"), &VoxelTerrain3D::get_redo_count);
+    ClassDB::bind_method(D_METHOD("set_max_undo_steps", "steps"), &VoxelTerrain3D::set_max_undo_steps);
+    ClassDB::bind_method(D_METHOD("get_max_undo_steps"), &VoxelTerrain3D::get_max_undo_steps);
     ClassDB::bind_method(D_METHOD("raycast_terrain", "from", "to"), &VoxelTerrain3D::raycast_terrain);
     ClassDB::bind_method(D_METHOD("raycast_terrain_material", "from", "to"),
                          &VoxelTerrain3D::raycast_terrain_material);
     ClassDB::bind_method(D_METHOD("get_surface_height", "x", "z"), &VoxelTerrain3D::get_surface_height);
     ClassDB::bind_method(D_METHOD("save_world"), &VoxelTerrain3D::save_world);
+    ClassDB::bind_method(D_METHOD("set_save_directory_path", "path"), &VoxelTerrain3D::set_save_directory_path);
+    ClassDB::bind_method(D_METHOD("get_save_directory_path"), &VoxelTerrain3D::get_save_directory_path);
     ClassDB::bind_method(D_METHOD("set_stream_focus", "position", "velocity"), &VoxelTerrain3D::set_stream_focus);
     ClassDB::bind_method(D_METHOD("core_idle"), &VoxelTerrain3D::core_idle);
     ClassDB::bind_method(D_METHOD("fully_committed"), &VoxelTerrain3D::fully_committed);
@@ -116,6 +129,10 @@ void VoxelTerrain3D::_bind_methods() {
                  "set_agent_max_climb", "get_agent_max_climb");
     ADD_PROPERTY(PropertyInfo(Variant::BOOL, "instrumentation_enabled"),
                  "set_instrumentation_enabled", "get_instrumentation_enabled");
+    ADD_PROPERTY(PropertyInfo(Variant::INT, "max_undo_steps", PROPERTY_HINT_RANGE, "1,512,1"),
+                 "set_max_undo_steps", "get_max_undo_steps");
+    ADD_PROPERTY(PropertyInfo(Variant::STRING, "save_directory_path", PROPERTY_HINT_GLOBAL_DIR),
+                 "set_save_directory_path", "get_save_directory_path");
 
     ADD_SIGNAL(MethodInfo("explosion_requested",
         PropertyInfo(Variant::VECTOR3, "position"),
@@ -146,6 +163,14 @@ void VoxelTerrain3D::_bind_methods() {
     ADD_SIGNAL(MethodInfo("structure_removed",
         PropertyInfo(Variant::INT, "structure_id"),
         PropertyInfo(Variant::STRING, "name")));
+    ADD_SIGNAL(MethodInfo("undo_completed",
+        PropertyInfo(Variant::INT, "restored_chunks"),
+        PropertyInfo(Variant::INT, "remaining_undo"),
+        PropertyInfo(Variant::INT, "available_redo")));
+    ADD_SIGNAL(MethodInfo("redo_completed",
+        PropertyInfo(Variant::INT, "restored_chunks"),
+        PropertyInfo(Variant::INT, "available_undo"),
+        PropertyInfo(Variant::INT, "remaining_redo")));
 #endif
 }
 
@@ -177,6 +202,15 @@ void VoxelTerrain3D::set_resident_memory_budget_mb(int p_mb) {
         core_engine->ledger.set_budget_bytes(
             static_cast<std::size_t>(p_mb) * voxel::MemoryLedger::kMiB);
     }
+}
+
+void VoxelTerrain3D::set_max_undo_steps(int p_steps) {
+    max_undo_steps = std::max(1, p_steps);
+    undo_redo_manager_.set_max_steps(static_cast<std::size_t>(max_undo_steps));
+}
+
+int VoxelTerrain3D::get_max_undo_steps() const {
+    return max_undo_steps;
 }
 
 void VoxelTerrain3D::set_voxel_scale(float p_scale) {
@@ -391,6 +425,60 @@ void VoxelTerrain3D::_exit_tree() {
     server_slot_manager.free_all_rids();
 }
 
+void VoxelTerrain3D::handle_completed_edit_transaction(voxel::EditTransactionCompletedPayload& tx) {
+    if (!core_engine) {
+        return;
+    }
+
+    auto stamps_before = stamp_manager_.capture_manager_snapshot();
+    navigation_manager.apply_edit_transaction(tx);
+    // Explosions / elemental reactions that carve stamped structures mark
+    // them damaged and arm their reconstitution timer; fills never do.
+    if (!tx.is_fill) {
+        for (const voxel::ChunkKey damaged_key : tx.dirtied_chunks) {
+            stamp_manager_.notify_chunk_damaged(damaged_key);
+        }
+    }
+    auto stamps_after = stamp_manager_.capture_manager_snapshot();
+
+    if (!tx.pre_edit_snapshots.empty() || !tx.post_edit_snapshots.empty()) {
+        voxel::UndoRedoEntry entry{};
+        entry.action_name = tx.is_fill ? "add_terrain" : "explosion";
+        entry.before_chunks = std::move(tx.pre_edit_snapshots);
+        entry.after_chunks = std::move(tx.post_edit_snapshots);
+        entry.stamps_before = std::move(stamps_before);
+        entry.stamps_after = std::move(stamps_after);
+        undo_redo_manager_.record_entry(std::move(entry));
+    }
+
+    // Payload spheres are in canonical grid-sample space; signals are world-space.
+    const Vector3 pos(tx.position.x * voxel_scale,
+                      tx.position.y * voxel_scale,
+                      tx.position.z * voxel_scale);
+    const float world_radius = tx.radius * voxel_scale;
+    const int affected = static_cast<int>(tx.total_affected_chunks);
+    const bool is_fill = tx.is_fill;
+#if defined(VOXEL_WITH_GODOT_CPP)
+    emit_signal(is_fill ? "terrain_add_completed" : "explosion_completed",
+                pos, world_radius, affected);
+#else
+    emitted_signals_.push_back(EmittedSignalRecord{
+        is_fill ? "terrain_add_completed" : "explosion_completed",
+        pos, world_radius, affected, {}, 0});
+#endif
+}
+
+void VoxelTerrain3D::drain_pending_edits_for_undo_redo() {
+    if (!core_engine) {
+        return;
+    }
+    core_engine->worker_pool->wait_until_edits_idle();
+    core_engine->worker_pool->drain_edit_completions(
+        [this](voxel::EditTransactionCompletedPayload& tx) {
+            handle_completed_edit_transaction(tx);
+        });
+}
+
 void VoxelTerrain3D::trigger_explosion(Vector3 p_position, float p_radius) {
     if (!core_engine || p_radius <= 0.0f) {
         const std::string reason = "engine not ready or radius is non-positive";
@@ -483,6 +571,7 @@ int64_t VoxelTerrain3D::stamp_asset(const String& p_vreg_path, Vector3 p_chunk_c
     if (!core_engine) {
         return 0;
     }
+    drain_pending_edits_for_undo_redo();
 #if defined(VOXEL_WITH_GODOT_CPP)
     const std::string vreg_path(p_vreg_path.utf8().get_data());
 #else
@@ -492,6 +581,10 @@ int64_t VoxelTerrain3D::stamp_asset(const String& p_vreg_path, Vector3 p_chunk_c
         static_cast<int32_t>(std::llround(p_chunk_coords.x)),
         static_cast<int32_t>(std::llround(p_chunk_coords.y)),
         static_cast<int32_t>(std::llround(p_chunk_coords.z)));
+
+    auto stamps_before = stamp_manager_.capture_manager_snapshot();
+    std::unordered_map<voxel::ChunkKey, voxel::ChunkStateSnapshot, voxel::ChunkKeyHash> before_chunks;
+    std::unordered_map<voxel::ChunkKey, voxel::ChunkStateSnapshot, voxel::ChunkKeyHash> after_chunks;
 
     const uint32_t structure_id = stamp_manager_.stamp_region_file(
         core_engine->store,
@@ -506,9 +599,20 @@ int64_t VoxelTerrain3D::stamp_asset(const String& p_vreg_path, Vector3 p_chunk_c
             voxel::WorkerDensityGrid34 grid34(core_engine->ledger);
             (void)core_engine->save_manager->load_or_generate_chunk(
                 s, ck, core_engine->procgen, grid34);
-        });
+        },
+        &before_chunks,
+        &after_chunks);
 
     if (structure_id != 0) {
+        if (!before_chunks.empty() || !after_chunks.empty()) {
+            voxel::UndoRedoEntry entry{};
+            entry.action_name = "stamp_asset";
+            entry.before_chunks = std::move(before_chunks);
+            entry.after_chunks = std::move(after_chunks);
+            entry.stamps_before = std::move(stamps_before);
+            entry.stamps_after = stamp_manager_.capture_manager_snapshot();
+            undo_redo_manager_.record_entry(std::move(entry));
+        }
         char buf[160];
         std::snprintf(buf, sizeof(buf), "stamped asset '%s' at chunk (%d, %d, %d) structure_id=%u delay=%.1fs",
                       vreg_path.c_str(), origin.x(), origin.y(), origin.z(),
@@ -522,18 +626,171 @@ bool VoxelTerrain3D::remove_structure(int64_t p_structure_id) {
     if (!core_engine || p_structure_id <= 0) {
         return false;
     }
+    drain_pending_edits_for_undo_redo();
+
+    auto stamps_before = stamp_manager_.capture_manager_snapshot();
+    std::unordered_map<voxel::ChunkKey, voxel::ChunkStateSnapshot, voxel::ChunkKeyHash> before_chunks;
+    std::unordered_map<voxel::ChunkKey, voxel::ChunkStateSnapshot, voxel::ChunkKeyHash> after_chunks;
+
     const bool removed = stamp_manager_.remove_structure(
         static_cast<uint32_t>(p_structure_id),
         core_engine->store,
         core_engine->dirty_scheduler,
-        navigation_manager);
+        navigation_manager,
+        &before_chunks,
+        &after_chunks);
     if (removed) {
+        if (!before_chunks.empty() || !after_chunks.empty()) {
+            voxel::UndoRedoEntry entry{};
+            entry.action_name = "remove_structure";
+            entry.before_chunks = std::move(before_chunks);
+            entry.after_chunks = std::move(after_chunks);
+            entry.stamps_before = std::move(stamps_before);
+            entry.stamps_after = stamp_manager_.capture_manager_snapshot();
+            undo_redo_manager_.record_entry(std::move(entry));
+        }
         char buf[96];
         std::snprintf(buf, sizeof(buf), "removed structure_id=%lld",
                       static_cast<long long>(p_structure_id));
         _log(buf);
     }
     return removed;
+}
+
+bool VoxelTerrain3D::undo() {
+    if (!core_engine) {
+        return false;
+    }
+    drain_pending_edits_for_undo_redo();
+
+    std::size_t affected_chunks = 0;
+    const bool ok = undo_redo_manager_.undo(
+        core_engine->store,
+        core_engine->dirty_scheduler,
+        navigation_manager,
+        stamp_manager_,
+        core_engine->save_manager.get(),
+        &affected_chunks);
+
+    if (ok) {
+        const int u_cnt = get_undo_count();
+        const int r_cnt = get_redo_count();
+#if defined(VOXEL_WITH_GODOT_CPP)
+        emit_signal("undo_completed", static_cast<int>(affected_chunks), u_cnt, r_cnt);
+#else
+        emitted_signals_.push_back(EmittedSignalRecord{
+            "undo_completed", {}, 0.0f, static_cast<int>(affected_chunks), {}, 0, 0, {}, u_cnt, r_cnt});
+#endif
+    }
+    return ok;
+}
+
+bool VoxelTerrain3D::redo() {
+    if (!core_engine) {
+        return false;
+    }
+    drain_pending_edits_for_undo_redo();
+
+    std::size_t affected_chunks = 0;
+    const bool ok = undo_redo_manager_.redo(
+        core_engine->store,
+        core_engine->dirty_scheduler,
+        navigation_manager,
+        stamp_manager_,
+        core_engine->save_manager.get(),
+        &affected_chunks);
+
+    if (ok) {
+        const int u_cnt = get_undo_count();
+        const int r_cnt = get_redo_count();
+#if defined(VOXEL_WITH_GODOT_CPP)
+        emit_signal("redo_completed", static_cast<int>(affected_chunks), u_cnt, r_cnt);
+#else
+        emitted_signals_.push_back(EmittedSignalRecord{
+            "redo_completed", {}, 0.0f, static_cast<int>(affected_chunks), {}, 0, 0, {}, u_cnt, r_cnt});
+#endif
+    }
+    return ok;
+}
+
+int VoxelTerrain3D::undo_all() {
+    if (!core_engine) {
+        return 0;
+    }
+    drain_pending_edits_for_undo_redo();
+
+    std::size_t affected_chunks = 0;
+    const std::size_t steps = undo_redo_manager_.undo_all(
+        core_engine->store,
+        core_engine->dirty_scheduler,
+        navigation_manager,
+        stamp_manager_,
+        core_engine->save_manager.get(),
+        &affected_chunks);
+
+    if (steps > 0) {
+        const int u_cnt = get_undo_count();
+        const int r_cnt = get_redo_count();
+#if defined(VOXEL_WITH_GODOT_CPP)
+        emit_signal("undo_completed", static_cast<int>(affected_chunks), u_cnt, r_cnt);
+#else
+        emitted_signals_.push_back(EmittedSignalRecord{
+            "undo_completed", {}, 0.0f, static_cast<int>(affected_chunks), {}, 0, 0, {}, u_cnt, r_cnt});
+#endif
+    }
+    return static_cast<int>(steps);
+}
+
+int VoxelTerrain3D::redo_all() {
+    if (!core_engine) {
+        return 0;
+    }
+    drain_pending_edits_for_undo_redo();
+
+    std::size_t affected_chunks = 0;
+    const std::size_t steps = undo_redo_manager_.redo_all(
+        core_engine->store,
+        core_engine->dirty_scheduler,
+        navigation_manager,
+        stamp_manager_,
+        core_engine->save_manager.get(),
+        &affected_chunks);
+
+    if (steps > 0) {
+        const int u_cnt = get_undo_count();
+        const int r_cnt = get_redo_count();
+#if defined(VOXEL_WITH_GODOT_CPP)
+        emit_signal("redo_completed", static_cast<int>(affected_chunks), u_cnt, r_cnt);
+#else
+        emitted_signals_.push_back(EmittedSignalRecord{
+            "redo_completed", {}, 0.0f, static_cast<int>(affected_chunks), {}, 0, 0, {}, u_cnt, r_cnt});
+#endif
+    }
+    return static_cast<int>(steps);
+}
+
+void VoxelTerrain3D::clear_undo_history() {
+    if (!core_engine) {
+        return;
+    }
+    drain_pending_edits_for_undo_redo();
+    undo_redo_manager_.clear();
+}
+
+bool VoxelTerrain3D::can_undo() const {
+    return undo_redo_manager_.can_undo();
+}
+
+bool VoxelTerrain3D::can_redo() const {
+    return undo_redo_manager_.can_redo();
+}
+
+int VoxelTerrain3D::get_undo_count() const {
+    return static_cast<int>(undo_redo_manager_.undo_count());
+}
+
+int VoxelTerrain3D::get_redo_count() const {
+    return static_cast<int>(undo_redo_manager_.redo_count());
 }
 
 void VoxelTerrain3D::_enqueue_fill(Vector3 p_position, float p_radius, uint8_t p_material) {
@@ -716,30 +973,7 @@ void VoxelTerrain3D::_process(double delta) {
                 break;
 
             case voxel::CompletionKind::EditTransactionCompleted: {
-                // Explosions / elemental reactions that carve stamped structures mark
-                // them damaged and arm their reconstitution timer; fills never do.
-                if (!done->edit_transaction.is_fill) {
-                    for (const voxel::ChunkKey damaged_key : done->edit_transaction.dirtied_chunks) {
-                        stamp_manager_.notify_chunk_damaged(damaged_key);
-                    }
-                }
-                navigation_manager.apply_edit_transaction(done->edit_transaction);
-                // Payload spheres are in canonical grid-sample space; signals are world-space.
-                const Vector3 pos(done->edit_transaction.position.x * voxel_scale,
-                                  done->edit_transaction.position.y * voxel_scale,
-                                  done->edit_transaction.position.z * voxel_scale);
-                const float world_radius = done->edit_transaction.radius * voxel_scale;
-                const int affected =
-                    static_cast<int>(done->edit_transaction.total_affected_chunks);
-                const bool is_fill = done->edit_transaction.is_fill;
-#if defined(VOXEL_WITH_GODOT_CPP)
-                emit_signal(is_fill ? "terrain_add_completed" : "explosion_completed",
-                            pos, world_radius, affected);
-#else
-                emitted_signals_.push_back(EmittedSignalRecord{
-                    is_fill ? "terrain_add_completed" : "explosion_completed",
-                    pos, world_radius, affected, {}, 0});
-#endif
+                handle_completed_edit_transaction(done->edit_transaction);
                 break;
             }
         }

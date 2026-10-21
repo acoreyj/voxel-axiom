@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -33,15 +34,7 @@ struct StampedStructureInstance {
 
     std::vector<ChunkKey> stamped_chunk_keys;
 
-    struct ChunkBaseline {
-        ChunkStorageForm form = ChunkStorageForm::Empty;
-        uint8_t base_material_id = 0;
-        bool has_material_plane = false;
-        bool has_color_plane = false;
-        std::vector<int16_t> tsdf_data;
-        std::vector<uint8_t> material_data;
-        std::vector<uint16_t> color_data;
-    };
+    using ChunkBaseline = ChunkStateSnapshot;
 
     // Pre-stamp chunk state captured before stamping (restored by remove_structure)
     std::unordered_map<ChunkKey, ChunkBaseline, ChunkKeyHash> pre_stamp_baselines;
@@ -52,6 +45,13 @@ struct StampedStructureInstance {
 class AssetStampManager {
 public:
     using StructureEventFn = std::function<void(uint32_t structure_id, const std::string& name)>;
+
+    /// Snapshot of the whole structure registry used by Undo/Redo entries so a
+    /// restored chunk state is accompanied by the matching structure bookkeeping.
+    struct ManagerSnapshot {
+        uint32_t next_structure_id = 0;
+        std::unordered_map<uint32_t, StampedStructureInstance> structures;
+    };
 
     void set_structure_damaged_callback(StructureEventFn cb) {
         on_structure_damaged_ = std::move(cb);
@@ -65,6 +65,17 @@ public:
         on_structure_removed_ = std::move(cb);
     }
 
+    [[nodiscard]] ManagerSnapshot capture_manager_snapshot() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return ManagerSnapshot{next_structure_id_, structures_};
+    }
+
+    void restore_manager_snapshot(const ManagerSnapshot& snap) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        next_structure_id_ = snap.next_structure_id;
+        structures_ = snap.structures;
+    }
+
     /// Stamps an offline baked BakedRegionData into the live ChunkStore at the given origin chunk.
     [[nodiscard]] uint32_t stamp_region(
         ChunkStore& store,
@@ -75,7 +86,9 @@ public:
         float recreate_delay_seconds = 0.0f,
         StampBlendMode blend_mode = StampBlendMode::Union,
         std::string asset_name = "ruin",
-        const std::function<void(ChunkStore&, ChunkKey)>& ensure_chunk_ready_fn = {}) {
+        const std::function<void(ChunkStore&, ChunkKey)>& ensure_chunk_ready_fn = {},
+        std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash>* out_before_chunks = nullptr,
+        std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash>* out_after_chunks = nullptr) {
 
         std::lock_guard<std::mutex> lock(mutex_);
         const uint32_t struct_id = ++next_structure_id_;
@@ -89,7 +102,7 @@ public:
         inst.is_damaged = false;
         inst.time_since_damaged = 0.0f;
 
-        std::vector<ChunkKey> dirtied_chunks;
+        std::unordered_set<ChunkKey, ChunkKeyHash> unique_dirtied_chunks;
         std::unordered_set<NavigationGroupKey, NavigationGroupKeyHash> affected_nav_groups;
 
         // Decompress and stamp each non-empty chunk from the region data
@@ -233,21 +246,18 @@ public:
             inst.baselines[target_key] = capture_baseline_unlocked(*slot);
 
             inst.stamped_chunk_keys.push_back(target_key);
-            dirtied_chunks.push_back(target_key);
-            affected_nav_groups.insert(NavigationGroupKey::from_chunk_key(target_key));
+            add_chunk_and_resident_neighbors_to_dirty(
+                store, target_key, unique_dirtied_chunks, affected_nav_groups);
         }
 
-        if (!dirtied_chunks.empty()) {
-            const uint64_t new_rev = store.increment_terrain_revision();
-            dirty_scheduler.publish_edit_transaction_dirty_batch(dirtied_chunks);
-
-            EditTransactionCompletedPayload payload{};
-            payload.terrain_revision = new_rev;
-            payload.total_affected_chunks = dirtied_chunks.size();
-            payload.dirtied_chunks = dirtied_chunks;
-            payload.affected_nav_groups.assign(affected_nav_groups.begin(), affected_nav_groups.end());
-            nav_mgr.apply_edit_transaction(payload);
+        if (out_before_chunks) {
+            *out_before_chunks = inst.pre_stamp_baselines;
         }
+        if (out_after_chunks) {
+            *out_after_chunks = inst.baselines;
+        }
+
+        publish_dirty_and_nav_update(store, dirty_scheduler, nav_mgr, unique_dirtied_chunks, affected_nav_groups);
 
         structures_.emplace(struct_id, std::move(inst));
         return struct_id;
@@ -263,7 +273,9 @@ public:
         float recreate_delay_seconds = 0.0f,
         StampBlendMode blend_mode = StampBlendMode::Union,
         std::string asset_name = "",
-        const std::function<void(ChunkStore&, ChunkKey)>& ensure_chunk_ready_fn = {}) {
+        const std::function<void(ChunkStore&, ChunkKey)>& ensure_chunk_ready_fn = {},
+        std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash>* out_before_chunks = nullptr,
+        std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash>* out_after_chunks = nullptr) {
 
         FILE* fp = std::fopen(vreg_filepath.c_str(), "rb");
         if (!fp) {
@@ -300,7 +312,8 @@ public:
         }
 
         return stamp_region(store, dirty_scheduler, nav_mgr, region, origin_chunk,
-                            recreate_delay_seconds, blend_mode, std::move(asset_name), ensure_chunk_ready_fn);
+                            recreate_delay_seconds, blend_mode, std::move(asset_name),
+                            ensure_chunk_ready_fn, out_before_chunks, out_after_chunks);
     }
 
     /// Removes a previously stamped structure by `structure_id`, restoring every affected chunk
@@ -309,7 +322,9 @@ public:
         uint32_t structure_id,
         ChunkStore& store,
         DualDirtyScheduler& dirty_scheduler,
-        VoxelNavigationManager& nav_mgr) {
+        VoxelNavigationManager& nav_mgr,
+        std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash>* out_before_chunks = nullptr,
+        std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash>* out_after_chunks = nullptr) {
 
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = structures_.find(structure_id);
@@ -326,7 +341,13 @@ public:
         for (const auto& [ck, pre_base] : inst.pre_stamp_baselines) {
             ChunkSlot* slot = store.get_or_create_slot(ck);
             std::unique_lock<std::shared_mutex> slot_lock(slot->mutex);
+            if (out_before_chunks) {
+                (*out_before_chunks)[ck] = capture_baseline_unlocked(*slot);
+            }
             restore_baseline_unlocked(*slot, pre_base, store);
+            if (out_after_chunks) {
+                (*out_after_chunks)[ck] = pre_base;
+            }
             add_chunk_and_resident_neighbors_to_dirty(
                 store, ck, unique_dirtied_chunks, affected_nav_groups);
         }
@@ -379,29 +400,19 @@ public:
             inst.time_since_damaged += delta_seconds;
             if (inst.time_since_damaged >= inst.recreate_delay_seconds) {
                 // Timer expired -> Recreate structure!
-                std::vector<ChunkKey> dirtied_chunks;
+                std::unordered_set<ChunkKey, ChunkKeyHash> unique_dirtied_chunks;
                 std::unordered_set<NavigationGroupKey, NavigationGroupKeyHash> affected_nav_groups;
 
                 for (const auto& [ck, base] : inst.baselines) {
                     ChunkSlot* slot = store.get_or_create_slot(ck);
                     std::unique_lock<std::shared_mutex> slot_lock(slot->mutex);
                     restore_baseline_unlocked(*slot, base, store);
-
-                    dirtied_chunks.push_back(ck);
-                    affected_nav_groups.insert(NavigationGroupKey::from_chunk_key(ck));
+                    add_chunk_and_resident_neighbors_to_dirty(
+                        store, ck, unique_dirtied_chunks, affected_nav_groups);
                 }
 
-                if (!dirtied_chunks.empty()) {
-                    const uint64_t new_rev = store.increment_terrain_revision();
-                    dirty_scheduler.publish_edit_transaction_dirty_batch(dirtied_chunks);
-
-                    EditTransactionCompletedPayload payload{};
-                    payload.terrain_revision = new_rev;
-                    payload.total_affected_chunks = dirtied_chunks.size();
-                    payload.dirtied_chunks = dirtied_chunks;
-                    payload.affected_nav_groups.assign(affected_nav_groups.begin(), affected_nav_groups.end());
-                    nav_mgr.apply_edit_transaction(payload);
-                }
+                publish_dirty_and_nav_update(
+                    store, dirty_scheduler, nav_mgr, unique_dirtied_chunks, affected_nav_groups);
 
                 inst.is_damaged = false;
                 inst.time_since_damaged = 0.0f;
@@ -430,66 +441,17 @@ public:
 private:
     [[nodiscard]] static StampedStructureInstance::ChunkBaseline capture_baseline_unlocked(
         const ChunkSlot& slot) {
-        StampedStructureInstance::ChunkBaseline base{};
-        base.form = slot.form;
-        base.base_material_id = slot.base_material_id;
-        base.has_material_plane = slot.has_material_array();
-        base.has_color_plane = slot.has_color_array();
-        if (slot.form == ChunkStorageForm::Dense && slot.tsdf_data) {
-            base.tsdf_data.assign(slot.tsdf_data, slot.tsdf_data + TsdfFormat::kChunkSamples);
-        }
-        if (slot.has_material_array()) {
-            base.material_data.assign(slot.material_data, slot.material_data + TsdfFormat::kChunkSamples);
-        }
-        if (slot.has_color_array()) {
-            base.color_data.assign(slot.color_data, slot.color_data + TsdfFormat::kChunkSamples);
-        }
-        return base;
+        return ChunkStateSnapshot::capture_unlocked(slot);
     }
 
     static void restore_baseline_unlocked(
         ChunkSlot& slot,
         const StampedStructureInstance::ChunkBaseline& base,
         ChunkStore& store) {
-        if (base.form == ChunkStorageForm::Empty) {
-            slot.reset_to_uniform(ChunkStorageForm::Empty, base.base_material_id,
-                                  store.tsdf_pool(), store.material_pool());
-        } else if (base.form == ChunkStorageForm::Solid) {
-            slot.reset_to_uniform(ChunkStorageForm::Solid, base.base_material_id,
-                                  store.tsdf_pool(), store.material_pool());
-        } else if (base.form == ChunkStorageForm::Dense) {
-            slot.reset_to_uniform(ChunkStorageForm::Solid, base.base_material_id,
-                                  store.tsdf_pool(), store.material_pool());
-            (void)slot.promote_to_dense(store.tsdf_pool());
-            if (!base.tsdf_data.empty()) {
-                std::memcpy(slot.tsdf_data, base.tsdf_data.data(), TsdfFormat::kTsdfSlabBytes);
-            }
-            if (base.has_material_plane && !base.material_data.empty()) {
-                for (uint32_t s = 0; s < TsdfFormat::kChunkSamples; ++s) {
-                    (void)slot.set_material_linear(s, base.material_data[s], store.material_pool());
-                }
-            }
-            if (base.has_color_plane && !base.color_data.empty()) {
-                for (uint32_t s = 0; s < TsdfFormat::kChunkSamples; ++s) {
-                    if (base.color_data[s] != VoxelColor::kUnpainted) {
-                        (void)slot.set_color_linear(s, base.color_data[s], store.tsdf_pool());
-                    }
-                }
-            }
-        }
-
-        if (slot.has_damage_array()) {
-            for (uint32_t s = 0; s < TsdfFormat::kChunkSamples; ++s) {
-                (void)slot.clear_damage(LocalCoord::from_linear_index(s));
-            }
-        }
-
-        slot.try_demote_if_uniform(store.tsdf_pool(), store.material_pool());
-        slot.version.fetch_add(1, std::memory_order_release);
-        slot.state = ChunkLifecycleState::Resident;
-        slot.dirty_persist = true;
+        ChunkStateSnapshot::restore_unlocked(slot, base, store);
     }
 
+public:
     static void add_chunk_and_resident_neighbors_to_dirty(
         const ChunkStore& store,
         ChunkKey ck,
@@ -537,12 +499,285 @@ private:
         nav_mgr.apply_edit_transaction(payload);
     }
 
+private:
     mutable std::mutex mutex_;
     uint32_t next_structure_id_ = 0;
     std::unordered_map<uint32_t, StampedStructureInstance> structures_;
     StructureEventFn on_structure_damaged_;
     StructureEventFn on_structure_recreated_;
     StructureEventFn on_structure_removed_;
+};
+
+// ============================================================================
+// Full Chunk-Snapshot & Structure-State Undo/Redo Manager
+// ============================================================================
+struct UndoRedoEntry {
+    std::string action_name;
+    std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash> before_chunks;
+    std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash> after_chunks;
+    AssetStampManager::ManagerSnapshot stamps_before;
+    AssetStampManager::ManagerSnapshot stamps_after;
+};
+
+class VoxelUndoRedoManager {
+public:
+    explicit VoxelUndoRedoManager(std::size_t max_steps = 64) noexcept
+        : max_steps_(std::max<std::size_t>(1, max_steps)) {}
+
+    void set_max_steps(std::size_t max_steps) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        max_steps_ = std::max<std::size_t>(1, max_steps);
+        while (undo_stack_.size() > max_steps_) {
+            undo_stack_.pop_front();
+        }
+    }
+
+    [[nodiscard]] std::size_t max_steps() const noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return max_steps_;
+    }
+
+    void record_entry(UndoRedoEntry entry) {
+        if (entry.before_chunks.empty() && entry.after_chunks.empty()) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        redo_stack_.clear();
+        undo_stack_.push_back(std::move(entry));
+        while (undo_stack_.size() > max_steps_) {
+            undo_stack_.pop_front();
+        }
+    }
+
+    void clear() noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        undo_stack_.clear();
+        redo_stack_.clear();
+    }
+
+    [[nodiscard]] bool can_undo() const noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return !undo_stack_.empty();
+    }
+
+    [[nodiscard]] bool can_redo() const noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return !redo_stack_.empty();
+    }
+
+    [[nodiscard]] std::size_t undo_count() const noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return undo_stack_.size();
+    }
+
+    [[nodiscard]] std::size_t redo_count() const noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return redo_stack_.size();
+    }
+
+    bool undo(
+        ChunkStore& store,
+        DualDirtyScheduler& dirty_scheduler,
+        VoxelNavigationManager& nav_mgr,
+        AssetStampManager& stamp_mgr,
+        RegionSaveManager* save_mgr = nullptr,
+        std::size_t* out_affected_chunks = nullptr) {
+
+        UndoRedoEntry entry{};
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (undo_stack_.empty()) {
+                if (out_affected_chunks) *out_affected_chunks = 0;
+                return false;
+            }
+            entry = std::move(undo_stack_.back());
+            undo_stack_.pop_back();
+        }
+
+        const std::size_t affected = apply_chunk_map_and_stamps(
+            store, dirty_scheduler, nav_mgr, stamp_mgr, save_mgr,
+            entry.before_chunks, entry.stamps_before);
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            redo_stack_.push_back(std::move(entry));
+        }
+        if (out_affected_chunks) {
+            *out_affected_chunks = affected;
+        }
+        return true;
+    }
+
+    bool redo(
+        ChunkStore& store,
+        DualDirtyScheduler& dirty_scheduler,
+        VoxelNavigationManager& nav_mgr,
+        AssetStampManager& stamp_mgr,
+        RegionSaveManager* save_mgr = nullptr,
+        std::size_t* out_affected_chunks = nullptr) {
+
+        UndoRedoEntry entry{};
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (redo_stack_.empty()) {
+                if (out_affected_chunks) *out_affected_chunks = 0;
+                return false;
+            }
+            entry = std::move(redo_stack_.back());
+            redo_stack_.pop_back();
+        }
+
+        const std::size_t affected = apply_chunk_map_and_stamps(
+            store, dirty_scheduler, nav_mgr, stamp_mgr, save_mgr,
+            entry.after_chunks, entry.stamps_after);
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            undo_stack_.push_back(std::move(entry));
+            while (undo_stack_.size() > max_steps_) {
+                undo_stack_.pop_front();
+            }
+        }
+        if (out_affected_chunks) {
+            *out_affected_chunks = affected;
+        }
+        return true;
+    }
+
+    /// Undoes all recorded operations in a single coalesced pass, restoring the earliest
+    /// pre-edit state of every modified chunk without intermediate remeshing.
+    std::size_t undo_all(
+        ChunkStore& store,
+        DualDirtyScheduler& dirty_scheduler,
+        VoxelNavigationManager& nav_mgr,
+        AssetStampManager& stamp_mgr,
+        RegionSaveManager* save_mgr = nullptr,
+        std::size_t* out_affected_chunks = nullptr) {
+
+        std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash> coalesced_before;
+        AssetStampManager::ManagerSnapshot earliest_stamps{};
+        std::size_t steps_undone = 0;
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (undo_stack_.empty()) {
+                if (out_affected_chunks) *out_affected_chunks = 0;
+                return 0;
+            }
+            steps_undone = undo_stack_.size();
+            earliest_stamps = undo_stack_.front().stamps_before;
+
+            // Walk from newest to oldest so the oldest entry overwrites with the earliest pre-edit state
+            for (auto it = undo_stack_.rbegin(); it != undo_stack_.rend(); ++it) {
+                for (const auto& [ck, snap] : it->before_chunks) {
+                    coalesced_before[ck] = snap;
+                }
+            }
+            while (!undo_stack_.empty()) {
+                redo_stack_.push_back(std::move(undo_stack_.back()));
+                undo_stack_.pop_back();
+            }
+        }
+
+        const std::size_t affected = apply_chunk_map_and_stamps(
+            store, dirty_scheduler, nav_mgr, stamp_mgr, save_mgr,
+            coalesced_before, earliest_stamps);
+
+        if (out_affected_chunks) {
+            *out_affected_chunks = affected;
+        }
+        return steps_undone;
+    }
+
+    /// Redoes all operations currently on the redo stack in a single coalesced pass.
+    std::size_t redo_all(
+        ChunkStore& store,
+        DualDirtyScheduler& dirty_scheduler,
+        VoxelNavigationManager& nav_mgr,
+        AssetStampManager& stamp_mgr,
+        RegionSaveManager* save_mgr = nullptr,
+        std::size_t* out_affected_chunks = nullptr) {
+
+        std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash> coalesced_after;
+        AssetStampManager::ManagerSnapshot latest_stamps{};
+        std::size_t steps_redone = 0;
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (redo_stack_.empty()) {
+                if (out_affected_chunks) *out_affected_chunks = 0;
+                return 0;
+            }
+            steps_redone = redo_stack_.size();
+            latest_stamps = redo_stack_.front().stamps_after;
+
+            // Walk redo_stack_ from back (oldest undone) to front (most recently undone = latest state)
+            for (auto it = redo_stack_.rbegin(); it != redo_stack_.rend(); ++it) {
+                for (const auto& [ck, snap] : it->after_chunks) {
+                    coalesced_after[ck] = snap;
+                }
+            }
+            while (!redo_stack_.empty()) {
+                undo_stack_.push_back(std::move(redo_stack_.back()));
+                redo_stack_.pop_back();
+            }
+        }
+
+        const std::size_t affected = apply_chunk_map_and_stamps(
+            store, dirty_scheduler, nav_mgr, stamp_mgr, save_mgr,
+            coalesced_after, latest_stamps);
+
+        if (out_affected_chunks) {
+            *out_affected_chunks = affected;
+        }
+        return steps_redone;
+    }
+
+private:
+    static std::size_t apply_chunk_map_and_stamps(
+        ChunkStore& store,
+        DualDirtyScheduler& dirty_scheduler,
+        VoxelNavigationManager& nav_mgr,
+        AssetStampManager& stamp_mgr,
+        RegionSaveManager* save_mgr,
+        const std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash>& chunk_map,
+        const AssetStampManager::ManagerSnapshot& stamps_snap) {
+
+        std::unordered_set<ChunkKey, ChunkKeyHash> unique_dirtied_chunks;
+        std::unordered_set<NavigationGroupKey, NavigationGroupKeyHash> affected_nav_groups;
+
+        std::vector<ChunkKey> sorted_keys;
+        sorted_keys.reserve(chunk_map.size());
+        for (const auto& [ck, _] : chunk_map) {
+            sorted_keys.push_back(ck);
+        }
+        std::sort(sorted_keys.begin(), sorted_keys.end());
+
+        for (const ChunkKey ck : sorted_keys) {
+            const auto it = chunk_map.find(ck);
+            if (it == chunk_map.end()) continue;
+            ChunkSlot* slot = store.get_or_create_slot(ck);
+            {
+                std::unique_lock<std::shared_mutex> slot_lock(slot->mutex);
+                ChunkStateSnapshot::restore_unlocked(*slot, it->second, store);
+            }
+            if (save_mgr != nullptr) {
+                (void)save_mgr->persist_compress_chunk(store, ck);
+            }
+            AssetStampManager::add_chunk_and_resident_neighbors_to_dirty(
+                store, ck, unique_dirtied_chunks, affected_nav_groups);
+        }
+
+        stamp_mgr.restore_manager_snapshot(stamps_snap);
+        AssetStampManager::publish_dirty_and_nav_update(
+            store, dirty_scheduler, nav_mgr, unique_dirtied_chunks, affected_nav_groups);
+        return sorted_keys.size();
+    }
+
+    mutable std::mutex mutex_;
+    std::size_t max_steps_ = 64;
+    std::deque<UndoRedoEntry> undo_stack_;
+    std::deque<UndoRedoEntry> redo_stack_;
 };
 
 } // namespace voxel

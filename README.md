@@ -34,9 +34,11 @@ document. For a one-screen map of all documentation, jump to the
   - [AI companion and 3D cave navigation](#ai-companion-and-3d-cave-navigation)
   - [Persistence and region files](#persistence-and-region-files)
   - [Asset baking and stamping](#asset-baking-and-stamping)
+  - [Undo and redo](#undo-and-redo)
   - [Physics collision](#physics-collision)
   - [Triplanar shading](#triplanar-shading)
   - [Performance instrumentation](#performance-instrumentation)
+  - [Automated benchmark suite](#automated-benchmark-suite)
 - [Node and API reference](#node-and-api-reference)
 - [Demo scene and controls](#demo-scene-and-controls)
 - [Building from source](#building-from-source)
@@ -107,9 +109,12 @@ asset baker or tests, step 1 produces `voxel_baker` and the CTest suites.
 | **AI navigation** | 3D cave navigation groups, asynchronous Recast bakes, and path queries through `VoxelAICompanion` | [AI Companion & Navigation](docs/AI%20Companion%20%26%20Navigation.md) |
 | **Persistence** | Two-stage saving into 8x8x8 chunk region files with LZ4 compression and atomic writes | [Design v4, Section 3.6](docs/Voxel%20Design%20Doc%20v4.md), [`persistence_and_streaming.hpp`](include/persistence_and_streaming.hpp) |
 | **Asset stamping** | Bake OBJ meshes to `.vreg`, stamp them into live terrain, damage them, and restore them | [Asset stamping and reconstitution](docs/asset%20stamping%20and%20reconstitution.md) |
+| **Undo / redo** | Bit-exact per-chunk snapshot history for edits, stamps, and structure removals, plus a coalesced full-world reset | [Undo and redo](#undo-and-redo) |
 | **Physics collision** | Per-chunk concave `PhysicsServer3D` bodies with distance gating and optional subsampling | [Design v4, Section 4.4](docs/Voxel%20Design%20Doc%20v4.md#44-physics-collision) |
 | **Triplanar shading** | Material-aware PBR shader with grass, soil, rock, lava, water, obsidian, ice, and crack glow | [`voxel_triplanar.gdshader`](voxel_triplanar.gdshader) |
+| **First-person pickaxe** | Procedurally built arm and pickaxe viewmodel with windup, strike, follow-through, solid-hit recoil, bob, mouse sway, and impact sparks | [`terrain_demo.gd`](terrain_demo.gd) |
 | **Instrumentation** | Lock-free per-stage timings for generate, mesh, commit, edit, streaming, and navigation | [Performance analysis](docs/Voxel%20Performance%20Analysis.md), [`stage_timings.hpp`](include/stage_timings.hpp) |
+| **Benchmark suite** | Five streaming/collision presets measure frame percentiles, streaming, CSG latency, navigation, VRAM, RAM, and draw calls; writes Markdown and JSON reports | [Automated benchmark suite](#automated-benchmark-suite) |
 
 ---
 
@@ -194,10 +199,9 @@ sets the vertical ceiling. `generate_caves = false` removes the 3D cave term ent
 | `world_seed` | `1337` | Procedural seed. Changes affect chunks generated afterwards. |
 | `generate_caves` | `true` | When false, generate cave-free terrain. Read per chunk at generation time. |
 
-Two demo scenes demonstrate the toggle:
-
-- `voxel_terrain_demo.tscn` - caves enabled.
-- `voxel_terrain_no_caves_demo.tscn` - `generate_caves = false`.
+Caves are enabled in the main demo scene. Set `generate_caves = false` in the Inspector or
+at runtime for cave-free terrain; the former standalone `voxel_terrain_no_caves_demo.tscn`
+was removed so the demo has one source scene.
 
 ```gdscript
 $VoxelTerrain3D.generate_caves = false
@@ -393,6 +397,10 @@ file using a narrow-band TSDF. The result can carry per-voxel color sampled from
 albedo (RGB5551, outer skin only). At runtime, `stamp_asset()` unions the region into the
 live world, where it is carved with normal voxel physics.
 
+Demo model textures (Ape, grenade, pickaxe, and TNT) import with S3TC/BPTC VRAM
+compression (`compress/mode=2`) so prop and statue surfaces stay compressed on the GPU.
+Baked `.vreg` albedo is separate and remains RGB5551 in the voxel data.
+
 ```bash
 voxel_baker model.obj model.vreg \
   --voxel-scale 0.5 \
@@ -423,7 +431,8 @@ immediately.
 | `structure_removed` | `structure_id`, `name` |
 
 The demo shows three statue pairs (Easter Island, Atlas, Ape), each with a mesh-swap
-option and a baked-voxel-color option. Press `R` to reset all six statues.
+option and a baked-voxel-color option. Press `R` to reset all six statues, or
+`Shift + R` to undo every prior terrain edit and return the whole world to its baseline.
 
 **Read more**
 
@@ -432,6 +441,68 @@ option and a baked-voxel-color option. Press `R` to reset all six statues.
 - [`include/asset_stamp_manager.hpp`](include/asset_stamp_manager.hpp)
 - [Model detail guide for 0.5 m voxels](voxel_05_model_prompt_and_detail_guide.md)
 - [`models/easter-island/README.md`](models/easter-island/README.md), [`models/atlas/README.md`](models/atlas/README.md), [`models/ape/README.md`](models/ape/README.md)
+
+### Undo and redo
+
+Every recorded action stores a bit-exact snapshot of each touched chunk before and after the
+edit: storage form, base material, 16-bit TSDF, 8-bit material, 8-bit persistent crack
+damage, and 16-bit RGB5551 color planes. Stamped structures also capture the
+`AssetStampManager` registry, so undo/redo restores both the voxels and the structure
+bookkeeping.
+
+The history covers every phased CSG and elemental edit path, `stamp_asset()`, and
+`remove_structure()`. Restoring a chunk marks it resident and dirty, increments its version,
+and republishes edit/navigation dirty batches. In-flight worker meshes whose captured terrain
+revision is older than a completed synchronous undo/redo are discarded, so a stale mesh can
+never overwrite a restored chunk.
+
+| Method | Returns | Behavior |
+| --- | --- | --- |
+| `undo()` | `bool` | Restore the most recent action. |
+| `redo()` | `bool` | Re-apply the most recently undone action. |
+| `undo_all()` | `int` | Coalesce the whole undo stack into one restore pass and one remesh batch; returns the number of actions reverted. |
+| `redo_all()` | `int` | Coalesce the whole redo stack into one re-apply pass; returns the number of actions re-applied. |
+| `clear_undo_history()` | `void` | Drain pending edits, then clear both stacks. |
+| `can_undo()` / `can_redo()` | `bool` | Stack availability. |
+| `get_undo_count()` / `get_redo_count()` | `int` | Current stack depths. |
+| `set_max_undo_steps(steps)` / `get_max_undo_steps()` | `void` / `int` | History depth, clamped to the `max_undo_steps` property. |
+
+| Property | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `max_undo_steps` | `int` | `64` | Range 1-512. Lowering it trims the oldest undo entries. |
+
+```gdscript
+var terrain := $VoxelTerrain3D
+
+terrain.trigger_explosion(Vector3(16, 70, 16), 8.5)
+if terrain.can_undo():
+    terrain.undo()
+
+# Reset every edit and stamp in one coalesced pass.
+var reverted := terrain.undo_all()
+print("Reverted ", reverted, " actions; redo depth = ", terrain.get_redo_count())
+
+# Lock the current world in as the new baseline.
+terrain.clear_undo_history()
+```
+
+Signals:
+
+| Signal | Payload |
+| --- | --- |
+| `undo_completed` | `restored_chunks`, `remaining_undo`, `available_redo` |
+| `redo_completed` | `restored_chunks`, `available_undo`, `remaining_redo` |
+
+The demo groups a continuous drag stroke, a pickaxe swing, and an Option 1 mesh-to-voxel swap
+with the explosion it triggers into one logical history action, so a single `Z` reverts the
+whole gesture.
+
+**Read more**
+
+- [`include/asset_stamp_manager.hpp`](include/asset_stamp_manager.hpp) - `VoxelUndoRedoManager` and structure snapshots
+- [`include/edit_and_worker_pool.hpp`](include/edit_and_worker_pool.hpp) - `ChunkStateSnapshot` and edit capture
+- [`src/voxel_terrain_3d.cpp`](src/voxel_terrain_3d.cpp) - binding, drain, and signal wiring
+- [`tests/test_gdextension_bindings.cpp`](tests/test_gdextension_bindings.cpp) - undo/redo/undo_all/redo_all regression suite
 
 ### Physics collision
 
@@ -512,6 +583,62 @@ $VoxelTerrain3D.instrumentation_enabled = false
 - [`include/stage_timings.hpp`](include/stage_timings.hpp)
 - [`tests/test_stage_timings.cpp`](tests/test_stage_timings.cpp)
 
+### Automated benchmark suite
+
+The demo includes a five-preset benchmark suite that exercises streaming, CSG destruction,
+and 3D navigation under different residency settings. Press `M` or `F8` to start it; press
+either key again to abort and still write a partial report. The suite disables VSync for
+the run, then restores the terrain settings, camera pose, VSync mode, and all six demo
+statues.
+
+Before every preset pass, the suite calls `undo_all()` and clears the history so each run
+starts from the same pristine world: the 3-hit Hard Rock boulder, Molten Lava dome, stamped
+statues, and zero prior craters or Frost ice bridges. This removes cross-preset
+contamination from the FPS, CSG latency, and navigation measurements.
+
+It can also start automatically from the command line:
+
+```powershell
+# Run the suite and leave the demo open when it finishes
+godot --path . -- --benchmark
+
+# Run the suite and quit after writing the reports (useful for CI)
+godot --path . -- --benchmark-quit
+```
+
+Each preset runs four phases:
+
+| Phase | Duration | What it measures |
+| --- | --- | --- |
+| Settle & warmup | Up to 3.5 s | Waits for streaming and commits to become fully idle. |
+| Stream flight | 4.5 s | S-curve sweep down the statue corridor while chunks stream. |
+| Destruction & CSG | 4.0 s | Eight deterministic explosion, hard-rock, water, frost, and large-blast edits. |
+| 3D nav pathing | 2.5 s | Waits for navigation groups to sync, then times a path query and waypoint count. |
+
+| Preset | View | Prefetch | Upload budget | Collision distance | Memory budget |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Low / Fast Stream | 6 | 1 | 1.5 ms | 2 | 512 MB |
+| Balanced Default | 8 | 2 | 2.5 ms | 4 | 1024 MB |
+| High Throughput Upload | 10 | 3 | 5.0 ms | 4 | 1536 MB |
+| Extended Horizon | 14 | 4 | 6.0 ms | 6 | 2048 MB |
+| Full Collision Stress | 12 | 2 | 8.0 ms | 10 | 2048 MB |
+
+The report records CPU/GPU/OS/RAM details, average and 1% low FPS, p50/p95/p99/max frame
+times, streaming commit rate, blast latency, navigation sync/query time, and peak VRAM,
+RAM, draw calls, and primitives. It also records start/completion timestamps in local and
+UTC time, Unix timestamps, total suite duration, and per-preset duration plus the terrain
+reset method. It writes both formats to the user data directory:
+
+- `user://voxel_benchmark_report.md`
+- `user://voxel_benchmark_results.json`
+- `user://voxel_benchmark_report_<YYYY-MM-DD_HH-MM-SS>.md`
+- `user://voxel_benchmark_results_<YYYY-MM-DD_HH-MM-SS>.json`
+
+In editor runs, copies are also written to `res://voxel_benchmark_report.md` and
+`res://voxel_benchmark_results.json`. Exported builds treat `res://` as read-only, so read
+the files from the Godot user data directory instead. The timestamped archives are only
+written under `user://`, so repeated benchmark runs never overwrite earlier results.
+
 ---
 
 ## Node and API reference
@@ -537,6 +664,7 @@ Exported properties:
 | `agent_max_slope` | `float` | `70.0` | Navigation slope limit in degrees. |
 | `agent_max_climb` | `float` | `1.5` | Navigation step height in meters. |
 | `instrumentation_enabled` | `bool` | `true` | Per-frame stage logging. |
+| `max_undo_steps` | `int` | `64` | Range 1-512. Maximum retained undo actions. |
 
 Runtime methods:
 
@@ -552,6 +680,12 @@ Runtime methods:
 | `raycast_terrain(from, to)` | `Vector3` | Surface hit, or `+INF` on miss. |
 | `raycast_terrain_material(from, to)` | `int` | Material ID, or -1 on miss. |
 | `get_surface_height(x, z)` | `float` | Top surface height at world X/Z. |
+| `undo()` / `redo()` | `bool` | Revert or re-apply one history action. |
+| `undo_all()` / `redo_all()` | `int` | Coalesced full-stack revert or re-apply. |
+| `clear_undo_history()` | `void` | Clear both history stacks. |
+| `can_undo()` / `can_redo()` | `bool` | Stack availability. |
+| `get_undo_count()` / `get_redo_count()` | `int` | Current stack depths. |
+| `set_max_undo_steps(steps)` / `get_max_undo_steps()` | `void` / `int` | History depth accessors. |
 | `save_world()` | `void` | Flush dirty regions. |
 | `set_stream_focus(position, velocity)` | `void` | Move the streaming focus. |
 | `core_idle()` | `bool` | True when the worker pool is idle. |
@@ -560,7 +694,8 @@ Runtime methods:
 
 Signals: `explosion_requested`, `explosion_completed`, `explosion_failed`,
 `terrain_add_requested`, `terrain_add_completed`, `terrain_add_failed`,
-`chunk_committed`, `structure_damaged`, `structure_recreated`, `structure_removed`.
+`chunk_committed`, `structure_damaged`, `structure_recreated`, `structure_removed`,
+`undo_completed`, `redo_completed`.
 
 ### `VoxelAICompanion`
 
@@ -578,14 +713,16 @@ document for lifecycle details and known limitations.
 
 ## Demo scene and controls
 
-Open `project.godot` in Godot 4.2+ and run `voxel_terrain_demo.tscn`. The second scene,
-`voxel_terrain_no_caves_demo.tscn`, runs the same world with `generate_caves = false`.
+Open `project.godot` in Godot 4.2+ and run `voxel_terrain_demo.tscn`. For cave-free terrain,
+toggle `generate_caves` off in the Inspector or at runtime; the separate no-caves scene was
+removed.
 
 ### Controls
 
 | Input | Action |
 | --- | --- |
 | `F` | Toggle Fly / Play mode |
+| `M` / `F8` | Start or abort the automated benchmark suite |
 | `W` / `A` / `S` / `D` | Move (fly) or run (play) |
 | `Space` / `E` | Fly up; jump in Play mode |
 | `Ctrl` / `Q` | Fly down |
@@ -604,18 +741,22 @@ Open `project.godot` in Godot 4.2+ and run `voxel_terrain_demo.tscn`. The second
 | `B` | Stamp configured asset with reconstitution timer |
 | `Shift + B` | Stamp configured asset permanently |
 | `R` | Reset all six demo statues |
+| `Z` / `Ctrl + Z` | Undo the last edit, stroke, stamp, or statue swap |
+| `Y` / `Ctrl + Y` / `Ctrl + Shift + Z` | Redo the last undone action |
+| `Shift + R` / `Ctrl + R` | Undo every terrain edit and restore all statues to the pristine baseline |
 | `T` | Toggle add/paint material (soil / hard rock) |
 | `P` | Place the companion at the crosshair |
 | `Right Click` | Query a 3D cave path to the crosshair |
 | `Shift + Right Click` | Place the companion and query a path |
 | `Left Click` (Fly) | Apply the active terrain tool |
-| `Left Click` (Play) | Swing the pickaxe and chip the terrain |
+| `Left Click` (Play) | Swing the pickaxe and chip the terrain; hold for repeated swings |
 | `H` | Show or hide the controls overlay |
 | `Escape` | Release mouse capture; click to recapture |
 
 ### Terrain tool tuning
 
-All tool radii are exported on the demo controller and editable live in the Inspector:
+Tool radii and pickaxe tuning are exported on the demo controller and editable live in the
+Inspector:
 
 | Export | Default | Used by |
 | --- | --- | --- |
@@ -630,6 +771,16 @@ All tool radii are exported on the demo controller and editable live in the Insp
 | `brush_spacing_factor` | `0.6` | Drag-brush step distance |
 | `brush_interval` | `0.05` | Minimum seconds between drag-brush steps |
 | `max_ray_distance` | `250.0` | Crosshair raycast length |
+| `pickaxe_hit_radius` | `1.5` | Play-mode pickaxe chip radius |
+| `pickaxe_impact_fraction` | `0.42` | Swing point where the chip lands |
+
+### First-person pickaxe viewmodel
+
+Play mode uses a procedurally built arm and pickaxe anchored to the camera; it has no
+external model or rig dependency. Shoulder, elbow, and wrist pivots drive a windup, strike,
+follow-through, and solid-hit recoil, with idle/walk bob, mouse sway, emissive metal
+accents, and impact sparks. Hold left mouse to keep swinging; each chip lands at
+`pickaxe_impact_fraction` of the 0.55 s swing.
 
 ### Companion behavior
 
@@ -806,7 +957,7 @@ The script runs all milestone suites under ASan and TSan and also builds the sta
 | `test_offline_asset_baker` | OBJ loading, `.vreg` baking, colors, reconstitution |
 | `test_persistence_and_streaming` | Region files, compression, streaming focus |
 | `test_integration_m3_m4` | Collision gating, navigation groups, bounded commits |
-| `test_gdextension_bindings` | Class registration, signals, stamping, lifecycle |
+| `test_gdextension_bindings` | Class registration, signals, stamping, lifecycle, undo/redo, coalesced benchmark reset |
 
 **Read more**
 
@@ -874,10 +1025,10 @@ voxel/
 |-- build/                        CMake build tree and .gdignore
 |-- docs/                         Design, navigation, stamping, depth, and performance docs
 |-- include/                      Pure C++20 voxel core (no Godot headers)
-|   |-- asset_stamp_manager.hpp   .vreg stamping, damage tracking, reconstitution
+|   |-- asset_stamp_manager.hpp   .vreg stamping, damage, reconstitution, undo/redo
 |   |-- chunk_key.hpp             Packed chunk coordinates and spatial hashing
 |   |-- chunk_store.hpp           TSDF chunk storage, compact chunks, memory ledger
-|   |-- edit_and_worker_pool.hpp  Worker pool, phased CSG edits, de-crumb
+|   |-- edit_and_worker_pool.hpp  Worker pool, phased CSG edits, chunk snapshots
 |   |-- godot_wrapper_and_nav3d.hpp Navigation groups and Godot wrapper contracts
 |   |-- persistence_and_streaming.hpp Region files, compression, streaming
 |   |-- procgen_and_surface_nets.hpp  Terrain noise and Surface Nets mesher
@@ -885,9 +1036,8 @@ voxel/
 |   |-- stage_timings.hpp         Lock-free performance instrumentation
 |   |-- terrain_raycast.hpp       Voxel-space raycasts
 |   `-- voxel_mesh_baker.hpp      Offline OBJ -> .vreg voxelizer
-|-- models/                       Demo statues and first-person props
+|-- models/                       Demo statues and prop models
 |   |-- ape/                      Ape GLB, OBJ, albedo, baked .vreg, README
-|   |-- arms/                     First-person rigged arms and textures
 |   |-- atlas/                    Atlas GLB, OBJ, albedo, baked .vreg, README
 |   |-- easter-island/            Easter Island GLB, OBJ, albedo, baked .vreg, README
 |   |-- grenade/                  Prop model
@@ -899,16 +1049,16 @@ voxel/
 |   |-- voxel_baker_main.cpp      voxel_baker CLI entry point
 |   `-- voxel_terrain_3d.cpp/.h   VoxelTerrain3D node
 |-- tests/                        CTest unit and integration suites
+|   `-- assets/                   Baked test fixtures, including `moai_statue.vreg`
 |-- addons/                       godot_ai and phantom_camera editor addons
 |-- CMakeLists.txt                Build configuration
 |-- project.godot                 Godot project definition
 |-- run_all_tests.sh              ASan/TSan test runner
 |-- run-prod.ps1                  Release library build and launch helper
 |-- running-prod.md               Production build guide
-|-- terrain_demo.gd               Demo controller
+|-- terrain_demo.gd               Demo controller, benchmark suite, and pickaxe viewmodel
 |-- voxel_engine.gdextension      GDExtension library mapping
 |-- voxel_terrain_demo.tscn       Main demo scene (caves enabled)
-|-- voxel_terrain_no_caves_demo.tscn Cave-free demo scene
 `-- voxel_triplanar.gdshader      Material-aware triplanar terrain shader
 ```
 
@@ -966,6 +1116,9 @@ These are kept for provenance. Use v4 for current behavior.
 | Stamped asset never returns | Reconstitution timer disabled | Pass a positive `recreate_delay_seconds`; `0.0` means permanently destroyed. |
 | Crater interiors show stretched texture | Baked color depth too deep | Lower `--color-depth`; see [asset stamping](docs/asset%20stamping%20and%20reconstitution.md#7-troubleshooting). |
 | Craters look blockier than expected | Voxel resolution too coarse | Lower `voxel_scale` and re-bake assets; see [voxel size guide](voxel_size_configuration_guide.md#choosing-a-scale). |
+| Benchmark reports are missing in an exported build | `res://` is read-only in exports | Read `user://voxel_benchmark_report.md` and `user://voxel_benchmark_results.json` from the Godot user data directory; see [automated benchmark suite](#automated-benchmark-suite). |
+| `undo()` / `redo()` missing or "Nothing to undo" | Loaded GDExtension predates the undo bindings, or history was cleared | Rebuild the extension and confirm `bin/libvoxel_engine.windows.release.x86_64.dll` is current; see [undo and redo](#undo-and-redo). |
+| Pickaxe viewmodel is invisible | It is only shown in Play mode | Press `F` to enter Play mode. |
 | CMake cannot find `godot::cpp` | `GODOT_CPP_DIR` not set | Pass `-DGODOT_CPP_DIR=/path/to/godot-cpp` or add the godot-cpp subdirectory. |
 
 ---
