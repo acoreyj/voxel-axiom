@@ -3,9 +3,10 @@
 importer="texture"
 type="CompressedTexture2D"
 uid="uid://lxrmns4fj6wt"
-path="res://.godot/imported/fp_arms_texture_0.png-7ded0d319b639ff42a1ca717733d9813.ctex"
+path.s3tc="res://.godot/imported/fp_arms_texture_0.png-7ded0d319b639ff42a1ca717733d9813.s3tc.ctex"
 metadata={
-"vram_texture": false
+"imported_formats": ["s3tc_bptc"],
+"vram_texture": true
 }
 generator_parameters={
 "md5": "68a1eb84c2c9d79f09bf5c1b9ddb588c"
@@ -14,11 +15,11 @@ generator_parameters={
 [deps]
 
 source_file="res://models/arms/fp_arms_texture_0.png"
-dest_files=["res://.godot/imported/fp_arms_texture_0.png-7ded0d319b639ff42a1ca717733d9813.ctex"]
+dest_files=["res://.godot/imported/fp_arms_texture_0.png-7ded0d319b639ff42a1ca717733d9813.s3tc.ctex"]
 
 [params]
 
-compress/mode=0
+compress/mode=2
 compress/high_quality=false
 compress/lossy_quality=0.7
 compress/uastc_level=0
@@ -40,4 +41,4 @@ process/normal_map_invert_y=false
 process/hdr_as_srgb=false
 process/hdr_clamp_exposure=false
 process/size_limit=0
-detect_3d/compress_to=1
+detect_3d/compress_to=0

@@ -99,7 +99,7 @@ extends Node3D
 
 ## First-person Play mode (F toggles Fly <-> Play). Play drops an eye-height body
 ## onto the voxel surface below the camera: WASD runs, Shift sprints, Space jumps,
-## and LMB swings the rigged pickaxe arms before chipping the terrain at the crosshair.
+## and LMB chips the terrain at the crosshair.
 @export var play_eye_height: float = 1.75
 @export var play_walk_speed: float = 5.0
 @export var play_run_speed: float = 9.0
@@ -107,18 +107,13 @@ extends Node3D
 @export var play_gravity: float = 24.0
 @export var play_step_height: float = 0.6
 @export var play_body_radius: float = 0.4
-## Slightly wider than the free-fly lens so the viewmodel arms clear the frame.
-@export var play_fov: float = 85.0
-## Viewmodel placement relative to the eye. The authored arms sit beside/behind
-## the head, so the rig is pulled forward and up to bring the hands on screen.
-@export var arms_view_offset: Vector3 = Vector3(0.0, -1.38, -0.62)
+@export var play_fov: float = 75.0
 ## Radius of the pickaxe chip carved on the swing's impact frame.
 @export var pickaxe_hit_radius: float = 1.5
-## Playback multiplier applied to the authored 80-frame PickaxeSwing_R action.
-@export var pickaxe_swing_speed: float = 3.0
-## Point in PickaxeSwing_R (0-1 of its length) where the tool bites the terrain.
+## Point in the swing (0-1 of its length) where the tool bites the terrain.
 @export var pickaxe_impact_fraction: float = 0.42
-const ARMS_SCENE_PATH := "res://models/arms/fp_arms.glb"
+## Swing length in seconds; the chip is applied at `pickaxe_impact_fraction`.
+const PICKAXE_SWING_TIME := 0.55
 
 ## Tool palette in keyboard order: construction (1-4), destruction (5-7),
 ## elemental reactions (8-0). `TOOL_KEYS` is the keycap shown in the HUD.
@@ -222,10 +217,6 @@ var _player_grounded: bool = false
 var _last_safe_feet: Vector3 = Vector3.ZERO
 var _spawn_pending: bool = false
 var _spawn_wait: float = 0.0
-var _arms_root: Node3D = null
-var _arms_player: AnimationPlayer = null
-var _arms_current_anim: String = ""
-var _arms_idle: bool = false
 var _swing_active: bool = false
 var _swing_hit_done: bool = false
 var _swing_elapsed: float = 0.0
@@ -314,7 +305,6 @@ func _ready() -> void:
 	_setup_side_by_side_atlas_statues()
 	_setup_side_by_side_ape_statues()
 	_setup_phantom_camera()
-	_setup_first_person_arms()
 	_update_stream_focus(true)
 
 func _setup_path_debug_visuals() -> void:
@@ -820,30 +810,6 @@ func _setup_phantom_camera() -> void:
 
 	_fly_pcam.priority = 1
 
-func _setup_first_person_arms() -> void:
-	var packed := load(ARMS_SCENE_PATH) as PackedScene
-	if packed == null:
-		push_warning("[FirstPerson] Missing arms scene: %s" % ARMS_SCENE_PATH)
-		return
-	_arms_root = packed.instantiate() as Node3D
-	if _arms_root == null:
-		push_warning("[FirstPerson] Arms scene has no Node3D root: %s" % ARMS_SCENE_PATH)
-		return
-	_arms_root.name = "FirstPersonArms"
-	camera.add_child(_arms_root)
-	_arms_root.position = arms_view_offset
-	_arms_root.rotation = Vector3(0.0, PI, 0.0)
-	_arms_root.visible = false
-	_arms_player = _arms_root.find_child("AnimationPlayer", true, false) as AnimationPlayer
-	if _arms_player == null:
-		push_warning("[FirstPerson] No AnimationPlayer in %s" % ARMS_SCENE_PATH)
-		return
-	for anim_name in ["Walk_R", "Run_R"]:
-		var anim := _arms_player.get_animation(anim_name)
-		if anim:
-			anim.loop_mode = Animation.LOOP_LINEAR
-	_arms_player.animation_finished.connect(_on_arms_animation_finished)
-
 func _toggle_mode() -> void:
 	if _mode == Mode.FLY:
 		_enter_play()
@@ -877,9 +843,6 @@ func _enter_play() -> void:
 	_play_pcam.rotation = camera.rotation
 	_play_pcam.priority = 1
 	_fly_pcam.priority = 0
-	if _arms_root:
-		_arms_root.visible = true
-	_play_arms_idle()
 	print("[FirstPerson] Play mode (F to fly)")
 
 func _exit_play() -> void:
@@ -888,73 +851,30 @@ func _exit_play() -> void:
 	_player_vel_y = 0.0
 	_player_grounded = false
 	_velocity = Vector3.ZERO
-	if _arms_player:
-		_arms_player.stop()
-	if _arms_root:
-		_arms_root.visible = false
 	camera.fov = _base_fov
 	_fly_pcam.global_transform = camera.global_transform
 	_fly_pcam.priority = 1
 	_play_pcam.priority = 0
 	print("[FirstPerson] Fly mode (F to play)")
 
-func _play_arms_idle() -> void:
-	if _arms_player == null:
-		return
-	_arms_current_anim = "Walk_R"
-	_arms_idle = true
-	_arms_player.play("Walk_R")
-	_arms_player.seek(0.0, true)
-	_arms_player.speed_scale = 0.0
-
-func _update_arms_locomotion(speed: float) -> void:
-	if _arms_player == null or _swing_active:
-		return
-	if speed < 0.05:
-		if not _arms_idle:
-			_play_arms_idle()
-		return
-	var want := "Run_R" if speed > play_walk_speed + 0.01 else "Walk_R"
-	if _arms_idle and _arms_current_anim == want:
-		_arms_idle = false
-		_arms_player.speed_scale = 1.0
-		return
-	if _arms_current_anim != want or not _arms_player.is_playing():
-		_arms_current_anim = want
-		_arms_player.play(want)
-	_arms_idle = false
-	_arms_player.speed_scale = 1.0
-
 func _start_pickaxe_swing() -> void:
-	if _arms_player == null or _swing_active:
+	if _swing_active:
 		return
 	_swing_active = true
 	_swing_hit_done = false
 	_swing_elapsed = 0.0
-	_arms_idle = false
-	_arms_current_anim = "PickaxeSwing_R"
-	var swing := _arms_player.get_animation("PickaxeSwing_R")
-	_swing_impact_time = swing.length * pickaxe_impact_fraction if swing else 0.4
-	_arms_player.speed_scale = pickaxe_swing_speed
-	_arms_player.play("PickaxeSwing_R")
+	_swing_impact_time = PICKAXE_SWING_TIME * pickaxe_impact_fraction
 
 func _update_pickaxe_swing(delta: float) -> void:
 	if not _swing_active:
 		return
-	_swing_elapsed += delta * pickaxe_swing_speed
+	_swing_elapsed += delta
 	if not _swing_hit_done and _swing_elapsed >= _swing_impact_time:
 		_swing_hit_done = true
 		_apply_pickaxe_hit()
-
-func _on_arms_animation_finished(anim_name: StringName) -> void:
-	if anim_name != "PickaxeSwing_R" or _arms_player == null:
-		return
-	_swing_active = false
-	_swing_hit_done = false
-	_arms_player.speed_scale = 1.0
-	_arms_current_anim = ""
-	if _mode == Mode.PLAY:
-		_update_arms_locomotion(_velocity.length())
+	if _swing_elapsed >= PICKAXE_SWING_TIME:
+		_swing_active = false
+		_swing_hit_done = false
 
 func _apply_pickaxe_hit() -> void:
 	var point := _pickaxe_aim_point()
@@ -1022,7 +942,6 @@ func _process_play(delta: float) -> void:
 			_play_pcam.global_position = _player_feet + Vector3(0.0, play_eye_height, 0.0)
 			_play_pcam.rotation = Vector3(_pitch, _yaw, 0.0)
 			_update_pickaxe_swing(delta)
-			_update_arms_locomotion(0.0)
 			if _spawn_wait > 4.0:
 				_spawn_pending = false
 			return
@@ -1082,7 +1001,6 @@ func _process_play(delta: float) -> void:
 	_play_pcam.global_position = _player_feet + Vector3(0.0, play_eye_height, 0.0)
 	_play_pcam.rotation = Vector3(_pitch, _yaw, 0.0)
 	_update_pickaxe_swing(delta)
-	_update_arms_locomotion(wish.length())
 
 func _move_player_horizontal(motion: Vector3) -> void:
 	if motion.length_squared() < 0.000001:

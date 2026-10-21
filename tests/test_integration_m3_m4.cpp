@@ -239,7 +239,8 @@ void test_sloped_cave_vertical_boundary_halo_gathering() {
     REQUIRE(std::abs(cfg.agent_radius - 0.35f) < 1e-5f);
     REQUIRE(std::abs(cfg.region_min_size - 8.0f) < 1e-5f);
     REQUIRE(cfg.vertical_padding() > 4.0f);   // P_y = 1.8 + 1.5 + 2.0 = 5.3 m
-    REQUIRE(std::abs(cfg.horizontal_padding() - 2.75f) < 1e-5f); // P_xz = 0.35 + 0.4 + 2.0 = 2.75 m
+    // P_xz = 0.35 + 0.4 + 2.0 = 2.75 m, quantized up to 6 * cell_size = 3.00 m.
+    REQUIRE(std::abs(cfg.horizontal_padding() - 3.00f) < 1e-5f);
 
     // Carve a sloped ramp connecting Cy = 1 (gy = 0, y in [32, 64]) and Cy = 2 (gy = 1, y in [64, 96]).
     // Because gy = 0 has owned_aabb y in [0, 64] and vertical padding P_y = 5.3 m (baking_aabb y up to 69.3),

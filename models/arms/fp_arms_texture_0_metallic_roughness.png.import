@@ -3,9 +3,10 @@
 importer="texture"
 type="CompressedTexture2D"
 uid="uid://bdhr8ug6nnv43"
-path="res://.godot/imported/fp_arms_texture_0_metallic_roughness.png-dc376141249271cad45634c5770de9ff.ctex"
+path.s3tc="res://.godot/imported/fp_arms_texture_0_metallic_roughness.png-dc376141249271cad45634c5770de9ff.s3tc.ctex"
 metadata={
-"vram_texture": false
+"imported_formats": ["s3tc_bptc"],
+"vram_texture": true
 }
 generator_parameters={
 "md5": "0138d9433c161b72db473e378fb5bc8d"
@@ -14,11 +15,11 @@ generator_parameters={
 [deps]
 
 source_file="res://models/arms/fp_arms_texture_0_metallic_roughness.png"
-dest_files=["res://.godot/imported/fp_arms_texture_0_metallic_roughness.png-dc376141249271cad45634c5770de9ff.ctex"]
+dest_files=["res://.godot/imported/fp_arms_texture_0_metallic_roughness.png-dc376141249271cad45634c5770de9ff.s3tc.ctex"]
 
 [params]
 
-compress/mode=0
+compress/mode=2
 compress/high_quality=false
 compress/lossy_quality=0.7
 compress/uastc_level=0
@@ -40,4 +41,4 @@ process/normal_map_invert_y=false
 process/hdr_as_srgb=false
 process/hdr_clamp_exposure=false
 process/size_limit=0
-detect_3d/compress_to=1
+detect_3d/compress_to=0
