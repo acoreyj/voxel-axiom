@@ -542,14 +542,14 @@ void test_gdextension_moai_stamp_baked_colors_and_remove_structure() {
 
     // Test stamping BEFORE set_stream_focus (exact _ready() order in terrain_demo.gd)
     // to verify background streaming never overwrites the stamped 2x Moai statue!
-    // Seat the statue on the surface: moai_statue.vreg is baked centred at
+    // Seat the statue on the surface: tests/assets/moai_statue.vreg is baked centred at
     // (144,160,128) and its solid base is at local y=136, so stamping at origin
     // chunk y = round((surface_y - 136) / 32) puts the base on the terrain.
     const float opt2_surface_y = terrain.get_surface_height(16.0f, 0.0f);
     const int opt2_origin_y = static_cast<int>(std::lround((opt2_surface_y - 136.0f) / 32.0f));
     std::printf("[MoaiTest] surface at (16,0)=%.2f -> origin chunk y=%d\n", opt2_surface_y, opt2_origin_y);
     const int opt2_id = terrain.stamp_asset(
-        "moai_statue.vreg", Vector3(-4.0f, static_cast<float>(opt2_origin_y), -4.0f), 15.0f);
+        "tests/assets/moai_statue.vreg", Vector3(-4.0f, static_cast<float>(opt2_origin_y), -4.0f), 15.0f);
     REQUIRE(opt2_id > 0);
 
     terrain.set_stream_focus(
@@ -563,7 +563,7 @@ void test_gdextension_moai_stamp_baked_colors_and_remove_structure() {
     const float opt1_surface_y = terrain.get_surface_height(-16.0f, 0.0f);
     const int opt1_origin_y = static_cast<int>(std::lround((opt1_surface_y - 136.0f) / 32.0f));
     const int opt1_id = terrain.stamp_asset(
-        "moai_statue.vreg", Vector3(-5.0f, static_cast<float>(opt1_origin_y), -4.0f), 0.0f);
+        "tests/assets/moai_statue.vreg", Vector3(-5.0f, static_cast<float>(opt1_origin_y), -4.0f), 0.0f);
     REQUIRE(opt1_id > 0);
     terrain.trigger_explosion(
         Vector3(-16.0f, static_cast<float>(opt1_origin_y) * 32.0f + 160.0f, 6.0f), 6.5f);
