@@ -719,6 +719,80 @@ void test_gdextension_undo_redo_and_benchmark_pass_reset() {
     std::printf("[PASS] test_gdextension_undo_redo_and_benchmark_pass_reset (undo/redo/undo_all/redo_all + 3-hit boulder & Lava->Obsidian reset verified)\n");
 }
 
+// ============================================================================
+// 5. Underground Multi-Chunk Explosion Atomic Mesh Commit Verification
+//    Ensures all chunks dirtied by an underground blast commit to ServerSlotManager
+//    in a single atomic _process() frame so the near cave wall is never replaced
+//    before the back crater wall in neighboring previously-solid chunks is ready.
+// ============================================================================
+void test_gdextension_underground_atomic_crater_commit_no_see_through() {
+    ++g_tests_run;
+
+    const std::filesystem::path save_dir = "/tmp/voxel_gdextension_atomic_crater_test";
+    std::filesystem::remove_all(save_dir);
+
+    VoxelTerrain3D terrain;
+    terrain.set_save_directory_path(save_dir.string());
+    terrain.set_view_distance_chunks(2);
+    terrain.set_prefetch_distance_chunks(0);
+    terrain.set_world_height_chunks(4);
+    // Use a very tight 0.5 ms upload budget that would normally split a 12-chunk
+    // explosion across 2-3 frames if edit batches were not staged atomically.
+    terrain.set_upload_budget_ms(0.5f);
+    terrain._enter_tree();
+
+    terrain.set_stream_focus(Vector3(32.0f, 32.0f, 32.0f), Vector3(0.0f, 0.0f, 0.0f));
+    wait_until_terrain_fully_committed(terrain);
+
+    std::size_t current_frame_index = 0;
+    std::vector<std::size_t> edit_commits_per_frame;
+    std::size_t total_edit_meshes_committed = 0;
+
+    terrain.get_server_slot_manager().set_commit_hook([&](const voxel::ChunkMeshPayload& mesh) {
+        if (mesh.captured_terrain_revision > 0) {
+            if (edit_commits_per_frame.size() <= current_frame_index) {
+                edit_commits_per_frame.resize(current_frame_index + 1, 0);
+            }
+            ++edit_commits_per_frame[current_frame_index];
+            ++total_edit_meshes_committed;
+        }
+    });
+
+    // Trigger an underground explosion straddling the 8-chunk corner at (32, 32, 32)
+    terrain.trigger_explosion(Vector3(32.0f, 32.0f, 32.0f), 11.5f);
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline) {
+        ++current_frame_index;
+        terrain._process(0.007);
+        terrain.get_navigation_manager().complete_in_flight_async_bakes_and_advance_map_iteration();
+        if (terrain.fully_committed() && total_edit_meshes_committed > 0) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+
+    REQUIRE(terrain.fully_committed());
+    REQUIRE(total_edit_meshes_committed >= 8ULL);
+
+    // Count how many distinct _process() frames committed any mesh from this explosion:
+    // MUST be exactly 1 frame (atomic commit across all chunks of the crater)!
+    std::size_t frames_with_commits = 0;
+    for (std::size_t count : edit_commits_per_frame) {
+        if (count > 0) {
+            ++frames_with_commits;
+            REQUIRE(count == total_edit_meshes_committed);
+        }
+    }
+    REQUIRE(frames_with_commits == 1ULL);
+
+    terrain._exit_tree();
+    std::filesystem::remove_all(save_dir);
+
+    std::printf("[PASS] test_gdextension_underground_atomic_crater_commit_no_see_through (%zu crater chunks committed atomically in 1 frame)\n",
+                total_edit_meshes_committed);
+}
+
 } // namespace
 
 int main() {
@@ -734,6 +808,7 @@ int main() {
     test_gdextension_mid_path_terrain_removal_and_frost_bridge_addition();
     test_gdextension_moai_stamp_baked_colors_and_remove_structure();
     test_gdextension_undo_redo_and_benchmark_pass_reset();
+    test_gdextension_underground_atomic_crater_commit_no_see_through();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",
                 g_tests_run, g_assertions_checked);
     return EXIT_SUCCESS;

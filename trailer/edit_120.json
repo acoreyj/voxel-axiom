@@ -1,0 +1,638 @@
+﻿{
+    "name":  "Voxel Engine v4.0 - 120s",
+    "fps":  60,
+    "resolution":  [
+                       3840,
+                       2160
+                   ],
+    "vertical_resolution":  [
+                                1080,
+                                1920
+                            ],
+    "duration":  120,
+    "strips":  [
+                   {
+                       "shot":  "overture_blast",
+                       "start":  0,
+                       "duration":  5,
+                       "source_in":  0.1,
+                       "speed":  0.48
+                   },
+                   {
+                       "shot":  "overture_surface",
+                       "start":  5,
+                       "duration":  5,
+                       "source_in":  0.1,
+                       "speed":  0.48
+                   },
+                   {
+                       "shot":  "overture_cave",
+                       "start":  10,
+                       "duration":  5,
+                       "source_in":  0.8,
+                       "speed":  0.35
+                   },
+                   {
+                       "shot":  "play_soil",
+                       "start":  15,
+                       "duration":  5,
+                       "source_in":  0.15,
+                       "speed":  0.4
+                   },
+                   {
+                       "shot":  "play_hardrock",
+                       "start":  20,
+                       "duration":  7,
+                       "source_in":  0.15,
+                       "speed":  0.42
+                   },
+                   {
+                       "shot":  "play_boulder",
+                       "start":  27,
+                       "duration":  6,
+                       "source_in":  0.15,
+                       "speed":  0.55
+                   },
+                   {
+                       "shot":  "play_obsidian",
+                       "start":  33,
+                       "duration":  4,
+                       "source_in":  0.15,
+                       "speed":  0.5
+                   },
+                   {
+                       "shot":  "play_ice",
+                       "start":  37,
+                       "duration":  3,
+                       "source_in":  0.15,
+                       "speed":  0.5
+                   },
+                   {
+                       "shot":  "play_statue_wide",
+                       "start":  40,
+                       "duration":  5,
+                       "source_in":  0.2,
+                       "speed":  0.5
+                   },
+                   {
+                       "shot":  "play_statue_swap",
+                       "start":  45,
+                       "duration":  4,
+                       "source_in":  0.2,
+                       "speed":  0.8
+                   },
+                   {
+                       "shot":  "play_statue_recon",
+                       "start":  49,
+                       "duration":  6,
+                       "source_in":  0.35,
+                       "speed":  2.5
+                   },
+                   {
+                       "shot":  "fly_stream",
+                       "start":  55,
+                       "duration":  5,
+                       "source_in":  0.2,
+                       "speed":  0.45
+                   },
+                   {
+                       "shot":  "fly_surface",
+                       "start":  60,
+                       "duration":  5,
+                       "source_in":  0.2,
+                       "speed":  0.42
+                   },
+                   {
+                       "shot":  "fly_cave",
+                       "start":  65,
+                       "duration":  8,
+                       "source_in":  0.8,
+                       "speed":  0.3
+                   },
+                   {
+                       "shot":  "fly_destruction",
+                       "start":  73,
+                       "duration":  5,
+                       "source_in":  0.2,
+                       "speed":  0.5
+                   },
+                   {
+                       "shot":  "react_lava_water",
+                       "start":  78,
+                       "duration":  8,
+                       "source_in":  0.1,
+                       "speed":  0.5
+                   },
+                   {
+                       "shot":  "fly_nav",
+                       "start":  86,
+                       "duration":  6,
+                       "source_in":  0.2,
+                       "speed":  0.6
+                   },
+                   {
+                       "shot":  "fly_persist_a",
+                       "start":  92,
+                       "duration":  3,
+                       "source_in":  0.2,
+                       "speed":  0.8
+                   },
+                   {
+                       "shot":  "fly_persist_b",
+                       "start":  95,
+                       "duration":  3,
+                       "source_in":  0.2,
+                       "speed":  0.8
+                   },
+                   {
+                       "shot":  "fly_undo_redo",
+                       "start":  98,
+                       "duration":  5,
+                       "source_in":  0.2,
+                       "speed":  0.7
+                   },
+                   {
+                       "shot":  "fly_stamp",
+                       "start":  103,
+                       "duration":  4,
+                       "source_in":  0.2,
+                       "speed":  0.75
+                   },
+                   {
+                       "shot":  "debug_xray",
+                       "start":  107,
+                       "duration":  3,
+                       "source_in":  0.2,
+                       "speed":  0.8
+                   },
+                   {
+                       "type":  "image",
+                       "image":  "trailer/assets/benchmark_chart.png",
+                       "start":  110,
+                       "duration":  6
+                   },
+                   {
+                       "type":  "color",
+                       "color":  [
+                                     0.005,
+                                     0.007,
+                                     0.012,
+                                     1
+                                 ],
+                       "start":  116,
+                       "duration":  4
+                   }
+               ],
+    "texts":  [
+                  {
+                      "text":  "REAL-TIME DESTRUCTIBLE VOXEL TERRAIN",
+                      "start":  0.5,
+                      "duration":  4.3,
+                      "x":  0.5,
+                      "y":  0.1,
+                      "size":  0.032,
+                      "font":  "mono",
+                      "color":  [
+                                    1,
+                                    1,
+                                    1,
+                                    1
+                                ],
+                      "anchor":  "center",
+                      "valign":  "bottom",
+                      "box":  true
+                  },
+                  {
+                      "text":  "REAL-TIME CSG | PROCEDURAL TERRAIN",
+                      "start":  5.3,
+                      "duration":  4.3,
+                      "x":  0.5,
+                      "y":  0.1,
+                      "size":  0.032,
+                      "font":  "mono",
+                      "color":  [
+                                    0.78,
+                                    0.95,
+                                    0.85,
+                                    1
+                                ],
+                      "anchor":  "center",
+                      "valign":  "bottom",
+                      "box":  true
+                  },
+                  {
+                      "text":  "UNDERGROUND CAVE: REAL-TIME CSG",
+                      "start":  10.4,
+                      "duration":  4.2,
+                      "x":  0.5,
+                      "y":  0.1,
+                      "size":  0.032,
+                      "font":  "mono",
+                      "color":  [
+                                    0.78,
+                                    0.9,
+                                    1,
+                                    1
+                                ],
+                      "anchor":  "center",
+                      "valign":  "bottom",
+                      "box":  true
+                  },
+                  {
+                      "text":  "SOIL (1 HIT)",
+                      "start":  15.3,
+                      "duration":  4.4,
+                      "x":  0.5,
+                      "y":  0.1,
+                      "size":  0.034,
+                      "font":  "sans",
+                      "color":  [
+                                    1,
+                                    1,
+                                    1,
+                                    1
+                                ],
+                      "anchor":  "center",
+                      "valign":  "bottom",
+                      "box":  true
+                  },
+                  {
+                      "text":  "HARD ROCK (3 HITS)",
+                      "start":  20.2,
+                      "duration":  6.4,
+                      "x":  0.5,
+                      "y":  0.1,
+                      "size":  0.034,
+                      "font":  "sans",
+                      "color":  [
+                                    1,
+                                    0.78,
+                                    0.55,
+                                    1
+                                ],
+                      "anchor":  "center",
+                      "valign":  "bottom",
+                      "box":  true
+                  },
+                  {
+                      "text":  "BOULDER (5 HITS)",
+                      "start":  27.2,
+                      "duration":  5.4,
+                      "x":  0.5,
+                      "y":  0.1,
+                      "size":  0.034,
+                      "font":  "sans",
+                      "color":  [
+                                    1,
+                                    0.78,
+                                    0.55,
+                                    1
+                                ],
+                      "anchor":  "center",
+                      "valign":  "bottom",
+                      "box":  true
+                  },
+                  {
+                      "text":  "OBSIDIAN (3 HITS)",
+                      "start":  33.2,
+                      "duration":  3.4,
+                      "x":  0.5,
+                      "y":  0.1,
+                      "size":  0.032,
+                      "font":  "sans",
+                      "color":  [
+                                    0.85,
+                                    0.72,
+                                    1,
+                                    1
+                                ],
+                      "anchor":  "center",
+                      "valign":  "bottom",
+                      "box":  true
+                  },
+                  {
+                      "text":  "ICE (1 HIT)",
+                      "start":  37.2,
+                      "duration":  2.4,
+                      "x":  0.5,
+                      "y":  0.1,
+                      "size":  0.032,
+                      "font":  "sans",
+                      "color":  [
+                                    0.7,
+                                    0.92,
+                                    1,
+                                    1
+                                ],
+                      "anchor":  "center",
+                      "valign":  "bottom",
+                      "box":  true
+                  },
+                  {
+                      "text":  "STATUE: PRISTINE MESH -\u003e VOXELS",
+                      "start":  40.3,
+                      "duration":  4.5,
+                      "x":  0.5,
+                      "y":  0.1,
+                      "size":  0.032,
+                      "font":  "mono",
+                      "color":  [
+                                    1,
+                                    1,
+                                    1,
+                                    1
+                                ],
+                      "anchor":  "center",
+                      "valign":  "bottom",
+                      "box":  true
+                  },
+                  {
+                      "text":  "STATUE: ONE HIT -\u003e VOXEL SWAP",
+                      "start":  45.2,
+                      "duration":  3.6,
+                      "x":  0.5,
+                      "y":  0.1,
+                      "size":  0.032,
+                      "font":  "sans",
+                      "color":  [
+                                    1,
+                                    0.82,
+                                    0.4,
+                                    1
+                                ],
+                      "anchor":  "center",
+                      "valign":  "bottom",
+                      "box":  true
+                  },
+                  {
+                      "text":  "STATUE: 15s QUIET -\u003e EXACT RESTORE",
+                      "start":  49.2,
+                      "duration":  5.6,
+                      "x":  0.5,
+                      "y":  0.1,
+                      "size":  0.03,
+                      "font":  "mono",
+                      "color":  [
+                                    0.7,
+                                    1,
+                                    0.8,
+                                    1
+                                ],
+                      "anchor":  "center",
+                      "valign":  "bottom",
+                      "box":  true
+                  },
+                  {
+                      "text":  "STREAMING: 32^3 CHUNKS",
+                      "start":  55.3,
+                      "duration":  4.5,
+                      "x":  0.5,
+                      "y":  0.1,
+                      "size":  0.032,
+                      "font":  "mono",
+                      "color":  [
+                                    0.72,
+                                    1,
+                                    0.8,
+                                    1
+                                ],
+                      "anchor":  "center",
+                      "valign":  "bottom",
+                      "box":  true
+                  },
+                  {
+                      "text":  "MESHING: SURFACE NETS | SEAM-FREE",
+                      "start":  60.3,
+                      "duration":  4.5,
+                      "x":  0.5,
+                      "y":  0.1,
+                      "size":  0.032,
+                      "font":  "mono",
+                      "color":  [
+                                    0.72,
+                                    1,
+                                    0.8,
+                                    1
+                                ],
+                      "anchor":  "center",
+                      "valign":  "bottom",
+                      "box":  true
+                  },
+                  {
+                      "text":  "UNDERGROUND CAVE: REAL-TIME CSG",
+                      "start":  65.3,
+                      "duration":  7.4,
+                      "x":  0.5,
+                      "y":  0.1,
+                      "size":  0.032,
+                      "font":  "mono",
+                      "color":  [
+                                    0.78,
+                                    0.9,
+                                    1,
+                                    1
+                                ],
+                      "anchor":  "center",
+                      "valign":  "bottom",
+                      "box":  true
+                  },
+                  {
+                      "text":  "DESTRUCTION: 8.5-18 m BLASTS",
+                      "start":  73.3,
+                      "duration":  4.5,
+                      "x":  0.5,
+                      "y":  0.1,
+                      "size":  0.032,
+                      "font":  "mono",
+                      "color":  [
+                                    1,
+                                    0.7,
+                                    0.35,
+                                    1
+                                ],
+                      "anchor":  "center",
+                      "valign":  "bottom",
+                      "box":  true
+                  },
+                  {
+                      "text":  "REACTION: LAVA + WATER -\u003e OBSIDIAN",
+                      "start":  78.3,
+                      "duration":  7.4,
+                      "x":  0.5,
+                      "y":  0.1,
+                      "size":  0.032,
+                      "font":  "mono",
+                      "color":  [
+                                    1,
+                                    0.72,
+                                    0.42,
+                                    1
+                                ],
+                      "anchor":  "center",
+                      "valign":  "bottom",
+                      "box":  true
+                  },
+                  {
+                      "text":  "AI NAVIGATION: 3D PATH",
+                      "start":  86.3,
+                      "duration":  5.5,
+                      "x":  0.5,
+                      "y":  0.1,
+                      "size":  0.032,
+                      "font":  "mono",
+                      "color":  [
+                                    0.65,
+                                    1,
+                                    0.65,
+                                    1
+                                ],
+                      "anchor":  "center",
+                      "valign":  "bottom",
+                      "box":  true
+                  },
+                  {
+                      "text":  "PERSISTENCE: SAVE",
+                      "start":  92.3,
+                      "duration":  2.4,
+                      "x":  0.5,
+                      "y":  0.1,
+                      "size":  0.032,
+                      "font":  "mono",
+                      "color":  [
+                                    1,
+                                    1,
+                                    1,
+                                    1
+                                ],
+                      "anchor":  "center",
+                      "valign":  "bottom",
+                      "box":  true
+                  },
+                  {
+                      "text":  "PERSISTENCE: RELOAD | DAMAGE PERSISTS",
+                      "start":  95.2,
+                      "duration":  2.6,
+                      "x":  0.5,
+                      "y":  0.1,
+                      "size":  0.03,
+                      "font":  "mono",
+                      "color":  [
+                                    1,
+                                    1,
+                                    1,
+                                    1
+                                ],
+                      "anchor":  "center",
+                      "valign":  "bottom",
+                      "box":  true
+                  },
+                  {
+                      "text":  "HISTORY: UNDO / REDO | BIT-EXACT",
+                      "start":  98.3,
+                      "duration":  4.5,
+                      "x":  0.5,
+                      "y":  0.1,
+                      "size":  0.03,
+                      "font":  "mono",
+                      "color":  [
+                                    1,
+                                    0.86,
+                                    0.4,
+                                    1
+                                ],
+                      "anchor":  "center",
+                      "valign":  "bottom",
+                      "box":  true
+                  },
+                  {
+                      "text":  "ASSET PIPELINE: OBJ -\u003e .VREG",
+                      "start":  103.3,
+                      "duration":  3.5,
+                      "x":  0.5,
+                      "y":  0.1,
+                      "size":  0.03,
+                      "font":  "mono",
+                      "color":  [
+                                    1,
+                                    0.92,
+                                    0.7,
+                                    1
+                                ],
+                      "anchor":  "center",
+                      "valign":  "bottom",
+                      "box":  true
+                  },
+                  {
+                      "text":  "QUERIES: VOXEL RAYCASTS | PHYSICS RIDS",
+                      "start":  107.2,
+                      "duration":  2.6,
+                      "x":  0.5,
+                      "y":  0.1,
+                      "size":  0.03,
+                      "font":  "mono",
+                      "color":  [
+                                    0.75,
+                                    0.9,
+                                    1,
+                                    1
+                                ],
+                      "anchor":  "center",
+                      "valign":  "bottom",
+                      "box":  true
+                  },
+                  {
+                      "text":  "VOXEL ENGINE v4.0",
+                      "start":  116.3,
+                      "duration":  3.4,
+                      "x":  0.5,
+                      "y":  0.56,
+                      "size":  0.075,
+                      "font":  "sans",
+                      "color":  [
+                                    0.92,
+                                    1,
+                                    0.95,
+                                    1
+                                ],
+                      "anchor":  "center",
+                      "valign":  "center",
+                      "box":  false
+                  },
+                  {
+                      "text":  "C++20 CORE | GODOT 4.7 GDEXTENSION",
+                      "start":  116.8,
+                      "duration":  3,
+                      "x":  0.5,
+                      "y":  0.44,
+                      "size":  0.024,
+                      "font":  "mono",
+                      "color":  [
+                                    0.72,
+                                    0.9,
+                                    0.82,
+                                    1
+                                ],
+                      "anchor":  "center",
+                      "valign":  "center",
+                      "box":  false
+                  },
+                  {
+                      "text":  "ALL FOOTAGE CAPTURED IN-ENGINE",
+                      "start":  117.2,
+                      "duration":  2.6,
+                      "x":  0.5,
+                      "y":  0.34,
+                      "size":  0.02,
+                      "font":  "mono",
+                      "color":  [
+                                    0.6,
+                                    0.72,
+                                    0.68,
+                                    1
+                                ],
+                      "anchor":  "center",
+                      "valign":  "center",
+                      "box":  false
+                  }
+              ]
+}

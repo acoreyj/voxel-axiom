@@ -431,6 +431,7 @@ void VoxelTerrain3D::handle_completed_edit_transaction(voxel::EditTransactionCom
     }
 
     auto stamps_before = stamp_manager_.capture_manager_snapshot();
+    server_slot_manager.register_edit_batch(tx.terrain_revision, tx.dirtied_chunks);
     navigation_manager.apply_edit_transaction(tx);
     // Explosions / elemental reactions that carve stamped structures mark
     // them damaged and arm their reconstitution timer; fills never do.
@@ -601,7 +602,8 @@ int64_t VoxelTerrain3D::stamp_asset(const String& p_vreg_path, Vector3 p_chunk_c
                 s, ck, core_engine->procgen, grid34);
         },
         &before_chunks,
-        &after_chunks);
+        &after_chunks,
+        &server_slot_manager);
 
     if (structure_id != 0) {
         if (!before_chunks.empty() || !after_chunks.empty()) {
@@ -638,7 +640,8 @@ bool VoxelTerrain3D::remove_structure(int64_t p_structure_id) {
         core_engine->dirty_scheduler,
         navigation_manager,
         &before_chunks,
-        &after_chunks);
+        &after_chunks,
+        &server_slot_manager);
     if (removed) {
         if (!before_chunks.empty() || !after_chunks.empty()) {
             voxel::UndoRedoEntry entry{};
@@ -670,7 +673,8 @@ bool VoxelTerrain3D::undo() {
         navigation_manager,
         stamp_manager_,
         core_engine->save_manager.get(),
-        &affected_chunks);
+        &affected_chunks,
+        &server_slot_manager);
 
     if (ok) {
         const int u_cnt = get_undo_count();
@@ -698,7 +702,8 @@ bool VoxelTerrain3D::redo() {
         navigation_manager,
         stamp_manager_,
         core_engine->save_manager.get(),
-        &affected_chunks);
+        &affected_chunks,
+        &server_slot_manager);
 
     if (ok) {
         const int u_cnt = get_undo_count();
@@ -726,7 +731,8 @@ int VoxelTerrain3D::undo_all() {
         navigation_manager,
         stamp_manager_,
         core_engine->save_manager.get(),
-        &affected_chunks);
+        &affected_chunks,
+        &server_slot_manager);
 
     if (steps > 0) {
         const int u_cnt = get_undo_count();
@@ -754,7 +760,8 @@ int VoxelTerrain3D::redo_all() {
         navigation_manager,
         stamp_manager_,
         core_engine->save_manager.get(),
-        &affected_chunks);
+        &affected_chunks,
+        &server_slot_manager);
 
     if (steps > 0) {
         const int u_cnt = get_undo_count();
@@ -915,6 +922,8 @@ bool VoxelTerrain3D::fully_committed() const {
     return core_idle() &&
            core_engine &&
            core_engine->worker_pool->completion_queue_depth() == 0 &&
+           !server_slot_manager.has_pending_edit_batch() &&
+           !server_slot_manager.has_staged_edit_meshes() &&
            navigation_manager.navigation_groups_synced();
 }
 
@@ -948,22 +957,27 @@ void VoxelTerrain3D::_process(double delta) {
         std::optional<voxel::CompletionRecord> done =
             core_engine->worker_pool->try_pop_completion();
         if (!done.has_value()) {
+            // If an edit batch has already finished its CSG phase and its chunk meshes
+            // are finishing on the worker threads within this frame's soft upload budget,
+            // briefly yield so all chunks of the crater can commit atomically on this frame.
+            const uint64_t elapsed_us = monotonic_ticks_usec() - frame_start_us;
+            if (server_slot_manager.has_pending_edit_batch() &&
+                !core_idle() &&
+                elapsed_us < soft_budget_us) {
+                std::this_thread::yield();
+                continue;
+            }
             break;
         }
 
         switch (done->kind) {
             case voxel::CompletionKind::ChunkMesh: {
                 voxel::ScopedTimer commit_timer(timings, voxel::Stage::Commit);
-                const bool has_geometry = !done->chunk_mesh.vertices.empty();
-                server_slot_manager.commit_chunk_mesh_and_collision(
-                    done->chunk_mesh, chunk_in_collision_range(done->chunk_mesh.key));
-                navigation_manager.note_chunk_mesh_committed(
-                    done->chunk_mesh.key,
-                    done->chunk_mesh.captured_terrain_revision,
-                    server_slot_manager.get_cached_nav_faces(done->chunk_mesh.key));
-                if (has_geometry) {
-                    ++non_empty_meshes_committed;
-                }
+                (void)server_slot_manager.stage_or_commit_chunk_mesh(
+                    done->chunk_mesh,
+                    chunk_in_collision_range(done->chunk_mesh.key),
+                    navigation_manager,
+                    &non_empty_meshes_committed);
                 break;
             }
 
@@ -981,21 +995,37 @@ void VoxelTerrain3D::_process(double delta) {
         const uint64_t elapsed_us = monotonic_ticks_usec() - frame_start_us;
         const std::size_t remaining_depth =
             core_engine->worker_pool->completion_queue_depth();
-        if (remaining_depth == 0) {
+        if (remaining_depth == 0 && !server_slot_manager.has_pending_edit_batch()) {
             break;
         }
 
-        const bool currently_over_cap = (remaining_depth >= 32ULL);
-        // Commit up to 8 non-empty chunk meshes per frame (still bounded by upload_budget_ms)
-        // so a single 8-chunk blast clears in one frame instead of re-dirtying and rebaking
-        // neighbouring navigation groups across five frames.
-        if (!currently_over_cap &&
-            (elapsed_us >= soft_budget_us || non_empty_meshes_committed >= 8ULL)) {
+        // Never split an in-flight edit batch across frames while completions are
+        // available; once the edit batch flushes atomically, resume normal soft-budget
+        // pacing for background stream meshes.
+        if (!server_slot_manager.has_pending_edit_batch()) {
+            const bool currently_over_cap = (remaining_depth >= 32ULL);
+            // Commit up to 8 non-empty chunk meshes per frame (still bounded by upload_budget_ms)
+            // so a single 8-chunk blast clears in one frame instead of re-dirtying and rebaking
+            // neighbouring navigation groups across five frames.
+            if (!currently_over_cap &&
+                (elapsed_us >= soft_budget_us || non_empty_meshes_committed >= 8ULL)) {
+                break;
+            }
+            if (elapsed_us >= emergency_budget_us) {
+                break;
+            }
+        } else if (elapsed_us >= emergency_budget_us && remaining_depth == 0) {
             break;
         }
-        if (elapsed_us >= emergency_budget_us) {
-            break;
-        }
+    }
+
+    // Safety net: if all workers and queues are completely idle, flush any remaining
+    // staged edit meshes so no edit batch can ever remain stranded.
+    if (core_idle() &&
+        core_engine->worker_pool->completion_queue_depth() == 0 &&
+        server_slot_manager.has_staged_edit_meshes()) {
+        (void)server_slot_manager.flush_staged_edit_meshes(
+            navigation_manager, &non_empty_meshes_committed);
     }
 
     // Advance reconstitution timers for stamped assets: damaged structures with a
@@ -1006,7 +1036,8 @@ void VoxelTerrain3D::_process(double delta) {
             static_cast<float>(delta),
             core_engine->store,
             core_engine->dirty_scheduler,
-            navigation_manager);
+            navigation_manager,
+            &server_slot_manager);
     }
 
     // Only submit NavigationGroup async bakes once all finished chunk meshes in

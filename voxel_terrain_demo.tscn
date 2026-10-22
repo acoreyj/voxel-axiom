@@ -60,6 +60,7 @@ prefetch_distance_chunks = 4
 world_height_chunks = 8
 voxel_scale = 0.5
 terrain_material = SubResource("ShaderMaterial_Terrain")
+instrumentation_enabled = false
 
 [node name="VoxelAICompanion" type="VoxelAICompanion" parent="." unique_id=1917223628]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 16, 48, 16)
@@ -171,6 +172,19 @@ offset_bottom = 350.0
 theme_override_colors/font_color = Color(0.78, 0.83, 0.9, 1)
 theme_override_font_sizes/font_size = 14
 text = "CONTROLS"
+
+[node name="HideUIButton" type="Button" parent="HUD"]
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -150.0
+offset_top = 8.0
+offset_right = -12.0
+offset_bottom = 40.0
+grow_horizontal = 0
+focus_mode = 0
+tooltip_text = "Hide all UI except the reticle and pickaxe (U)"
+text = "Hide UI (U)"
 
 [node name="Reticle" type="Panel" parent="HUD" unique_id=1289745621]
 anchors_preset = 8

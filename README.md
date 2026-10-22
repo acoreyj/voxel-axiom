@@ -113,6 +113,7 @@ asset baker or tests, step 1 produces `voxel_baker` and the CTest suites.
 | **Physics collision** | Per-chunk concave `PhysicsServer3D` bodies with distance gating and optional subsampling | [Design v4, Section 4.4](docs/Voxel%20Design%20Doc%20v4.md#44-physics-collision) |
 | **Triplanar shading** | Material-aware PBR shader with grass, soil, rock, lava, water, obsidian, ice, and crack glow | [`voxel_triplanar.gdshader`](voxel_triplanar.gdshader) |
 | **First-person pickaxe** | Procedurally built arm and pickaxe viewmodel with windup, strike, follow-through, solid-hit recoil, bob, mouse sway, and impact sparks | [`terrain_demo.gd`](terrain_demo.gd) |
+| **Clean-screen UI toggle** | One button (or `U`) hides the stats readout, controls overlay, world labels, and the button itself, leaving only the reticle and pickaxe for screenshots | [`terrain_demo.gd`](terrain_demo.gd) |
 | **Instrumentation** | Lock-free per-stage timings for generate, mesh, commit, edit, streaming, and navigation | [Performance analysis](docs/Voxel%20Performance%20Analysis.md), [`stage_timings.hpp`](include/stage_timings.hpp) |
 | **Benchmark suite** | Five streaming/collision presets measure frame percentiles, streaming, CSG latency, navigation, VRAM, RAM, and draw calls; writes Markdown and JSON reports | [Automated benchmark suite](#automated-benchmark-suite) |
 
@@ -751,7 +752,14 @@ removed.
 | `Left Click` (Fly) | Apply the active terrain tool |
 | `Left Click` (Play) | Swing the pickaxe and chip the terrain; hold for repeated swings |
 | `H` | Show or hide the controls overlay |
+| `U` | Hide all UI except the reticle and pickaxe; press again to restore |
 | `Escape` | Release mouse capture; click to recapture |
+
+The HUD also has a **Hide UI (U)** button in the top-right corner. It toggles the same
+clean-screen mode as `U`: the stats label, controls overlay, world `Label3D` guidance, and
+the button itself disappear, while the targeting reticle and the pickaxe viewmodel stay
+visible. Because the mouse is captured during play, either press `U` or press `Escape`
+first if you prefer to click the button.
 
 ### Terrain tool tuning
 

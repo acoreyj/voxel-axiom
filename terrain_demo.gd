@@ -15,7 +15,9 @@ extends Node3D
 ## reconstitution timer below; Shift+B stamps the same asset permanently
 ## destroyed (no timer). Blast the stamped structure and it is either restored
 ## after the quiet period or stays destroyed forever.
-## H hides / shows the grouped controls overlay.
+## H hides / shows the grouped controls overlay. U (or the Hide UI button) hides
+## every HUD element except the targeting reticle, plus the world Label3D guidance,
+## leaving the pickaxe viewmodel visible.
 ## Side-by-side 16x-scale Easter Island statues are seeded on startup (see
 ## `_setup_side_by_side_easter_island_statues`):
 ##   Option 1 `EasterIslandOption1_MeshSwap` shows a pristine 16x easter_island.obj
@@ -185,8 +187,8 @@ const BENCHMARK_PRESETS := [
 
 const TOOL_NAMES := ["Add terrain", "Paint terrain", "Paint delete", "Place boulder", "Small hit", "Explode", "Large explode", "Water quench", "Frost / Ice", "Lava / Magma"]
 const TOOL_KEYS := ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"]
-const CONTROLS_TEXT := """CONTROLS  (H to hide)
-Mode    F fly / play   M (or F8) run benchmark suite
+const CONTROLS_TEXT := """CONTROLS  (H hide keys | U hide all UI)
+Mode    F fly / play   M (or F8) run / abort benchmark suite
 Play    WASD run   Shift sprint   Space jump   LMB swing pickaxe
 Move    W/A/S/D   Space or E up   Ctrl or Q down   Shift sprint
 Look    Mouse   Esc releases cursor   click recaptures
@@ -194,7 +196,7 @@ Build   1 Add terrain   2 Paint   3 Paint delete   4 Boulder
 Carve   5 Small hit     6 Explode   7 Large explode
 Element 8 Water   9 Frost/Ice   0 Lava/Magma
 Stamps  B timed ruin   Shift+B permanent ruin
-History Z (or Ctrl+Z) undo   Y (or Ctrl+Y) redo   Shift+R undo all & reset
+History Undo %d (Z) | Redo %d (Y) | Reset All (Shift+R)
 World   R reset statues   T material   P place companion
 Mouse   Play LMB pickaxe   Fly LMB tool   RMB cave path   Shift+RMB place companion"""
 const MATERIAL_NAMES := ["Soil", "Rock"]
@@ -253,6 +255,8 @@ const APE_OPT2_WORLD_CENTER := Vector3(32.0, 96.0, -128.0)
 @onready var camera: Camera3D = $Camera3D
 @onready var stats_label: Label = $HUD/StatsLabel
 @onready var controls_label: Label = $HUD/ControlsLabel
+@onready var hide_ui_button: Button = $HUD/HideUIButton
+@onready var reticle: Control = $HUD/Reticle
 @onready var opt1_root: Node3D = $EasterIslandOption1_MeshSwap
 @onready var opt1_mesh_inst: MeshInstance3D = $EasterIslandOption1_MeshSwap/PristineMesh
 @onready var opt1_static_body: StaticBody3D = $EasterIslandOption1_MeshSwap/StaticBody3D
@@ -307,6 +311,7 @@ var _commits_per_second: float = 0.0
 var _stats_accum: float = 0.0
 var _active_tool: int = Tool.EXPLODE
 var _controls_visible: bool = true
+var _ui_hidden: bool = false
 var _add_material: int = MATERIAL_SOIL
 var _tool_pressed: bool = false
 var _brush_cooldown: float = 0.0
@@ -407,6 +412,22 @@ var _undo_stack: Array[Dictionary] = []
 var _redo_stack: Array[Dictionary] = []
 var _active_undo_action: Dictionary = {}
 
+func _get_cli_arg(prefix: String) -> String:
+	for arg in OS.get_cmdline_user_args():
+		if arg.begins_with(prefix):
+			return arg.substr(prefix.length())
+	return ""
+
+## The capture rig must choose its save directory before VoxelTerrain3D enters the
+## tree, because the native save manager is constructed in _enter_tree().
+func _enter_tree() -> void:
+	var save_dir := _get_cli_arg("--trailer-save-dir=")
+	if save_dir.is_empty():
+		return
+	var terrain_node := get_node_or_null("VoxelTerrain3D")
+	if terrain_node != null and terrain_node.has_method("set_save_directory_path"):
+		terrain_node.call("set_save_directory_path", save_dir)
+
 func _ready() -> void:
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 	terrain.explosion_requested.connect(_on_explosion_requested)
@@ -427,8 +448,9 @@ func _ready() -> void:
 
 	_setup_pickaxe_viewmodel()
 	_setup_path_debug_visuals()
-	controls_label.text = CONTROLS_TEXT
+	_refresh_controls_label()
 	controls_label.visible = _controls_visible
+	hide_ui_button.pressed.connect(_toggle_ui_hidden)
 	_setup_side_by_side_easter_island_statues()
 	_setup_side_by_side_atlas_statues()
 	_setup_side_by_side_ape_statues()
@@ -438,6 +460,7 @@ func _ready() -> void:
 	_setup_phantom_camera()
 	_update_stream_focus(true)
 	_check_cli_benchmark_autostart()
+	_check_cli_trailer_autostart()
 
 func _setup_path_debug_visuals() -> void:
 	# 1. Cyan capsule marker on VoxelAICompanion so you can see it walk along the path
@@ -1598,7 +1621,7 @@ func _unhandled_input(event: InputEvent) -> void:
 		if event.keycode == KEY_M or event.keycode == KEY_F8:
 			_toggle_benchmark_mode()
 			return
-		if _mode == Mode.BENCHMARK and event.keycode not in [KEY_ESCAPE, KEY_H, KEY_F]:
+		if _mode == Mode.BENCHMARK and event.keycode not in [KEY_ESCAPE, KEY_H, KEY_U, KEY_F]:
 			return
 		if _mode == Mode.PLAY and event.keycode in [KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_0, KEY_B]:
 			return
@@ -1639,7 +1662,9 @@ func _unhandled_input(event: InputEvent) -> void:
 				_stamp_asset_at_crosshair(0.0 if Input.is_key_pressed(KEY_SHIFT) else stamp_recreate_delay_seconds)
 			KEY_H:
 				_controls_visible = not _controls_visible
-				controls_label.visible = _controls_visible
+				controls_label.visible = _controls_visible and not _ui_hidden
+			KEY_U:
+				_toggle_ui_hidden()
 			KEY_Z:
 				if event.shift_pressed and (event.ctrl_pressed or event.meta_pressed):
 					_perform_redo()
@@ -1769,12 +1794,12 @@ func _update_hud(delta: float) -> void:
 
 	var material_state := ""
 	if _active_tool == Tool.ADD_TERRAIN or _active_tool == Tool.PAINT:
-		material_state = " | Material: %s (T)" % MATERIAL_NAMES[_add_material - 1]
+		material_state = " | Material: %s" % MATERIAL_NAMES[_add_material - 1]
 
 	if _mode == Mode.BENCHMARK:
 		var preset: Dictionary = BENCHMARK_PRESETS[_bench_preset_idx]
 		var phase_name: String = BENCHMARK_PHASE_NAMES[_bench_phase]
-		stats_label.text = "=== BENCHMARK MODE (Press M or F8 to abort) ===\nPreset %d/%d: %s\nPhase: %s (%.1fs)\nSettings: view=%d prefetch=%d budget=%.1fms mem=%dMB\nFPS: %.0f (%.2f ms) | Committed: %d (%.0f/s) | %s\nGPU: %s\nCPU: %s (%d threads)" % [
+		stats_label.text = "=== BENCHMARK MODE ===\nPreset %d/%d: %s\nPhase: %s (%.1fs)\nSettings: view=%d prefetch=%d budget=%.1fms mem=%dMB\nFPS: %.0f (%.2f ms) | Committed: %d (%.0f/s) | %s\nGPU: %s\nCPU: %s (%d threads)" % [
 			_bench_preset_idx + 1,
 			BENCHMARK_PRESETS.size(),
 			String(preset["name"]),
@@ -1796,18 +1821,17 @@ func _update_hud(delta: float) -> void:
 		return
 
 	var mode_name := "Play" if _mode == Mode.PLAY else "Fly"
-	var tool_text := "Pickaxe (LMB swing)" if _mode == Mode.PLAY \
-		else "[%s] %s%s" % [TOOL_KEYS[_active_tool], TOOL_NAMES[_active_tool], material_state]
+	var tool_text := "Pickaxe" if _mode == Mode.PLAY \
+		else "%s%s" % [TOOL_NAMES[_active_tool], material_state]
 
 	_look_at_accum += delta
 	if _look_at_accum >= LOOK_AT_REFRESH_INTERVAL:
 		_look_at_accum = 0.0
 		_refresh_look_at_material()
 
-	var undo_depth := _get_undo_depth_display()
-	var redo_depth := _get_redo_depth_display()
+	_refresh_controls_label()
 	var banner_suffix := ("\n" + _bench_last_summary_banner) if _bench_banner_timer > 0.0 and not _bench_last_summary_banner.is_empty() else ""
-	stats_label.text = "FPS: %.0f  (%.2f ms)\nView dist: %d / %d chunks  (prefetch %d)\nCommitted: %d chunks  (%.0f/s)\nStreaming: %s\nMode: %s (F) | Benchmark: M\nLooking at: %s\nTool: %s\nHistory: Undo %d (Z) | Redo %d (Y) | Reset All (Shift+R)\nControls: H%s" % [
+	stats_label.text = "FPS: %.0f  (%.2f ms)\nView dist: %d / %d chunks  (prefetch %d)\nCommitted: %d chunks  (%.0f/s)\nStreaming: %s\nMode: %s\nLooking at: %s\nTool: %s%s" % [
 		_fps_smoothed,
 		1000.0 / max(_fps_smoothed, 1.0),
 		terrain.get_effective_view_distance_chunks(),
@@ -1819,10 +1843,29 @@ func _update_hud(delta: float) -> void:
 		mode_name,
 		_look_at_name,
 		tool_text,
-		undo_depth,
-		redo_depth,
 		banner_suffix,
 	]
+
+## Hides every HUD element and world Label3D except the reticle, leaving only the
+## targeting dot and the 3D pickaxe viewmodel on screen. Press U or the HUD button
+## again to restore. The reticle is never hidden.
+func _toggle_ui_hidden() -> void:
+	_ui_hidden = not _ui_hidden
+	stats_label.visible = not _ui_hidden
+	controls_label.visible = not _ui_hidden and _controls_visible
+	hide_ui_button.visible = not _ui_hidden
+	reticle.visible = true
+	for label in find_children("*", "Label3D", true, false):
+		label.visible = not _ui_hidden
+
+## Rebuilds the controls overlay with live undo/redo depths. All key bindings
+## live here; StatsLabel only reports state, so this is the single controls view.
+func _refresh_controls_label() -> void:
+	if controls_label == null:
+		return
+	var text := CONTROLS_TEXT % [_get_undo_depth_display(), _get_redo_depth_display()]
+	if controls_label.text != text:
+		controls_label.text = text
 
 ## Raycasts the crosshair ray and caches the display name of the material under the
 ## reticle: "Sky" when the ray misses, otherwise the solid sample's material name.
@@ -2612,6 +2655,178 @@ func _reset_terrain_for_benchmark_pass() -> void:
 	_bench_last_reset_method = "engine_reinit_fallback"
 	print("[VoxelBenchmark] Reset terrain before pass via engine_reinit_fallback.")
 
+
+# ==============================================================================
+# Trailer Capture API (used only by --trailer-shot)
+# ==============================================================================
+
+func _check_cli_trailer_autostart() -> void:
+	var shot_id := _get_cli_arg("--trailer-shot=")
+	if shot_id.is_empty():
+		return
+	var director_script := load("res://trailer/trailer_director.gd")
+	if director_script == null:
+		push_error("[Trailer] Could not load res://trailer/trailer_director.gd")
+		return
+	var director = director_script.new()
+	director.name = "TrailerDirector"
+	director.demo = self
+	director.shot_id = shot_id
+	add_child(director)
+
+func trailer_hide_ui(hide: bool) -> void:
+	var hud := get_node_or_null("HUD")
+	if hud != null:
+		hud.visible = not hide
+	for label in find_children("*", "Label3D", true, false):
+		label.visible = not hide
+	Input.mouse_mode = Input.MOUSE_MODE_HIDDEN if hide else Input.MOUSE_MODE_CAPTURED
+
+func _trailer_aim_camera(target: Vector3) -> void:
+	var dir := target - camera.global_position
+	if dir.length_squared() < 0.000001:
+		return
+	dir = dir.normalized()
+	_yaw = atan2(-dir.x, -dir.z)
+	_pitch = asin(clampf(dir.y, -1.0, 1.0))
+	camera.rotation = Vector3(_pitch, _yaw, 0.0)
+
+func trailer_set_fly_camera(pos: Vector3, look_target: Vector3, fov: float = -1.0) -> void:
+	if _mode != Mode.FLY:
+		_exit_play()
+	camera.global_position = pos
+	_trailer_aim_camera(look_target)
+	if fov > 0.0:
+		camera.fov = fov
+	if _fly_pcam != null:
+		_fly_pcam.global_transform = camera.global_transform
+		_fly_pcam.priority = 1
+	if _play_pcam != null:
+		_play_pcam.priority = 0
+
+func trailer_set_fov(fov: float) -> void:
+	if fov > 0.0:
+		camera.fov = fov
+
+func trailer_enter_play_at(feet: Vector3, look_target: Vector3) -> void:
+	if _mode == Mode.PLAY:
+		_exit_play()
+	camera.global_position = feet + Vector3(0.0, play_eye_height, 0.0)
+	_trailer_aim_camera(look_target)
+	_enter_play()
+	_player_feet = feet
+	_player_vel_y = 0.0
+	_player_grounded = true
+	_last_safe_feet = feet
+	_spawn_pending = false
+	camera.global_position = feet + Vector3(0.0, play_eye_height, 0.0)
+	_play_pcam.global_position = camera.global_position
+	_play_pcam.rotation = camera.rotation
+
+func trailer_enter_play_on_surface(x: float, z: float, look_target: Vector3) -> void:
+	var ground := terrain.get_surface_height(x, z)
+	if not is_finite(ground):
+		ground = 68.0
+	trailer_enter_play_at(Vector3(x, ground, z), look_target)
+
+func trailer_aim_at(target: Vector3) -> void:
+	_trailer_aim_camera(target)
+	if _mode == Mode.PLAY:
+		_play_pcam.rotation = camera.rotation
+
+func trailer_swing_pickaxe() -> bool:
+	if _mode != Mode.PLAY:
+		return false
+	_start_pickaxe_swing()
+	return true
+
+func trailer_set_active_tool(tool: int) -> void:
+	_active_tool = tool
+
+func trailer_apply_tool(tool: int, point: Vector3) -> void:
+	_active_tool = tool
+	_last_boom_point = Vector3(INF, INF, INF)
+	_apply_tool_at(point)
+
+func trailer_add_material(point: Vector3, radius: float, material: int) -> void:
+	terrain.add_terrain_with_material(point, radius, material)
+
+func trailer_trigger_explosion(point: Vector3, radius: float) -> void:
+	terrain.trigger_explosion(point, radius)
+
+func trailer_trigger_elemental(point: Vector3, radius: float, element: int) -> void:
+	terrain.trigger_elemental_sphere(point, radius, element)
+
+func trailer_undo() -> bool:
+	return bool(terrain.call("undo")) if terrain.has_method("undo") else false
+
+func trailer_redo() -> bool:
+	return bool(terrain.call("redo")) if terrain.has_method("redo") else false
+
+func trailer_clear_history() -> void:
+	_clear_undo_history_to_current_baseline()
+
+func trailer_reset_baseline() -> void:
+	if terrain.has_method("undo_all"):
+		terrain.call("undo_all")
+	_reset_statues()
+	_clear_undo_history_to_current_baseline()
+
+func trailer_history_counts() -> Dictionary:
+	var undo_count := 0
+	var redo_count := 0
+	if terrain.has_method("get_undo_count"):
+		undo_count = int(terrain.call("get_undo_count"))
+	if terrain.has_method("get_redo_count"):
+		redo_count = int(terrain.call("get_redo_count"))
+	return {"undo": undo_count, "redo": redo_count}
+
+func trailer_statue_center(statue_id: String) -> Vector3:
+	match statue_id:
+		"easter_opt1":
+			return _opt1_world_center
+		"easter_opt2":
+			return _opt2_world_center
+		"atlas_opt1":
+			return _atlas_opt1_world_center
+		"atlas_opt2":
+			return _atlas_opt2_world_center
+		"ape_opt1":
+			return _ape_opt1_world_center
+		"ape_opt2":
+			return _ape_opt2_world_center
+	return Vector3.ZERO
+
+func trailer_place_companion(pos: Vector3) -> void:
+	ai_companion.global_position = pos
+	_companion_vertical_vel = 0.0
+	_companion_initialized = true
+	_active_waypoints.clear()
+	_path_immediate_mesh.clear_surfaces()
+
+func trailer_set_path_goal(goal: Vector3) -> void:
+	_pending_path_goal = goal
+	_goal_mesh_inst.global_position = goal
+	_goal_mesh_inst.visible = true
+	_has_pending_path_query = true
+
+func trailer_path_count() -> int:
+	return _active_waypoints.size()
+
+func trailer_path_ready() -> bool:
+	return _active_waypoints.size() > 1 and not _has_pending_path_query
+
+func trailer_waypoints() -> PackedVector3Array:
+	return _active_waypoints
+
+func trailer_ground_point(x: float, z: float, y_offset: float = 0.0) -> Vector3:
+	var ground := terrain.get_surface_height(x, z)
+	if not is_finite(ground):
+		ground = 68.0
+	return Vector3(x, ground + y_offset, z)
+
+func trailer_save_world() -> void:
+	terrain.save_world()
 
 # ==============================================================================
 # Automated Multi-Setting & Hardware Benchmark Suite (Key M or F8 / --benchmark)

@@ -38,3 +38,10 @@ Desktop.ini
 .godot/
 *.translation
 
+
+# Trailer capture artifacts
+captures/
+trailer_saves/
+trailer/assets/
+override.cfg
+

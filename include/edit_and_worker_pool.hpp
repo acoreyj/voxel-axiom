@@ -252,6 +252,7 @@ struct ChunkMeshPayload {
     ChunkKey key{};
     uint64_t captured_version = 0;
     uint64_t captured_terrain_revision = 0;
+    bool is_edit_mesh = false;
     std::vector<Vec3f> vertices;
     std::vector<Vec3f> normals;
     // Per-vertex attributes:
@@ -428,7 +429,8 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
     ChunkStore& store,
     DualDirtyScheduler& dirty_scheduler,
     EditTransaction& tx,
-    const std::function<void(ChunkStore&, ChunkKey)>& generate_fn = {}) {
+    const std::function<void(ChunkStore&, ChunkKey)>& generate_fn = {},
+    bool publish_dirty_immediately = true) {
 
     assert(!tx.is_finished());
     const std::size_t phase_idx = tx.next_phase_index++;
@@ -1025,11 +1027,15 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
 
     if (!tx.modified_chunk_masks.empty()) {
         new_revision = store.increment_terrain_revision();
+        const int32_t world_h = store.world_height_chunks();
         std::unordered_set<ChunkKey, ChunkKeyHash> unique_dirty;
         for (const auto& [ck, mask] : tx.modified_chunk_masks) {
             std::vector<ChunkKey> emitted;
             mask.emit_dirty_keys(ck, emitted);
             for (const ChunkKey dk : emitted) {
+                // Never enqueue non-existent vertical neighbor keys (bedrock / ceiling
+                // blasts would otherwise wait forever for chunks that cannot exist).
+                if (dk.y() < 0 || dk.y() >= world_h) continue;
                 unique_dirty.insert(dk);
                 tx.affected_nav_groups.insert(NavigationGroupKey::from_chunk_key(dk));
             }
@@ -1038,7 +1044,6 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
         std::sort(deduplicated_dirty.begin(), deduplicated_dirty.end());
 
         if (generate_fn) {
-            const int32_t world_h = store.world_height_chunks();
             for (const ChunkKey dk : deduplicated_dirty) {
                 for (int32_t dz = -1; dz <= 1; ++dz) {
                     for (int32_t dy = -1; dy <= 1; ++dy) {
@@ -1061,7 +1066,9 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
             }
         }
 
-        dirty_scheduler.publish_edit_transaction_dirty_batch(deduplicated_dirty);
+        if (publish_dirty_immediately) {
+            dirty_scheduler.publish_edit_transaction_dirty_batch(deduplicated_dirty);
+        }
     }
 
     EditTransactionCompletedPayload payload{};
@@ -1441,16 +1448,25 @@ private:
                     std::optional<EditTransactionCompletedPayload> completed_payload;
                     {
                         ScopedTimer timer(stage_timings_, Stage::Edit);
-                        completed_payload = execute_next_edit_phase(store_, dirty_scheduler_, tx, generate_fn_);
+                        completed_payload = execute_next_edit_phase(
+                            store_, dirty_scheduler_, tx, generate_fn_,
+                            /*publish_dirty_immediately=*/false);
                     }
                     ++consecutive_edit_phases;
 
                     lock.lock();
                     if (completed_payload.has_value()) {
+                        const std::vector<ChunkKey> dirtied_batch = completed_payload->dirtied_chunks;
                         CompletionRecord rec{};
                         rec.kind = CompletionKind::EditTransactionCompleted;
                         rec.edit_transaction = std::move(*completed_payload);
+                        // Enqueue EditTransactionCompleted BEFORE publishing the dirty chunk batch
+                        // so the main thread always registers the atomic edit batch before any
+                        // worker thread can finish and push a ChunkMesh for that edit.
                         push_completion(std::move(rec));
+                        if (!dirtied_batch.empty()) {
+                            dirty_scheduler_.publish_edit_transaction_dirty_batch(dirtied_batch);
+                        }
                     } else {
                         edit_queue_.push_front(std::move(tx));
                     }
@@ -1488,6 +1504,7 @@ private:
                             mesh_payload.captured_terrain_revision = stamp.captured_terrain_revision;
                         }
                     }
+                    mesh_payload.is_edit_mesh = (maybe_mesh->lane == DirtyQueueLane::EditDirty);
 
                     if (validate_neighborhood_stamp(store_, stamp)) {
                         CompletionRecord rec{};

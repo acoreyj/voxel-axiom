@@ -479,22 +479,26 @@ void test_surface_height_query() {
         }
     }
 
-    // 2. Store-first: re-generate the same chunks at a lower plane. The default
-    //    generator still models y ~ 68, so a y ~ 40 answer proves the resident
-    //    (edited) path wins over the analytic fallback.
+    // 2. Store-first: generate the same chunks at a lower plane in a fresh store.
+    //    Regeneration must not overwrite an already-Resident slot (race guard), so
+    //    use a new store to model the edited terrain. The default generator still
+    //    models y ~ 68, so a y ~ 40 answer proves the resident (edited) path wins
+    //    over the analytic fallback.
+    MemoryLedger edited_ledger;
+    ChunkStore edited_store(edited_ledger, /*world_height_chunks=*/8);
     for (int32_t cz = -1; cz <= 1; ++cz) {
         for (int32_t cx = -1; cx <= 1; ++cx) {
             for (int32_t cy = 0; cy <= 2; ++cy) {
                 gen.generate_chunk_from_density_fn(
-                    store, ChunkKey::from_coords(cx, cy, cz), grid34, plane_at(40.0f));
+                    edited_store, ChunkKey::from_coords(cx, cy, cz), grid34, plane_at(40.0f));
             }
         }
     }
-    REQUIRE(std::abs(voxel::sample_top_surface_y(store, gen, 16.0f, 16.0f) - 40.0f) <= 0.1f);
+    REQUIRE(std::abs(voxel::sample_top_surface_y(edited_store, gen, 16.0f, 16.0f) - 40.0f) <= 0.1f);
 
     // 3. Generator fallback: a column that was never streamed still answers within
     //    the +-3 m overhang envelope of the 2D generator height.
-    const float far_y = voxel::sample_top_surface_y(store, gen, 5000.0f, 5000.0f);
+    const float far_y = voxel::sample_top_surface_y(edited_store, gen, 5000.0f, 5000.0f);
     REQUIRE(std::abs(far_y - 68.0f) <= 3.5f);
 
     std::printf("[PASS] test_surface_height_query (resident plane 68 -> edited plane 40 -> fallback %.2f)\n",

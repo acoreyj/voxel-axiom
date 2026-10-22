@@ -23,6 +23,14 @@ config/features=PackedStringArray("4.7", "Forward Plus")
 PhantomCameraManager="*res://addons/phantom_camera/scripts/managers/phantom_camera_manager.gd"
 _mcp_game_helper="*res://addons/godot_ai/runtime/game_helper.gd"
 
+[display]
+
+window/size/viewport_width.movie=3840
+window/size/viewport_height.movie=2160
+window/size/window_width_override.movie=1280
+window/size/window_height_override.movie=720
+window/stretch/mode.movie="viewport"
+
 [dotnet]
 
 project/assembly_name="Voxel Engine v4.0 Cave & Destruction Demo"
@@ -34,3 +42,4 @@ enabled=PackedStringArray("res://addons/godot_ai/plugin.cfg", "res://addons/phan
 [rendering]
 
 anti_aliasing/quality/msaa_3d=2
+scaling_3d/scale.movie=1.0

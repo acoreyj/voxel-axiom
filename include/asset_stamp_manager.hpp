@@ -88,7 +88,8 @@ public:
         std::string asset_name = "ruin",
         const std::function<void(ChunkStore&, ChunkKey)>& ensure_chunk_ready_fn = {},
         std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash>* out_before_chunks = nullptr,
-        std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash>* out_after_chunks = nullptr) {
+        std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash>* out_after_chunks = nullptr,
+        ServerSlotManager* slot_mgr = nullptr) {
 
         std::lock_guard<std::mutex> lock(mutex_);
         const uint32_t struct_id = ++next_structure_id_;
@@ -257,7 +258,7 @@ public:
             *out_after_chunks = inst.baselines;
         }
 
-        publish_dirty_and_nav_update(store, dirty_scheduler, nav_mgr, unique_dirtied_chunks, affected_nav_groups);
+        publish_dirty_and_nav_update(store, dirty_scheduler, nav_mgr, unique_dirtied_chunks, affected_nav_groups, slot_mgr);
 
         structures_.emplace(struct_id, std::move(inst));
         return struct_id;
@@ -275,7 +276,8 @@ public:
         std::string asset_name = "",
         const std::function<void(ChunkStore&, ChunkKey)>& ensure_chunk_ready_fn = {},
         std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash>* out_before_chunks = nullptr,
-        std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash>* out_after_chunks = nullptr) {
+        std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash>* out_after_chunks = nullptr,
+        ServerSlotManager* slot_mgr = nullptr) {
 
         FILE* fp = std::fopen(vreg_filepath.c_str(), "rb");
         if (!fp) {
@@ -313,7 +315,7 @@ public:
 
         return stamp_region(store, dirty_scheduler, nav_mgr, region, origin_chunk,
                             recreate_delay_seconds, blend_mode, std::move(asset_name),
-                            ensure_chunk_ready_fn, out_before_chunks, out_after_chunks);
+                            ensure_chunk_ready_fn, out_before_chunks, out_after_chunks, slot_mgr);
     }
 
     /// Removes a previously stamped structure by `structure_id`, restoring every affected chunk
@@ -324,7 +326,8 @@ public:
         DualDirtyScheduler& dirty_scheduler,
         VoxelNavigationManager& nav_mgr,
         std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash>* out_before_chunks = nullptr,
-        std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash>* out_after_chunks = nullptr) {
+        std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash>* out_after_chunks = nullptr,
+        ServerSlotManager* slot_mgr = nullptr) {
 
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = structures_.find(structure_id);
@@ -352,7 +355,7 @@ public:
                 store, ck, unique_dirtied_chunks, affected_nav_groups);
         }
 
-        publish_dirty_and_nav_update(store, dirty_scheduler, nav_mgr, unique_dirtied_chunks, affected_nav_groups);
+        publish_dirty_and_nav_update(store, dirty_scheduler, nav_mgr, unique_dirtied_chunks, affected_nav_groups, slot_mgr);
 
         if (on_structure_removed_) {
             on_structure_removed_(inst.id, inst.name);
@@ -386,7 +389,8 @@ public:
         float delta_seconds,
         ChunkStore& store,
         DualDirtyScheduler& dirty_scheduler,
-        VoxelNavigationManager& nav_mgr) {
+        VoxelNavigationManager& nav_mgr,
+        ServerSlotManager* slot_mgr = nullptr) {
 
         std::lock_guard<std::mutex> lock(mutex_);
         std::vector<uint32_t> recreated_ids;
@@ -412,7 +416,7 @@ public:
                 }
 
                 publish_dirty_and_nav_update(
-                    store, dirty_scheduler, nav_mgr, unique_dirtied_chunks, affected_nav_groups);
+                    store, dirty_scheduler, nav_mgr, unique_dirtied_chunks, affected_nav_groups, slot_mgr);
 
                 inst.is_damaged = false;
                 inst.time_since_damaged = 0.0f;
@@ -465,6 +469,7 @@ public:
                 const int32_t ny = ck.y() + dy;
                 if (ny < 0 || ny >= world_h) continue;
                 for (int32_t dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0 && dz == 0) continue;
                     const ChunkKey nk = ck.offset(dx, dy, dz);
                     if (store.find_slot(nk) != nullptr) {
                         unique_dirtied.insert(nk);
@@ -480,7 +485,8 @@ public:
         DualDirtyScheduler& dirty_scheduler,
         VoxelNavigationManager& nav_mgr,
         const std::unordered_set<ChunkKey, ChunkKeyHash>& unique_dirtied_chunks,
-        const std::unordered_set<NavigationGroupKey, NavigationGroupKeyHash>& affected_nav_groups) {
+        const std::unordered_set<NavigationGroupKey, NavigationGroupKeyHash>& affected_nav_groups,
+        ServerSlotManager* slot_mgr = nullptr) {
         if (unique_dirtied_chunks.empty()) {
             return;
         }
@@ -488,15 +494,19 @@ public:
         std::sort(dirtied_chunks.begin(), dirtied_chunks.end());
 
         const uint64_t new_rev = store.increment_terrain_revision();
-        dirty_scheduler.publish_edit_transaction_dirty_batch(dirtied_chunks);
+        if (slot_mgr != nullptr) {
+            slot_mgr->register_edit_batch(new_rev, dirtied_chunks);
+        }
 
         EditTransactionCompletedPayload payload{};
         payload.terrain_revision = new_rev;
         payload.total_affected_chunks = dirtied_chunks.size();
-        payload.dirtied_chunks = std::move(dirtied_chunks);
+        payload.dirtied_chunks = dirtied_chunks;
         payload.affected_nav_groups.assign(affected_nav_groups.begin(), affected_nav_groups.end());
         std::sort(payload.affected_nav_groups.begin(), payload.affected_nav_groups.end());
         nav_mgr.apply_edit_transaction(payload);
+
+        dirty_scheduler.publish_edit_transaction_dirty_batch(dirtied_chunks);
     }
 
 private:
@@ -581,7 +591,8 @@ public:
         VoxelNavigationManager& nav_mgr,
         AssetStampManager& stamp_mgr,
         RegionSaveManager* save_mgr = nullptr,
-        std::size_t* out_affected_chunks = nullptr) {
+        std::size_t* out_affected_chunks = nullptr,
+        ServerSlotManager* slot_mgr = nullptr) {
 
         UndoRedoEntry entry{};
         {
@@ -596,7 +607,7 @@ public:
 
         const std::size_t affected = apply_chunk_map_and_stamps(
             store, dirty_scheduler, nav_mgr, stamp_mgr, save_mgr,
-            entry.before_chunks, entry.stamps_before);
+            entry.before_chunks, entry.stamps_before, slot_mgr);
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -614,7 +625,8 @@ public:
         VoxelNavigationManager& nav_mgr,
         AssetStampManager& stamp_mgr,
         RegionSaveManager* save_mgr = nullptr,
-        std::size_t* out_affected_chunks = nullptr) {
+        std::size_t* out_affected_chunks = nullptr,
+        ServerSlotManager* slot_mgr = nullptr) {
 
         UndoRedoEntry entry{};
         {
@@ -629,7 +641,7 @@ public:
 
         const std::size_t affected = apply_chunk_map_and_stamps(
             store, dirty_scheduler, nav_mgr, stamp_mgr, save_mgr,
-            entry.after_chunks, entry.stamps_after);
+            entry.after_chunks, entry.stamps_after, slot_mgr);
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -652,7 +664,8 @@ public:
         VoxelNavigationManager& nav_mgr,
         AssetStampManager& stamp_mgr,
         RegionSaveManager* save_mgr = nullptr,
-        std::size_t* out_affected_chunks = nullptr) {
+        std::size_t* out_affected_chunks = nullptr,
+        ServerSlotManager* slot_mgr = nullptr) {
 
         std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash> coalesced_before;
         AssetStampManager::ManagerSnapshot earliest_stamps{};
@@ -681,7 +694,7 @@ public:
 
         const std::size_t affected = apply_chunk_map_and_stamps(
             store, dirty_scheduler, nav_mgr, stamp_mgr, save_mgr,
-            coalesced_before, earliest_stamps);
+            coalesced_before, earliest_stamps, slot_mgr);
 
         if (out_affected_chunks) {
             *out_affected_chunks = affected;
@@ -696,7 +709,8 @@ public:
         VoxelNavigationManager& nav_mgr,
         AssetStampManager& stamp_mgr,
         RegionSaveManager* save_mgr = nullptr,
-        std::size_t* out_affected_chunks = nullptr) {
+        std::size_t* out_affected_chunks = nullptr,
+        ServerSlotManager* slot_mgr = nullptr) {
 
         std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash> coalesced_after;
         AssetStampManager::ManagerSnapshot latest_stamps{};
@@ -725,7 +739,7 @@ public:
 
         const std::size_t affected = apply_chunk_map_and_stamps(
             store, dirty_scheduler, nav_mgr, stamp_mgr, save_mgr,
-            coalesced_after, latest_stamps);
+            coalesced_after, latest_stamps, slot_mgr);
 
         if (out_affected_chunks) {
             *out_affected_chunks = affected;
@@ -741,7 +755,8 @@ private:
         AssetStampManager& stamp_mgr,
         RegionSaveManager* save_mgr,
         const std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash>& chunk_map,
-        const AssetStampManager::ManagerSnapshot& stamps_snap) {
+        const AssetStampManager::ManagerSnapshot& stamps_snap,
+        ServerSlotManager* slot_mgr = nullptr) {
 
         std::unordered_set<ChunkKey, ChunkKeyHash> unique_dirtied_chunks;
         std::unordered_set<NavigationGroupKey, NavigationGroupKeyHash> affected_nav_groups;
@@ -770,7 +785,7 @@ private:
 
         stamp_mgr.restore_manager_snapshot(stamps_snap);
         AssetStampManager::publish_dirty_and_nav_update(
-            store, dirty_scheduler, nav_mgr, unique_dirtied_chunks, affected_nav_groups);
+            store, dirty_scheduler, nav_mgr, unique_dirtied_chunks, affected_nav_groups, slot_mgr);
         return sorted_keys.size();
     }
 

@@ -241,6 +241,12 @@ struct CaveNoiseGenerator {
 
         ChunkSlot* slot = store.get_or_create_slot(chunk_key);
         std::unique_lock<std::shared_mutex> lock(slot->mutex);
+        // Race guard: an edit transaction may have initialized and carved this chunk
+        // while the background stream worker was still generating its density grid.
+        // Never overwrite a slot that is already Resident.
+        if (slot->state == ChunkLifecycleState::Resident) {
+            return;
+        }
         slot->reset_to_uniform(ChunkStorageForm::Solid, base_material, store.tsdf_pool(), store.material_pool());
         REQUIRE_OR_ASSERT(slot->promote_to_dense(store.tsdf_pool()));
 

@@ -1,0 +1,1305 @@
+﻿{
+    "fps":  60,
+    "shots":  {
+                  "overture_blast":  {
+                                         "mode":  "fly",
+                                         "fps":  60,
+                                         "duration":  2.6,
+                                         "lead":  0.20,
+                                         "tail":  0.20,
+                                         "camera_path":  [
+                                                             {
+                                                                 "t":  0.0,
+                                                                 "pos":  [
+                                                                             24.0,
+                                                                             108.0,
+                                                                             48.0
+                                                                         ],
+                                                                 "look":  [
+                                                                              42.0,
+                                                                              80.0,
+                                                                              8.0
+                                                                          ],
+                                                                 "fov":  58.0
+                                                             },
+                                                             {
+                                                                 "t":  2.6,
+                                                                 "pos":  [
+                                                                             34.0,
+                                                                             98.0,
+                                                                             28.0
+                                                                         ],
+                                                                 "look":  [
+                                                                              42.0,
+                                                                              78.0,
+                                                                              8.0
+                                                                          ],
+                                                                 "fov":  62.0
+                                                             }
+                                                         ],
+                                         "events":  [
+                                                        {
+                                                            "t":  0.08,
+                                                            "action":  "large_explode",
+                                                            "target":  {
+                                                                           "ground":  [
+                                                                                          42.0,
+                                                                                          8.0
+                                                                                      ]
+                                                                       },
+                                                            "radius":  18.0
+                                                        },
+                                                        {
+                                                            "t":  0.15,
+                                                            "action":  "shake",
+                                                            "time":  0.35,
+                                                            "amplitude":  0.22
+                                                        }
+                                                    ]
+                                     },
+                  "overture_surface":  {
+                                           "mode":  "fly",
+                                           "fps":  60,
+                                           "duration":  2.5,
+                                           "lead":  0.20,
+                                           "tail":  0.20,
+                                           "camera_path":  [
+                                                               {
+                                                                   "t":  0.0,
+                                                                   "pos":  [
+                                                                               44.0,
+                                                                               80.0,
+                                                                               28.0
+                                                                           ],
+                                                                   "look":  [
+                                                                                30.0,
+                                                                                72.0,
+                                                                                4.0
+                                                                            ],
+                                                                   "fov":  55.0
+                                                               },
+                                                               {
+                                                                   "t":  2.5,
+                                                                   "pos":  [
+                                                                               38.0,
+                                                                               76.0,
+                                                                               12.0
+                                                                           ],
+                                                                   "look":  [
+                                                                                20.0,
+                                                                                71.0,
+                                                                                -6.0
+                                                                            ],
+                                                                   "fov":  60.0
+                                                               }
+                                                           ],
+                                           "events":  [
+
+                                                      ]
+                                       },
+                  "overture_cave":  {
+                                        "mode":  "fly",
+                                        "fps":  60,
+                                        "duration":  2.8,
+                                        "lead":  0.20,
+                                        "tail":  0.20,
+                                        "cave_set":  true,
+                                        "camera_path":  [
+                                                            {
+                                                                "t":  0,
+                                                                "pos":  "cave:inside_start",
+                                                                "look":  "cave:inside_mid",
+                                                                "fov":  72
+                                                            },
+                                                            {
+                                                                "t":  2.8,
+                                                                "pos":  "cave:inside_mid",
+                                                                "look":  "cave:inside_end",
+                                                                "fov":  68
+                                                            }
+                                                        ],
+                                        "events":  [
+
+                                                   ],
+                                        "headlamp":  true
+                                    },
+                  "play_soil":  {
+                                    "mode":  "play",
+                                    "fps":  60,
+                                    "duration":  2.25,
+                                    "lead":  0.20,
+                                    "tail":  0.20,
+                                    "material_bay":  true,
+                                    "play":  {
+                                                 "stand":  [
+                                                               7.0,
+                                                               54.5
+                                                           ],
+                                                 "look_at":  "material:soil",
+                                                 "fov":  75.0
+                                             },
+                                    "events":  [
+                                                   {
+                                                       "t":  0,
+                                                       "action":  "target_dot",
+                                                       "visible":  true
+                                                   },
+                                                   {
+                                                       "t":  0.15,
+                                                       "action":  "aim",
+                                                       "target":  "material:soil"
+                                                   },
+                                                   {
+                                                       "t":  0.25,
+                                                       "action":  "swing"
+                                                   }
+                                               ],
+                                    "target_dot":  true
+                                },
+                  "play_hardrock":  {
+                                        "mode":  "play",
+                                        "fps":  60,
+                                        "duration":  3.2,
+                                        "lead":  0.15,
+                                        "tail":  0.20,
+                                        "material_bay":  true,
+                                        "play":  {
+                                                     "stand":  [
+                                                                   11.5,
+                                                                   54.5
+                                                               ],
+                                                     "look_at":  "material:hard_rock",
+                                                     "fov":  75.0
+                                                 },
+                                        "events":  [
+                                                       {
+                                                           "t":  0,
+                                                           "action":  "target_dot",
+                                                           "visible":  true
+                                                       },
+                                                       {
+                                                           "t":  0.10,
+                                                           "action":  "aim",
+                                                           "target":  "material:hard_rock"
+                                                       },
+                                                       {
+                                                           "t":  0.20,
+                                                           "action":  "swing"
+                                                       },
+                                                       {
+                                                           "t":  0.85,
+                                                           "action":  "swing"
+                                                       },
+                                                       {
+                                                           "t":  1.50,
+                                                           "action":  "swing"
+                                                       }
+                                                   ],
+                                        "target_dot":  true
+                                    },
+                  "play_boulder":  {
+                                       "mode":  "play",
+                                       "fps":  60,
+                                       "duration":  3.6,
+                                       "lead":  0.15,
+                                       "tail":  0.20,
+                                       "material_bay":  true,
+                                       "play":  {
+                                                    "stand":  [
+                                                                  16.0,
+                                                                  54.5
+                                                              ],
+                                                    "look_at":  "material:boulder",
+                                                    "fov":  75.0
+                                                },
+                                       "events":  [
+                                                      {
+                                                          "t":  0,
+                                                          "action":  "target_dot",
+                                                          "visible":  true
+                                                      },
+                                                      {
+                                                          "t":  0.10,
+                                                          "action":  "aim",
+                                                          "target":  "material:boulder"
+                                                      },
+                                                      {
+                                                          "t":  0.20,
+                                                          "action":  "swing"
+                                                      },
+                                                      {
+                                                          "t":  0.78,
+                                                          "action":  "swing"
+                                                      },
+                                                      {
+                                                          "t":  1.36,
+                                                          "action":  "swing"
+                                                      },
+                                                      {
+                                                          "t":  1.94,
+                                                          "action":  "swing"
+                                                      },
+                                                      {
+                                                          "t":  2.52,
+                                                          "action":  "swing"
+                                                      }
+                                                  ],
+                                       "target_dot":  true
+                                   },
+                  "play_obsidian":  {
+                                        "mode":  "play",
+                                        "fps":  60,
+                                        "duration":  2.6,
+                                        "lead":  0.15,
+                                        "tail":  0.20,
+                                        "material_bay":  true,
+                                        "play":  {
+                                                     "stand":  [
+                                                                   20.5,
+                                                                   54.5
+                                                               ],
+                                                     "look_at":  "material:obsidian",
+                                                     "fov":  75.0
+                                                 },
+                                        "events":  [
+                                                       {
+                                                           "t":  0,
+                                                           "action":  "target_dot",
+                                                           "visible":  true
+                                                       },
+                                                       {
+                                                           "t":  0.10,
+                                                           "action":  "aim",
+                                                           "target":  "material:obsidian"
+                                                       },
+                                                       {
+                                                           "t":  0.20,
+                                                           "action":  "swing"
+                                                       },
+                                                       {
+                                                           "t":  0.85,
+                                                           "action":  "swing"
+                                                       },
+                                                       {
+                                                           "t":  1.50,
+                                                           "action":  "swing"
+                                                       }
+                                                   ],
+                                        "target_dot":  true
+                                    },
+                  "play_ice":  {
+                                   "mode":  "play",
+                                   "fps":  60,
+                                   "duration":  1.7,
+                                   "lead":  0.15,
+                                   "tail":  0.20,
+                                   "material_bay":  true,
+                                   "play":  {
+                                                "stand":  [
+                                                              25.0,
+                                                              54.5
+                                                          ],
+                                                "look_at":  "material:ice",
+                                                "fov":  75.0
+                                            },
+                                   "events":  [
+                                                  {
+                                                      "t":  0,
+                                                      "action":  "target_dot",
+                                                      "visible":  true
+                                                  },
+                                                  {
+                                                      "t":  0.10,
+                                                      "action":  "aim",
+                                                      "target":  "material:ice"
+                                                  },
+                                                  {
+                                                      "t":  0.20,
+                                                      "action":  "swing"
+                                                  }
+                                              ],
+                                   "target_dot":  true
+                               },
+                  "play_statue_wide":  {
+                                           "mode":  "play",
+                                           "fps":  60,
+                                           "duration":  2.8,
+                                           "lead":  0.25,
+                                           "tail":  0.25,
+                                           "play":  {
+                                                        "stand":  [
+                                                                      0.0,
+                                                                      62.0
+                                                                  ],
+                                                        "look_at":  [
+                                                                        0.0,
+                                                                        94.0,
+                                                                        0.0
+                                                                    ],
+                                                        "fov":  72.0
+                                                    },
+                                           "events":  [
+                                                          {
+                                                              "t":  0,
+                                                              "action":  "target_dot",
+                                                              "visible":  true
+                                                          }
+                                                      ]
+                                       },
+                  "play_statue_swap":  {
+                                           "mode":  "play",
+                                           "fps":  120,
+                                           "duration":  3.6,
+                                           "lead":  0.20,
+                                           "tail":  0.25,
+                                           "play":  {
+                                                        "stand":  [
+                                                                      -16.0,
+                                                                      52.0
+                                                                  ],
+                                                        "look_at":  "statue:easter_opt1",
+                                                        "fov":  70.0
+                                                    },
+                                           "events":  [
+                                                          {
+                                                              "t":  0,
+                                                              "action":  "target_dot",
+                                                              "visible":  true
+                                                          },
+                                                          {
+                                                              "t":  0.18,
+                                                              "action":  "aim",
+                                                              "target":  "statue:easter_opt1"
+                                                          },
+                                                          {
+                                                              "t":  0.35,
+                                                              "action":  "swing"
+                                                          }
+                                                      ],
+                                           "target_dot":  true
+                                       },
+                  "play_statue_recon":  {
+                                            "mode":  "play",
+                                            "fps":  60,
+                                            "duration":  20.5,
+                                            "lead":  0.30,
+                                            "tail":  0.30,
+                                            "play":  {
+                                                         "stand":  [
+                                                                       16.0,
+                                                                       52.0
+                                                                   ],
+                                                         "look_at":  "statue:easter_opt2",
+                                                         "fov":  70.0
+                                                     },
+                                            "events":  [
+                                                           {
+                                                               "t":  0,
+                                                               "action":  "target_dot",
+                                                               "visible":  true
+                                                           },
+                                                           {
+                                                               "t":  0.30,
+                                                               "action":  "aim",
+                                                               "target":  "statue:easter_opt2"
+                                                           },
+                                                           {
+                                                               "t":  0.45,
+                                                               "action":  "swing"
+                                                           },
+                                                           {
+                                                               "t":  1.10,
+                                                               "action":  "swing"
+                                                           },
+                                                           {
+                                                               "t":  1.75,
+                                                               "action":  "swing"
+                                                           }
+                                                       ],
+                                            "target_dot":  true
+                                        },
+                  "fly_stream":  {
+                                     "mode":  "fly",
+                                     "fps":  60,
+                                     "duration":  2.8,
+                                     "lead":  0.20,
+                                     "tail":  0.20,
+                                     "camera_path":  [
+                                                         {
+                                                             "t":  0.0,
+                                                             "pos":  [
+                                                                         0.0,
+                                                                         112.0,
+                                                                         48.0
+                                                                     ],
+                                                             "look":  [
+                                                                          0.0,
+                                                                          88.0,
+                                                                          -20.0
+                                                                      ],
+                                                             "fov":  62.0
+                                                         },
+                                                         {
+                                                             "t":  2.8,
+                                                             "pos":  [
+                                                                         0.0,
+                                                                         92.0,
+                                                                         -72.0
+                                                                     ],
+                                                             "look":  [
+                                                                          0.0,
+                                                                          80.0,
+                                                                          -130.0
+                                                                      ],
+                                                             "fov":  68.0
+                                                         }
+                                                     ],
+                                     "events":  [
+
+                                                ]
+                                 },
+                  "fly_surface":  {
+                                      "mode":  "fly",
+                                      "fps":  60,
+                                      "duration":  2.6,
+                                      "lead":  0.20,
+                                      "tail":  0.20,
+                                      "camera_path":  [
+                                                          {
+                                                              "t":  0.0,
+                                                              "pos":  [
+                                                                          48.0,
+                                                                          78.0,
+                                                                          24.0
+                                                                      ],
+                                                              "look":  [
+                                                                           60.0,
+                                                                           72.0,
+                                                                           4.0
+                                                                       ],
+                                                              "fov":  52.0
+                                                          },
+                                                          {
+                                                              "t":  2.6,
+                                                              "pos":  [
+                                                                          52.0,
+                                                                          75.0,
+                                                                          10.0
+                                                                      ],
+                                                              "look":  [
+                                                                           64.0,
+                                                                           71.0,
+                                                                           -8.0
+                                                                       ],
+                                                              "fov":  58.0
+                                                          }
+                                                      ],
+                                      "events":  [
+
+                                                 ]
+                                  },
+                  "fly_cave":  {
+                                   "mode":  "fly",
+                                   "fps":  60,
+                                   "duration":  3.2,
+                                   "lead":  0.20,
+                                   "tail":  0.20,
+                                   "cave_set":  true,
+                                   "camera_path":  [
+                                                       {
+                                                           "t":  0,
+                                                           "pos":  "cave:inside_start",
+                                                           "look":  "cave:inside_mid",
+                                                           "fov":  72
+                                                       },
+                                                       {
+                                                           "t":  3.2,
+                                                           "pos":  "cave:inside_mid",
+                                                           "look":  "cave:inside_end",
+                                                           "fov":  66
+                                                       }
+                                                   ],
+                                   "events":  [
+
+                                              ],
+                                   "headlamp":  true
+                               },
+                  "fly_destruction":  {
+                                          "mode":  "fly",
+                                          "fps":  60,
+                                          "duration":  2.9,
+                                          "lead":  0.20,
+                                          "tail":  0.20,
+                                          "camera_path":  [
+                                                              {
+                                                                  "t":  0.0,
+                                                                  "pos":  [
+                                                                              28.0,
+                                                                              104.0,
+                                                                              44.0
+                                                                          ],
+                                                                  "look":  [
+                                                                               42.0,
+                                                                               80.0,
+                                                                               8.0
+                                                                           ],
+                                                                  "fov":  62.0
+                                                              },
+                                                              {
+                                                                  "t":  2.9,
+                                                                  "pos":  [
+                                                                              38.0,
+                                                                              92.0,
+                                                                              22.0
+                                                                          ],
+                                                                  "look":  [
+                                                                               42.0,
+                                                                               76.0,
+                                                                               8.0
+                                                                           ],
+                                                                  "fov":  68.0
+                                                              }
+                                                          ],
+                                          "events":  [
+                                                         {
+                                                             "t":  0.30,
+                                                             "action":  "large_explode",
+                                                             "target":  {
+                                                                            "ground":  [
+                                                                                           42.0,
+                                                                                           8.0
+                                                                                       ]
+                                                                        },
+                                                             "radius":  18.0
+                                                         },
+                                                         {
+                                                             "t":  0.36,
+                                                             "action":  "shake",
+                                                             "time":  0.45,
+                                                             "amplitude":  0.28
+                                                         }
+                                                     ],
+                                          "target_dot":  true
+                                      },
+                  "fly_water":  {
+                                    "mode":  "fly",
+                                    "fps":  60,
+                                    "duration":  4.2,
+                                    "lead":  0.20,
+                                    "tail":  0.20,
+                                    "pre_actions":  [
+
+                                                    ],
+                                    "camera_path":  [
+                                                        {
+                                                            "t":  0,
+                                                            "pos":  [
+                                                                        60,
+                                                                        80,
+                                                                        54
+                                                                    ],
+                                                            "look":  [
+                                                                         60,
+                                                                         70,
+                                                                         40
+                                                                     ],
+                                                            "fov":  46
+                                                        },
+                                                        {
+                                                            "t":  4.2,
+                                                            "pos":  [
+                                                                        60,
+                                                                        78,
+                                                                        49
+                                                                    ],
+                                                            "look":  [
+                                                                         60,
+                                                                         70,
+                                                                         40
+                                                                     ],
+                                                            "fov":  42
+                                                        }
+                                                    ],
+                                    "events":  [
+                                                   {
+                                                       "t":  0.2,
+                                                       "action":  "set_tool",
+                                                       "tool":  "lava",
+                                                       "label":  "LAVA / MAGMA",
+                                                       "key":  "0",
+                                                       "color":  [
+                                                                     1,
+                                                                     0.35,
+                                                                     0.08,
+                                                                     1
+                                                                 ]
+                                                   },
+                                                   {
+                                                       "t":  0.35,
+                                                       "action":  "add_material",
+                                                       "target":  {
+                                                                      "ground":  [
+                                                                                     60,
+                                                                                     40
+                                                                                 ],
+                                                                      "y_offset":  3
+                                                                  },
+                                                       "radius":  6.5,
+                                                       "material":  3
+                                                   },
+                                                   {
+                                                       "t":  1.2,
+                                                       "action":  "set_tool",
+                                                       "tool":  "water",
+                                                       "label":  "WATER QUENCH",
+                                                       "key":  "8",
+                                                       "color":  [
+                                                                     0.22,
+                                                                     0.52,
+                                                                     0.95,
+                                                                     1
+                                                                 ]
+                                                   },
+                                                   {
+                                                       "t":  1.35,
+                                                       "action":  "elemental",
+                                                       "target":  {
+                                                                      "ground":  [
+                                                                                     60,
+                                                                                     40
+                                                                                 ],
+                                                                      "y_offset":  3
+                                                                  },
+                                                       "radius":  8.5,
+                                                       "element":  1
+                                                   },
+                                                   {
+                                                       "t":  2.7,
+                                                       "action":  "set_tool",
+                                                       "label":  "OBSIDIAN",
+                                                       "key":  "",
+                                                       "color":  [
+                                                                     0.06,
+                                                                     0.05,
+                                                                     0.11,
+                                                                     1
+                                                                 ]
+                                                   }
+                                               ],
+                                    "target_dot":  true,
+                                    "tool_ui":  true
+                                },
+                  "fly_frost":  {
+                                    "mode":  "fly",
+                                    "fps":  60,
+                                    "duration":  4.2,
+                                    "lead":  0.20,
+                                    "tail":  0.20,
+                                    "pre_actions":  [
+
+                                                    ],
+                                    "camera_path":  [
+                                                        {
+                                                            "t":  0,
+                                                            "pos":  [
+                                                                        72,
+                                                                        78,
+                                                                        36
+                                                                    ],
+                                                            "look":  [
+                                                                         72,
+                                                                         60,
+                                                                         20
+                                                                     ],
+                                                            "fov":  46
+                                                        },
+                                                        {
+                                                            "t":  4.2,
+                                                            "pos":  [
+                                                                        72,
+                                                                        76,
+                                                                        31
+                                                                    ],
+                                                            "look":  [
+                                                                         72,
+                                                                         60,
+                                                                         20
+                                                                     ],
+                                                            "fov":  42
+                                                        }
+                                                    ],
+                                    "events":  [
+                                                   {
+                                                       "t":  0.2,
+                                                       "action":  "set_tool",
+                                                       "tool":  "water",
+                                                       "label":  "WATER",
+                                                       "key":  "8",
+                                                       "color":  [
+                                                                     0.1,
+                                                                     0.45,
+                                                                     0.85,
+                                                                     1
+                                                                 ]
+                                                   },
+                                                   {
+                                                       "t":  0.35,
+                                                       "action":  "add_material",
+                                                       "target":  {
+                                                                      "ground":  [
+                                                                                     72,
+                                                                                     20
+                                                                                 ],
+                                                                      "y_offset":  2
+                                                                  },
+                                                       "radius":  6,
+                                                       "material":  4
+                                                   },
+                                                   {
+                                                       "t":  1.2,
+                                                       "action":  "set_tool",
+                                                       "tool":  "frost",
+                                                       "label":  "FROST / ICE",
+                                                       "key":  "9",
+                                                       "color":  [
+                                                                     0.62,
+                                                                     0.88,
+                                                                     0.98,
+                                                                     1
+                                                                 ]
+                                                   },
+                                                   {
+                                                       "t":  1.35,
+                                                       "action":  "elemental",
+                                                       "target":  {
+                                                                      "ground":  [
+                                                                                     72,
+                                                                                     20
+                                                                                 ],
+                                                                      "y_offset":  2
+                                                                  },
+                                                       "radius":  8.5,
+                                                       "element":  2
+                                                   },
+                                                   {
+                                                       "t":  2.7,
+                                                       "action":  "set_tool",
+                                                       "label":  "ICE BRIDGE",
+                                                       "key":  "",
+                                                       "color":  [
+                                                                     0.62,
+                                                                     0.88,
+                                                                     0.98,
+                                                                     1
+                                                                 ]
+                                                   }
+                                               ],
+                                    "target_dot":  true,
+                                    "tool_ui":  true
+                                },
+                  "fly_lava":  {
+                                   "mode":  "fly",
+                                   "fps":  60,
+                                   "duration":  4.2,
+                                   "lead":  0.20,
+                                   "tail":  0.20,
+                                   "pre_actions":  [
+                                                       {
+                                                           "action":  "add_material",
+                                                           "target":  {
+                                                                          "ground":  [
+                                                                                         84,
+                                                                                         40
+                                                                                     ],
+                                                                          "y_offset":  3
+                                                                      },
+                                                           "radius":  6.5,
+                                                           "material":  6,
+                                                           "delay":  0.9
+                                                       }
+                                                   ],
+                                   "camera_path":  [
+                                                       {
+                                                           "t":  0,
+                                                           "pos":  [
+                                                                       84,
+                                                                       80,
+                                                                       54
+                                                                   ],
+                                                           "look":  [
+                                                                        84,
+                                                                        69,
+                                                                        40
+                                                                    ],
+                                                           "fov":  46
+                                                       },
+                                                       {
+                                                           "t":  4.2,
+                                                           "pos":  [
+                                                                       84,
+                                                                       78,
+                                                                       49
+                                                                   ],
+                                                           "look":  [
+                                                                        84,
+                                                                        69,
+                                                                        40
+                                                                    ],
+                                                           "fov":  42
+                                                       }
+                                                   ],
+                                   "events":  [
+                                                  {
+                                                      "t":  0.2,
+                                                      "action":  "set_tool",
+                                                      "label":  "ICE",
+                                                      "key":  "",
+                                                      "color":  [
+                                                                    0.62,
+                                                                    0.88,
+                                                                    0.98,
+                                                                    1
+                                                                ]
+                                                  },
+                                                  {
+                                                      "t":  1,
+                                                      "action":  "set_tool",
+                                                      "tool":  "lava",
+                                                      "label":  "LAVA / MAGMA",
+                                                      "key":  "0",
+                                                      "color":  [
+                                                                    1,
+                                                                    0.35,
+                                                                    0.08,
+                                                                    1
+                                                                ]
+                                                  },
+                                                  {
+                                                      "t":  1.15,
+                                                      "action":  "elemental",
+                                                      "target":  {
+                                                                     "ground":  [
+                                                                                    84,
+                                                                                    40
+                                                                                ],
+                                                                     "y_offset":  3
+                                                                 },
+                                                      "radius":  8.5,
+                                                      "element":  3
+                                                  },
+                                                  {
+                                                      "t":  2.7,
+                                                      "action":  "set_tool",
+                                                      "label":  "ICE -\u003e LAVA / AIR",
+                                                      "key":  "",
+                                                      "color":  [
+                                                                    1,
+                                                                    0.45,
+                                                                    0.12,
+                                                                    1
+                                                                ]
+                                                  }
+                                              ],
+                                   "target_dot":  true,
+                                   "tool_ui":  true
+                               },
+                  "fly_nav":  {
+                                  "mode":  "fly",
+                                  "fps":  60,
+                                  "duration":  4.2,
+                                  "lead":  0.20,
+                                  "tail":  0.20,
+                                  "wait_path":  true,
+                                  "pre_actions":  [
+                                                      {
+                                                          "action":  "explode",
+                                                          "target":  {
+                                                                         "ground":  [
+                                                                                        4.0,
+                                                                                        20.0
+                                                                                    ]
+                                                                     },
+                                                          "radius":  3.0,
+                                                          "delay":  0.8
+                                                      },
+                                                      {
+                                                          "action":  "explode",
+                                                          "target":  {
+                                                                         "ground":  [
+                                                                                        28.0,
+                                                                                        20.0
+                                                                                    ]
+                                                                     },
+                                                          "radius":  3.0,
+                                                          "delay":  0.8
+                                                      },
+                                                      {
+                                                          "action":  "place_companion",
+                                                          "target":  {
+                                                                         "ground":  [
+                                                                                        4.0,
+                                                                                        20.0
+                                                                                    ],
+                                                                         "y_offset":  0.2
+                                                                     },
+                                                          "delay":  0.2
+                                                      },
+                                                      {
+                                                          "action":  "path_goal",
+                                                          "target":  {
+                                                                         "ground":  [
+                                                                                        28.0,
+                                                                                        20.0
+                                                                                    ],
+                                                                         "y_offset":  0.2
+                                                                     },
+                                                          "delay":  0.2
+                                                      }
+                                                  ],
+                                  "camera_path":  [
+                                                      {
+                                                          "t":  0.0,
+                                                          "pos":  [
+                                                                      16.0,
+                                                                      96.0,
+                                                                      44.0
+                                                                  ],
+                                                          "look":  [
+                                                                       16.0,
+                                                                       76.0,
+                                                                       16.0
+                                                                   ],
+                                                          "fov":  62.0
+                                                      },
+                                                      {
+                                                          "t":  4.2,
+                                                          "pos":  [
+                                                                      16.0,
+                                                                      88.0,
+                                                                      26.0
+                                                                  ],
+                                                          "look":  [
+                                                                       16.0,
+                                                                       74.0,
+                                                                       16.0
+                                                                   ],
+                                                          "fov":  68.0
+                                                      }
+                                                  ],
+                                  "events":  [
+
+                                             ]
+                              },
+                  "fly_persist_a":  {
+                                        "mode":  "fly",
+                                        "fps":  60,
+                                        "duration":  3.2,
+                                        "lead":  0.20,
+                                        "tail":  0.20,
+                                        "save_on_finish":  true,
+                                        "camera_path":  [
+                                                            {
+                                                                "t":  0.0,
+                                                                "pos":  [
+                                                                            56.0,
+                                                                            98.0,
+                                                                            36.0
+                                                                        ],
+                                                                "look":  [
+                                                                             56.0,
+                                                                             78.0,
+                                                                             8.0
+                                                                         ],
+                                                                "fov":  60.0
+                                                            }
+                                                        ],
+                                        "events":  [
+                                                       {
+                                                           "t":  0.20,
+                                                           "action":  "large_explode",
+                                                           "target":  {
+                                                                          "ground":  [
+                                                                                         56.0,
+                                                                                         8.0
+                                                                                     ]
+                                                                      },
+                                                           "radius":  14.0
+                                                       },
+                                                       {
+                                                           "t":  1.10,
+                                                           "action":  "save"
+                                                       }
+                                                   ],
+                                        "target_dot":  true
+                                    },
+                  "fly_persist_b":  {
+                                        "mode":  "fly",
+                                        "fps":  60,
+                                        "duration":  2.8,
+                                        "lead":  0.20,
+                                        "tail":  0.20,
+                                        "reset_baseline":  false,
+                                        "camera_path":  [
+                                                            {
+                                                                "t":  0.0,
+                                                                "pos":  [
+                                                                            56.0,
+                                                                            98.0,
+                                                                            36.0
+                                                                        ],
+                                                                "look":  [
+                                                                             56.0,
+                                                                             78.0,
+                                                                             8.0
+                                                                         ],
+                                                                "fov":  60.0
+                                                            }
+                                                        ],
+                                        "events":  [
+
+                                                   ],
+                                        "target_dot":  true
+                                    },
+                  "fly_stamp":  {
+                                    "mode":  "fly",
+                                    "fps":  60,
+                                    "duration":  3.2,
+                                    "lead":  0.20,
+                                    "tail":  0.20,
+                                    "camera_path":  [
+                                                        {
+                                                            "t":  0.0,
+                                                            "pos":  [
+                                                                        30.0,
+                                                                        100.0,
+                                                                        34.0
+                                                                    ],
+                                                            "look":  [
+                                                                         16.0,
+                                                                         92.0,
+                                                                         0.0
+                                                                     ],
+                                                            "fov":  58.0
+                                                        },
+                                                        {
+                                                            "t":  3.2,
+                                                            "pos":  [
+                                                                        2.0,
+                                                                        100.0,
+                                                                        34.0
+                                                                    ],
+                                                            "look":  [
+                                                                         16.0,
+                                                                         92.0,
+                                                                         0.0
+                                                                     ],
+                                                            "fov":  58.0
+                                                        }
+                                                    ],
+                                    "events":  [
+
+                                               ]
+                                },
+                  "debug_xray":  {
+                                     "mode":  "fly",
+                                     "fps":  60,
+                                     "duration":  2.8,
+                                     "lead":  0.20,
+                                     "tail":  0.20,
+                                     "camera_path":  [
+                                                         {
+                                                             "t":  0.0,
+                                                             "pos":  [
+                                                                         0.0,
+                                                                         108.0,
+                                                                         38.0
+                                                                     ],
+                                                             "look":  [
+                                                                          0.0,
+                                                                          84.0,
+                                                                          -20.0
+                                                                      ],
+                                                             "fov":  62.0
+                                                         },
+                                                         {
+                                                             "t":  2.8,
+                                                             "pos":  [
+                                                                         0.0,
+                                                                         98.0,
+                                                                         18.0
+                                                                     ],
+                                                             "look":  [
+                                                                          0.0,
+                                                                          82.0,
+                                                                          -20.0
+                                                                      ],
+                                                             "fov":  68.0
+                                                         }
+                                                     ],
+                                     "events":  [
+
+                                                ]
+                                 },
+                  "fly_undo_redo":  {
+                                        "mode":  "fly",
+                                        "fps":  60,
+                                        "duration":  4.0,
+                                        "lead":  0.20,
+                                        "tail":  0.20,
+                                        "camera_path":  [
+                                                            {
+                                                                "t":  0.0,
+                                                                "pos":  [
+                                                                            52.0,
+                                                                            96.0,
+                                                                            34.0
+                                                                        ],
+                                                                "look":  [
+                                                                             52.0,
+                                                                             78.0,
+                                                                             8.0
+                                                                         ],
+                                                                "fov":  60.0
+                                                            }
+                                                        ],
+                                        "events":  [
+                                                       {
+                                                           "t":  0.20,
+                                                           "action":  "large_explode",
+                                                           "target":  {
+                                                                          "ground":  [
+                                                                                         52.0,
+                                                                                         8.0
+                                                                                     ]
+                                                                      },
+                                                           "radius":  14.0
+                                                       },
+                                                       {
+                                                           "t":  1.30,
+                                                           "action":  "undo"
+                                                       },
+                                                       {
+                                                           "t":  2.55,
+                                                           "action":  "redo"
+                                                       }
+                                                   ],
+                                        "target_dot":  true
+                                    },
+                  "react_lava_water":  {
+                                           "mode":  "fly",
+                                           "fps":  60,
+                                           "duration":  4.2,
+                                           "lead":  0.2,
+                                           "tail":  0.2,
+                                           "reticle":  true,
+                                           "camera_path":  [
+                                                               {
+                                                                   "t":  0,
+                                                                   "pos":  [
+                                                                               60,
+                                                                               80,
+                                                                               54
+                                                                           ],
+                                                                   "look":  {
+                                                                                "ground":  [
+                                                                                               60,
+                                                                                               40
+                                                                                           ],
+                                                                                "y_offset":  3
+                                                                            },
+                                                                   "fov":  46
+                                                               },
+                                                               {
+                                                                   "t":  4.2,
+                                                                   "pos":  [
+                                                                               60,
+                                                                               78,
+                                                                               49
+                                                                           ],
+                                                                   "look":  {
+                                                                                "ground":  [
+                                                                                               60,
+                                                                                               40
+                                                                                           ],
+                                                                                "y_offset":  3
+                                                                            },
+                                                                   "fov":  42
+                                                               }
+                                                           ],
+                                           "events":  [
+                                                          {
+                                                              "t":  0.1,
+                                                              "action":  "target_dot",
+                                                              "visible":  true
+                                                          },
+                                                          {
+                                                              "t":  0.2,
+                                                              "action":  "set_tool",
+                                                              "tool":  "lava",
+                                                              "label":  "LAVA",
+                                                              "key":  "0",
+                                                              "color":  [
+                                                                            1,
+                                                                            0.45,
+                                                                            0.12,
+                                                                            1
+                                                                        ]
+                                                          },
+                                                          {
+                                                              "t":  0.45,
+                                                              "action":  "tool",
+                                                              "tool":  "lava",
+                                                              "target":  {
+                                                                             "ground":  [
+                                                                                            60,
+                                                                                            40
+                                                                                        ],
+                                                                             "y_offset":  3
+                                                                         }
+                                                          },
+                                                          {
+                                                              "t":  1.55,
+                                                              "action":  "set_tool",
+                                                              "tool":  "water",
+                                                              "label":  "WATER",
+                                                              "key":  "8",
+                                                              "color":  [
+                                                                            0.35,
+                                                                            0.75,
+                                                                            1,
+                                                                            1
+                                                                        ]
+                                                          },
+                                                          {
+                                                              "t":  1.75,
+                                                              "action":  "tool",
+                                                              "tool":  "water",
+                                                              "target":  {
+                                                                             "ground":  [
+                                                                                            60,
+                                                                                            40
+                                                                                        ],
+                                                                             "y_offset":  3
+                                                                         }
+                                                          },
+                                                          {
+                                                              "t":  2.35,
+                                                              "action":  "set_tool",
+                                                              "tool":  "",
+                                                              "label":  "RESULT: OBSIDIAN",
+                                                              "key":  "",
+                                                              "color":  [
+                                                                            0.18,
+                                                                            0.12,
+                                                                            0.24,
+                                                                            1
+                                                                        ]
+                                                          },
+                                                          {
+                                                              "t":  3.9,
+                                                              "action":  "hide_tool"
+                                                          }
+                                                      ]
+                                       }
+              }
+}

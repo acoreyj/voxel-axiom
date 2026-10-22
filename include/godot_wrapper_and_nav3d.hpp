@@ -101,12 +101,18 @@ public:
     ///   built for it. Used to gate distant chunks under `collision_distance_chunks`.
     void commit_chunk_mesh_and_collision(const ChunkMeshPayload& mesh, bool build_collision = true) {
         assert(initialized_);
+        if (auto rev_it = committed_revisions_.find(mesh.key);
+            rev_it != committed_revisions_.end() &&
+            mesh.captured_terrain_revision < rev_it->second) {
+            return;
+        }
         if (auto existing_it = slots_.find(mesh.key);
             existing_it != slots_.end() &&
             existing_it->second.mesh_rid.is_valid() &&
             mesh.captured_terrain_revision < existing_it->second.committed_terrain_revision) {
             return;
         }
+        committed_revisions_[mesh.key] = mesh.captured_terrain_revision;
         if (commit_hook_) {
             commit_hook_(mesh);
         }
@@ -242,7 +248,129 @@ public:
         slot.committed_terrain_revision = mesh.captured_terrain_revision;
     }
 
+    /// Registers the set of chunks dirtied by an edit transaction at `terrain_revision`.
+    /// Edit-dirty chunk meshes are staged in `staged_edit_meshes_` until all chunks in the
+    /// edit batch have finished meshing, then committed to RenderingServer & PhysicsServer3D
+    /// atomically in a single frame so multi-chunk craters never show a 1-2 frame see-through
+    /// gap between the near cave wall and the newly carved back wall in neighbor chunks.
+    void register_edit_batch(uint64_t terrain_revision, const std::vector<ChunkKey>& dirtied_chunks) {
+        for (const ChunkKey ck : dirtied_chunks) {
+            const auto stg_it = staged_edit_meshes_.find(ck);
+            if (stg_it != staged_edit_meshes_.end() &&
+                stg_it->second.mesh.captured_terrain_revision >= terrain_revision) {
+                continue;
+            }
+            const auto rev_it = committed_revisions_.find(ck);
+            if (rev_it != committed_revisions_.end() && rev_it->second >= terrain_revision) {
+                continue;
+            }
+            auto& req = pending_edit_revisions_[ck];
+            req = std::max(req, terrain_revision);
+        }
+    }
+
+    [[nodiscard]] bool has_pending_edit_batch() const noexcept {
+        return !pending_edit_revisions_.empty();
+    }
+
+    [[nodiscard]] bool has_staged_edit_meshes() const noexcept {
+        return !staged_edit_meshes_.empty();
+    }
+
+    [[nodiscard]] std::size_t pending_edit_chunk_count() const noexcept {
+        return pending_edit_revisions_.size();
+    }
+
+    template <typename NavMgrT>
+    std::size_t stage_or_commit_chunk_mesh(
+        ChunkMeshPayload& mesh,
+        bool build_collision,
+        NavMgrT& nav_mgr,
+        std::size_t* out_non_empty_committed = nullptr) {
+
+        const auto req_it = pending_edit_revisions_.find(mesh.key);
+        const bool is_tracked_edit_chunk = (req_it != pending_edit_revisions_.end());
+
+        // Drop stale pre-edit mesh if this chunk is awaiting a newer edit revision
+        if (is_tracked_edit_chunk && mesh.captured_terrain_revision < req_it->second) {
+            return 0;
+        }
+
+        const bool should_stage =
+            !pending_edit_revisions_.empty() &&
+            (is_tracked_edit_chunk || mesh.is_edit_mesh ||
+             staged_edit_meshes_.find(mesh.key) != staged_edit_meshes_.end());
+
+        if (!should_stage) {
+            const bool has_geom = !mesh.vertices.empty();
+            const ChunkKey ck = mesh.key;
+            const uint64_t rev = mesh.captured_terrain_revision;
+            commit_chunk_mesh_and_collision(mesh, build_collision);
+            nav_mgr.note_chunk_mesh_committed(ck, rev, get_cached_nav_faces(ck));
+            if (has_geom && out_non_empty_committed != nullptr) {
+                *out_non_empty_committed += 1;
+            }
+            return 1;
+        }
+
+        const ChunkKey ck = mesh.key;
+        const uint64_t rev = mesh.captured_terrain_revision;
+        auto existing_stg = staged_edit_meshes_.find(ck);
+        if (existing_stg == staged_edit_meshes_.end() ||
+            rev >= existing_stg->second.mesh.captured_terrain_revision) {
+            staged_edit_meshes_[ck] = StagedEditMesh{std::move(mesh), build_collision};
+        }
+
+        if (is_tracked_edit_chunk && rev >= req_it->second) {
+            pending_edit_revisions_.erase(req_it);
+        }
+
+        if (pending_edit_revisions_.empty()) {
+            return flush_staged_edit_meshes(nav_mgr, out_non_empty_committed);
+        }
+        return 0;
+    }
+
+    template <typename NavMgrT>
+    std::size_t flush_staged_edit_meshes(
+        NavMgrT& nav_mgr,
+        std::size_t* out_non_empty_committed = nullptr) {
+
+        pending_edit_revisions_.clear();
+        if (staged_edit_meshes_.empty()) {
+            return 0;
+        }
+
+        std::vector<ChunkKey> keys;
+        keys.reserve(staged_edit_meshes_.size());
+        for (const auto& [ck, _] : staged_edit_meshes_) {
+            keys.push_back(ck);
+        }
+        std::sort(keys.begin(), keys.end());
+
+        std::size_t total_committed = 0;
+        for (const ChunkKey ck : keys) {
+            auto it = staged_edit_meshes_.find(ck);
+            if (it == staged_edit_meshes_.end()) {
+                continue;
+            }
+            const bool has_geom = !it->second.mesh.vertices.empty();
+            const uint64_t rev = it->second.mesh.captured_terrain_revision;
+            commit_chunk_mesh_and_collision(it->second.mesh, it->second.build_collision);
+            nav_mgr.note_chunk_mesh_committed(ck, rev, get_cached_nav_faces(ck));
+            if (has_geom && out_non_empty_committed != nullptr) {
+                *out_non_empty_committed += 1;
+            }
+            ++total_committed;
+        }
+        staged_edit_meshes_.clear();
+        return total_committed;
+    }
+
     void free_chunk_slot(ChunkKey key) noexcept {
+        pending_edit_revisions_.erase(key);
+        staged_edit_meshes_.erase(key);
+        committed_revisions_.erase(key);
         auto it = slots_.find(key);
         if (it != slots_.end()) {
             release_slot_rids(it->second);
@@ -258,6 +386,9 @@ public:
         }
         freed_rids_count_ += slots_.size() * 4;
         slots_.clear();
+        pending_edit_revisions_.clear();
+        staged_edit_meshes_.clear();
+        committed_revisions_.clear();
         initialized_ = false;
     }
 
@@ -344,8 +475,16 @@ private:
 #endif
     uint64_t next_rid_counter_ = 0;
     std::size_t freed_rids_count_ = 0;
+    struct StagedEditMesh {
+        ChunkMeshPayload mesh{};
+        bool build_collision = true;
+    };
+
     CommitHookFn commit_hook_;
     std::unordered_map<ChunkKey, ChunkServerSlot, ChunkKeyHash> slots_;
+    std::unordered_map<ChunkKey, uint64_t, ChunkKeyHash> committed_revisions_;
+    std::unordered_map<ChunkKey, uint64_t, ChunkKeyHash> pending_edit_revisions_;
+    std::unordered_map<ChunkKey, StagedEditMesh, ChunkKeyHash> staged_edit_meshes_;
 };
 
 // ============================================================================
@@ -1078,12 +1217,8 @@ inline ProcessFrameStats run_main_thread_process_frame(
 
         switch (done->kind) {
             case CompletionKind::ChunkMesh:
-                server_slot_manager.commit_chunk_mesh_and_collision(done->chunk_mesh);
-                navigation_manager.note_chunk_mesh_committed(
-                    done->chunk_mesh.key,
-                    done->chunk_mesh.captured_terrain_revision,
-                    server_slot_manager.get_cached_nav_faces(done->chunk_mesh.key));
-                ++stats.meshes_committed;
+                stats.meshes_committed += server_slot_manager.stage_or_commit_chunk_mesh(
+                    done->chunk_mesh, /*build_collision=*/true, navigation_manager);
                 break;
 
             case CompletionKind::ChunkUnloaded:
@@ -1092,6 +1227,9 @@ inline ProcessFrameStats run_main_thread_process_frame(
                 break;
 
             case CompletionKind::EditTransactionCompleted:
+                server_slot_manager.register_edit_batch(
+                    done->edit_transaction.terrain_revision,
+                    done->edit_transaction.dirtied_chunks);
                 navigation_manager.apply_edit_transaction(done->edit_transaction);
                 ++stats.edit_completions_processed;
                 break;
