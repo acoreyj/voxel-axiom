@@ -1,0 +1,18 @@
+# Valgrind suppressions for voxel_engine.
+#
+# glibc caches thread stacks/TLS after pthread_join, so the TLS block of an
+# exited worker thread is reported as "possibly lost" even though it is owned
+# and reused by glibc. CoreWorkerPool joins every worker in shutdown()
+# (include/edit_and_worker_pool.hpp), so these blocks are not application leaks.
+#
+# Run with: valgrind --suppressions=valgrind.supp ...
+{
+   glibc_pthread_tls_possibly_lost
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:calloc
+   ...
+   fun:allocate_dtv
+   fun:_dl_allocate_tls
+   ...
+}

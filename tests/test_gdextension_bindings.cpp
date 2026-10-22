@@ -33,8 +33,19 @@ int g_assertions_checked = 0;
         }                                                                             \
     } while (0)
 
+int commit_timeout_seconds() {
+    if (const char* raw = std::getenv("VOXEL_TEST_COMMIT_TIMEOUT_SECONDS")) {
+        const int parsed = std::atoi(raw);
+        if (parsed > 0) {
+            return parsed;
+        }
+    }
+    return 15;
+}
+
 void wait_until_terrain_fully_committed(VoxelTerrain3D& terrain) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(commit_timeout_seconds());
     while (std::chrono::steady_clock::now() < deadline) {
         terrain._process(0.016);
         terrain.get_navigation_manager().complete_in_flight_async_bakes_and_advance_map_iteration();

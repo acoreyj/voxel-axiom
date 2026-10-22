@@ -951,6 +951,21 @@ chmod +x run_all_tests.sh
 The script runs all milestone suites under ASan and TSan and also builds the standalone
 `voxel_baker` CLI.
 
+### Valgrind
+
+On Linux or WSL with `valgrind` installed:
+
+```bash
+chmod +x run_valgrind.sh
+./run_valgrind.sh
+```
+
+The script builds a `-g -O1` configuration and runs every suite under Memcheck with
+full leak checking. The run fails on definite or indirect leaks; the
+`glibc_pthread_tls_possibly_lost` suppression in `valgrind.supp` covers glibc's cached
+TLS blocks from joined worker threads. Per-suite reports land in
+`build-valgrind/logs/`.
+
 ### Test suites
 
 | Suite | Covers |
@@ -1062,6 +1077,8 @@ voxel/
 |-- CMakeLists.txt                Build configuration
 |-- project.godot                 Godot project definition
 |-- run_all_tests.sh              ASan/TSan test runner
+|-- run_valgrind.sh               Valgrind Memcheck test runner
+|-- valgrind.supp                 Memcheck suppressions (glibc thread TLS)
 |-- run-prod.ps1                  Release library build and launch helper
 |-- running-prod.md               Production build guide
 |-- terrain_demo.gd               Demo controller, benchmark suite, and pickaxe viewmodel
