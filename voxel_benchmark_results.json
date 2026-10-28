@@ -1,0 +1,512 @@
+{
+	"completed_at_local": "2026-10-21 17:54:07",
+	"completed_at_utc": "2026-10-21 22:54:07",
+	"completed_unix_sec": 1792623247.906,
+	"hardware": {
+		"completed_at_local": "2026-10-21 17:54:07",
+		"completed_at_utc": "2026-10-21 22:54:07",
+		"cpu_arch": "x86_64",
+		"cpu_name": "AMD Ryzen 7 5800X 8-Core Processor",
+		"cpu_threads": 16,
+		"godot_version": "4.7.2-stable (official)",
+		"gpu_api_version": "1.4.351",
+		"gpu_name": "NVIDIA GeForce RTX 3080",
+		"gpu_type": "Discrete GPU",
+		"gpu_vendor": "NVIDIA",
+		"initial_vsync_mode": 1,
+		"locale": "en_US",
+		"os_distro": "Windows",
+		"os_name": "Windows",
+		"os_version": "10.0.26200",
+		"ram_available_mb": 85919.0,
+		"ram_free_mb": 11827.0,
+		"ram_physical_mb": 32671.0,
+		"rendering_driver": "vulkan",
+		"rendering_method": "forward_plus",
+		"started_at_local": "2026-10-21 17:52:58",
+		"started_at_utc": "2026-10-21 22:52:58",
+		"timestamp_local": "2026-10-21 17:52:58",
+		"timestamp_utc": "2026-10-21 22:52:58",
+		"total_duration_sec": 69.28,
+		"voxel_scale_m": 0.5,
+		"voxel_worker_threads": 6,
+		"window_resolution": "1152x648",
+		"world_height_chunks": 8
+	},
+	"presets": [
+		{
+			"destruction": {
+				"affected_chunks_total": 48,
+				"avg_blast_latency_ms": 46.14,
+				"blasts_completed": 8,
+				"max_blast_latency_ms": 125.15
+			},
+			"navigation": {
+				"nav_query_ms": 0.106,
+				"nav_sync_ms": 214.19,
+				"nav_waypoints": 15
+			},
+			"overall": {
+				"avg_fps": 387.8,
+				"avg_ms": 2.58,
+				"frames": 4268,
+				"max_ms": 66.23,
+				"min_fps": 15.1,
+				"min_ms": 0.69,
+				"p1_low_fps": 153.6,
+				"p50_ms": 2.24,
+				"p95_ms": 4.48,
+				"p99_ms": 6.51
+			},
+			"phases": {
+				"destruction_csg": {
+					"avg_fps": 351.0,
+					"avg_ms": 2.85,
+					"frames": 1405,
+					"max_ms": 23.35,
+					"min_fps": 42.8,
+					"min_ms": 0.96,
+					"p1_low_fps": 120.6,
+					"p50_ms": 2.66,
+					"p95_ms": 4.48,
+					"p99_ms": 8.29
+				},
+				"navigation_3d": {
+					"avg_fps": 285.7,
+					"avg_ms": 3.5,
+					"frames": 715,
+					"max_ms": 66.23,
+					"min_fps": 15.1,
+					"min_ms": 1.69,
+					"p1_low_fps": 197.1,
+					"p50_ms": 3.38,
+					"p95_ms": 4.76,
+					"p99_ms": 5.07
+				},
+				"stream_flight": {
+					"avg_fps": 477.2,
+					"avg_ms": 2.1,
+					"frames": 2148,
+					"max_ms": 39.42,
+					"min_fps": 25.4,
+					"min_ms": 0.69,
+					"p1_low_fps": 177.9,
+					"p50_ms": 1.89,
+					"p95_ms": 3.31,
+					"p99_ms": 5.62
+				}
+			},
+			"preset_name": "Low / Fast Stream",
+			"resources": {
+				"peak_draw_calls": 1023,
+				"peak_primitives": 2761541,
+				"peak_static_ram_mb": 310.6,
+				"peak_vram_mb": 385.4
+			},
+			"settings": {
+				"collision_distance_chunks": 2,
+				"effective_view_distance_chunks": 6,
+				"prefetch_distance_chunks": 1,
+				"resident_memory_budget_mb": 512,
+				"upload_budget_ms": 1.5,
+				"view_distance_chunks": 6,
+				"voxel_scale_m": 0.5
+			},
+			"streaming": {
+				"chunks_committed": 7055,
+				"commits_per_sec": 641.0,
+				"settle_time_ms": 3501.2
+			},
+			"timestamps": {
+				"completed_at_local": "2026-10-21 17:53:13",
+				"completed_at_utc": "2026-10-21 22:53:13",
+				"duration_sec": 14.42,
+				"started_at_local": "2026-10-21 17:52:58",
+				"started_at_utc": "2026-10-21 22:52:58",
+				"terrain_reset_before_pass": true,
+				"terrain_reset_method": "undo_all (0 edits reverted)"
+			}
+		},
+		{
+			"destruction": {
+				"affected_chunks_total": 48,
+				"avg_blast_latency_ms": 28.64,
+				"blasts_completed": 8,
+				"max_blast_latency_ms": 59.05
+			},
+			"navigation": {
+				"nav_query_ms": 0.181,
+				"nav_sync_ms": 47.86,
+				"nav_waypoints": 35
+			},
+			"overall": {
+				"avg_fps": 288.0,
+				"avg_ms": 3.47,
+				"frames": 3169,
+				"max_ms": 92.7,
+				"min_fps": 10.8,
+				"min_ms": 1.03,
+				"p1_low_fps": 50.6,
+				"p50_ms": 3.05,
+				"p95_ms": 5.2,
+				"p99_ms": 19.76
+			},
+			"phases": {
+				"destruction_csg": {
+					"avg_fps": 269.9,
+					"avg_ms": 3.71,
+					"frames": 1080,
+					"max_ms": 92.7,
+					"min_fps": 10.8,
+					"min_ms": 1.03,
+					"p1_low_fps": 52.6,
+					"p50_ms": 3.11,
+					"p95_ms": 6.36,
+					"p99_ms": 19.02
+				},
+				"navigation_3d": {
+					"avg_fps": 285.1,
+					"avg_ms": 3.51,
+					"frames": 713,
+					"max_ms": 47.78,
+					"min_fps": 20.9,
+					"min_ms": 1.86,
+					"p1_low_fps": 197.4,
+					"p50_ms": 3.42,
+					"p95_ms": 4.72,
+					"p99_ms": 5.07
+				},
+				"stream_flight": {
+					"avg_fps": 305.6,
+					"avg_ms": 3.27,
+					"frames": 1376,
+					"max_ms": 63.71,
+					"min_fps": 15.7,
+					"min_ms": 1.19,
+					"p1_low_fps": 43.2,
+					"p50_ms": 2.86,
+					"p95_ms": 5.03,
+					"p99_ms": 23.17
+				}
+			},
+			"preset_name": "Balanced Default",
+			"resources": {
+				"peak_draw_calls": 1203,
+				"peak_primitives": 3179309,
+				"peak_static_ram_mb": 418.3,
+				"peak_vram_mb": 406.4
+			},
+			"settings": {
+				"collision_distance_chunks": 4,
+				"effective_view_distance_chunks": 8,
+				"prefetch_distance_chunks": 2,
+				"resident_memory_budget_mb": 1024,
+				"upload_budget_ms": 2.5,
+				"view_distance_chunks": 8,
+				"voxel_scale_m": 0.5
+			},
+			"streaming": {
+				"chunks_committed": 5049,
+				"commits_per_sec": 458.8,
+				"settle_time_ms": 961.5
+			},
+			"timestamps": {
+				"completed_at_local": "2026-10-21 17:53:25",
+				"completed_at_utc": "2026-10-21 22:53:25",
+				"duration_sec": 12.75,
+				"started_at_local": "2026-10-21 17:53:13",
+				"started_at_utc": "2026-10-21 22:53:13",
+				"terrain_reset_before_pass": true,
+				"terrain_reset_method": "undo_all (7 edits reverted)"
+			}
+		},
+		{
+			"destruction": {
+				"affected_chunks_total": 49,
+				"avg_blast_latency_ms": 38.38,
+				"blasts_completed": 8,
+				"max_blast_latency_ms": 86.02
+			},
+			"navigation": {
+				"nav_query_ms": 0.224,
+				"nav_sync_ms": 51.05,
+				"nav_waypoints": 35
+			},
+			"overall": {
+				"avg_fps": 265.2,
+				"avg_ms": 3.77,
+				"frames": 2918,
+				"max_ms": 138.66,
+				"min_fps": 7.2,
+				"min_ms": 1.26,
+				"p1_low_fps": 49.9,
+				"p50_ms": 3.3,
+				"p95_ms": 5.35,
+				"p99_ms": 20.02
+			},
+			"phases": {
+				"destruction_csg": {
+					"avg_fps": 254.0,
+					"avg_ms": 3.94,
+					"frames": 1016,
+					"max_ms": 138.66,
+					"min_fps": 7.2,
+					"min_ms": 1.45,
+					"p1_low_fps": 59.5,
+					"p50_ms": 3.31,
+					"p95_ms": 8.29,
+					"p99_ms": 16.81
+				},
+				"navigation_3d": {
+					"avg_fps": 275.6,
+					"avg_ms": 3.63,
+					"frames": 689,
+					"max_ms": 50.94,
+					"min_fps": 19.6,
+					"min_ms": 1.93,
+					"p1_low_fps": 198.9,
+					"p50_ms": 3.52,
+					"p95_ms": 4.82,
+					"p99_ms": 5.03
+				},
+				"stream_flight": {
+					"avg_fps": 269.5,
+					"avg_ms": 3.71,
+					"frames": 1213,
+					"max_ms": 63.41,
+					"min_fps": 15.8,
+					"min_ms": 1.26,
+					"p1_low_fps": 37.1,
+					"p50_ms": 3.08,
+					"p95_ms": 5.32,
+					"p99_ms": 26.95
+				}
+			},
+			"preset_name": "High Throughput Upload",
+			"resources": {
+				"peak_draw_calls": 1326,
+				"peak_primitives": 3491148,
+				"peak_static_ram_mb": 441.5,
+				"peak_vram_mb": 406.8
+			},
+			"settings": {
+				"collision_distance_chunks": 4,
+				"effective_view_distance_chunks": 10,
+				"prefetch_distance_chunks": 3,
+				"resident_memory_budget_mb": 1536,
+				"upload_budget_ms": 5.0,
+				"view_distance_chunks": 10,
+				"voxel_scale_m": 0.5
+			},
+			"streaming": {
+				"chunks_committed": 6091,
+				"commits_per_sec": 553.6,
+				"settle_time_ms": 1162.9
+			},
+			"timestamps": {
+				"completed_at_local": "2026-10-21 17:53:38",
+				"completed_at_utc": "2026-10-21 22:53:38",
+				"duration_sec": 12.51,
+				"started_at_local": "2026-10-21 17:53:25",
+				"started_at_utc": "2026-10-21 22:53:25",
+				"terrain_reset_before_pass": true,
+				"terrain_reset_method": "undo_all (7 edits reverted)"
+			}
+		},
+		{
+			"destruction": {
+				"affected_chunks_total": 49,
+				"avg_blast_latency_ms": 25.69,
+				"blasts_completed": 8,
+				"max_blast_latency_ms": 35.31
+			},
+			"navigation": {
+				"nav_query_ms": 0.136,
+				"nav_sync_ms": 3006.48,
+				"nav_waypoints": 39
+			},
+			"overall": {
+				"avg_fps": 206.2,
+				"avg_ms": 4.85,
+				"frames": 2375,
+				"max_ms": 136.0,
+				"min_fps": 7.4,
+				"min_ms": 1.78,
+				"p1_low_fps": 31.3,
+				"p50_ms": 3.79,
+				"p95_ms": 7.1,
+				"p99_ms": 31.95
+			},
+			"phases": {
+				"destruction_csg": {
+					"avg_fps": 220.8,
+					"avg_ms": 4.53,
+					"frames": 884,
+					"max_ms": 136.0,
+					"min_fps": 7.4,
+					"min_ms": 1.84,
+					"p1_low_fps": 47.2,
+					"p50_ms": 3.55,
+					"p95_ms": 10.06,
+					"p99_ms": 21.17
+				},
+				"navigation_3d": {
+					"avg_fps": 229.2,
+					"avg_ms": 4.36,
+					"frames": 690,
+					"max_ms": 66.57,
+					"min_fps": 15.0,
+					"min_ms": 2.25,
+					"p1_low_fps": 151.7,
+					"p50_ms": 4.1,
+					"p95_ms": 5.77,
+					"p99_ms": 6.59
+				},
+				"stream_flight": {
+					"avg_fps": 177.9,
+					"avg_ms": 5.62,
+					"frames": 801,
+					"max_ms": 107.38,
+					"min_fps": 9.3,
+					"min_ms": 1.78,
+					"p1_low_fps": 15.8,
+					"p50_ms": 3.82,
+					"p95_ms": 7.36,
+					"p99_ms": 63.23
+				}
+			},
+			"preset_name": "Extended Horizon",
+			"resources": {
+				"peak_draw_calls": 1617,
+				"peak_primitives": 4245106,
+				"peak_static_ram_mb": 757.0,
+				"peak_vram_mb": 470.8
+			},
+			"settings": {
+				"collision_distance_chunks": 6,
+				"effective_view_distance_chunks": 14,
+				"prefetch_distance_chunks": 4,
+				"resident_memory_budget_mb": 2048,
+				"upload_budget_ms": 6.0,
+				"view_distance_chunks": 14,
+				"voxel_scale_m": 0.5
+			},
+			"streaming": {
+				"chunks_committed": 9137,
+				"commits_per_sec": 793.3,
+				"settle_time_ms": 3017.2
+			},
+			"timestamps": {
+				"completed_at_local": "2026-10-21 17:53:53",
+				"completed_at_utc": "2026-10-21 22:53:53",
+				"duration_sec": 15.44,
+				"started_at_local": "2026-10-21 17:53:38",
+				"started_at_utc": "2026-10-21 22:53:38",
+				"terrain_reset_before_pass": true,
+				"terrain_reset_method": "undo_all (7 edits reverted)"
+			}
+		},
+		{
+			"destruction": {
+				"affected_chunks_total": 49,
+				"avg_blast_latency_ms": 31.35,
+				"blasts_completed": 8,
+				"max_blast_latency_ms": 40.05
+			},
+			"navigation": {
+				"nav_query_ms": 0.158,
+				"nav_sync_ms": 140.13,
+				"nav_waypoints": 35
+			},
+			"overall": {
+				"avg_fps": 174.6,
+				"avg_ms": 5.73,
+				"frames": 1921,
+				"max_ms": 140.59,
+				"min_fps": 7.1,
+				"min_ms": 1.91,
+				"p1_low_fps": 14.0,
+				"p50_ms": 3.87,
+				"p95_ms": 12.14,
+				"p99_ms": 71.57
+			},
+			"phases": {
+				"destruction_csg": {
+					"avg_fps": 158.9,
+					"avg_ms": 6.29,
+					"frames": 636,
+					"max_ms": 140.59,
+					"min_fps": 7.1,
+					"min_ms": 1.91,
+					"p1_low_fps": 36.4,
+					"p50_ms": 3.93,
+					"p95_ms": 13.73,
+					"p99_ms": 27.48
+				},
+				"navigation_3d": {
+					"avg_fps": 248.7,
+					"avg_ms": 4.02,
+					"frames": 622,
+					"max_ms": 139.97,
+					"min_fps": 7.1,
+					"min_ms": 2.09,
+					"p1_low_fps": 186.3,
+					"p50_ms": 3.78,
+					"p95_ms": 5.01,
+					"p99_ms": 5.37
+				},
+				"stream_flight": {
+					"avg_fps": 147.3,
+					"avg_ms": 6.79,
+					"frames": 663,
+					"max_ms": 124.85,
+					"min_fps": 8.0,
+					"min_ms": 2.06,
+					"p1_low_fps": 10.4,
+					"p50_ms": 3.88,
+					"p95_ms": 7.52,
+					"p99_ms": 96.43
+				}
+			},
+			"preset_name": "Full Collision Stress",
+			"resources": {
+				"peak_draw_calls": 1468,
+				"peak_primitives": 3867168,
+				"peak_static_ram_mb": 895.9,
+				"peak_vram_mb": 471.5
+			},
+			"settings": {
+				"collision_distance_chunks": 10,
+				"effective_view_distance_chunks": 12,
+				"prefetch_distance_chunks": 2,
+				"resident_memory_budget_mb": 2048,
+				"upload_budget_ms": 8.0,
+				"view_distance_chunks": 12,
+				"voxel_scale_m": 0.5
+			},
+			"streaming": {
+				"chunks_committed": 5895,
+				"commits_per_sec": 535.7,
+				"settle_time_ms": 630.7
+			},
+			"timestamps": {
+				"completed_at_local": "2026-10-21 17:54:06",
+				"completed_at_utc": "2026-10-21 22:54:06",
+				"duration_sec": 12.97,
+				"started_at_local": "2026-10-21 17:53:53",
+				"started_at_utc": "2026-10-21 22:53:53",
+				"terrain_reset_before_pass": true,
+				"terrain_reset_method": "undo_all (7 edits reverted)"
+			}
+		}
+	],
+	"started_at_local": "2026-10-21 17:52:58",
+	"started_at_utc": "2026-10-21 22:52:58",
+	"started_unix_sec": 1792623178.622,
+	"status": "completed",
+	"terrain_reset_between_passes": true,
+	"terrain_reset_method": "undo_all (7 edits reverted)",
+	"timestamp_local": "2026-10-21 17:54:07",
+	"timestamp_utc": "2026-10-21 22:54:07",
+	"total_duration_sec": 69.28
+}

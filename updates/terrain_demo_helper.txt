@@ -1,0 +1,70 @@
+## Track active dynamic boulders so explosions can wake or impulse them.
+var _rolling_boulders: Array[RigidBody3D] = []
+
+## Call this once in _ready() alongside your existing explosion_completed connection:
+func _setup_rolling_physics_hooks() -> void:
+	if not terrain.explosion_completed.is_connected(_on_terrain_explosion_physics):
+		terrain.explosion_completed.connect(_on_terrain_explosion_physics)
+
+## Spawns a dynamic rolling granite boulder above `hit_point`.
+func spawn_rolling_boulder(hit_point: Vector3, radius: float = 2.0, bake_when_settled: bool = false) -> RigidBody3D:
+	var body := RigidBody3D.new()
+	body.name = "RollingBoulder"
+	# Spawn slightly above the surface so it doesn't start interpenetrating the trimesh
+	body.global_position = hit_point + Vector3(0.0, radius + 0.35, 0.0)
+	body.mass = maxf(40.0, (4.0 / 3.0) * PI * pow(radius, 3.0) * 25.0) # ~granite density
+	body.continuous_cd = true        # Prevents tunneling through thin cave floors at high speed
+	body.angular_damp = 0.35         # Keeps it from rolling forever on nearly-flat plains
+	body.linear_damp = 0.05
+
+	# Tuned PhysicsMaterial so it rolls smoothly over Surface Nets triangles without catching
+	var phys_mat := PhysicsMaterial.new()
+	phys_mat.friction = 0.45
+	phys_mat.bounce = 0.18
+	body.physics_material_override = phys_mat
+
+	# 1. Collision shape (SphereShape3D glides cleanly over internal trimesh edges)
+	var col := CollisionShape3D.new()
+	var sphere_shape := SphereShape3D.new()
+	sphere_shape.radius = radius
+	col.shape = sphere_shape
+	body.add_child(col)
+
+	# 2. Visual mesh using your existing voxel_triplanar.gdshader
+	# A SphereMesh has default vertex COLOR = (1,1,1,1), which triggers the soil/grass
+	# branch unless we either use the terrain shader with a boulder material override
+	# or bake vertex alpha = 0.0 (the kMaterialBoulder sentinel in voxel_triplanar.gdshader:132).
+	var mesh_inst := MeshInstance3D.new()
+	mesh_inst.mesh = _build_boulder_sphere_mesh(radius)
+	if terrain.terrain_material != null:
+		mesh_inst.material_override = terrain.terrain_material
+	body.add_child(mesh_inst)
+
+	# Optional: solidify into permanent 5-hit voxel terrain once it stops rolling
+	if bake_when_settled:
+		body.set_meta("settle_timer", 0.0)
+		body.set_meta("boulder_radius", radius)
+
+	add_child(body)
+	_rolling_boulders.append(body)
+	return body
+
+## Builds a sphere mesh with vertex COLOR = Color(0.55, 0.55, 0.55, 0.0) so
+## voxel_triplanar.gdshader automatically renders it with the procedural granite
+## boulder palette (vertex_color.a < 0.002 -> is_boulder = true).
+func _build_boulder_sphere_mesh(radius: float) -> ArrayMesh:
+	var prim := SphereMesh.new()
+	prim.radius = radius
+	prim.height = radius * 2.0
+	prim.radial_segments = 24
+	prim.rings = 12
+	var arrays := prim.get_mesh_arrays()
+	var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+	var colors := PackedColorArray()
+	colors.resize(verts.size())
+	# Alpha = 0.0 selects the procedural granite boulder branch in voxel_triplanar.gdshader
+	colors.fill(Color(0.55, 0.55, 0.55, 0.0))
+	arrays[Mesh.ARRAY_COLOR] = colors
+	var arr_mesh := ArrayMesh.new()
+	arr_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	return arr_mesh

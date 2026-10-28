@@ -41,6 +41,10 @@ Desktop.ini
 *.translation
 
 
+# Local installers (too large for the repo)
+DaVinci_Resolve_*.zip
+*.exe.7z
+
 # Trailer capture artifacts
 captures/
 trailer_saves/
