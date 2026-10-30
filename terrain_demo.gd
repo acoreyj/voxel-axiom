@@ -243,7 +243,7 @@ Build   1 Add terrain   2 Paint   3 Paint delete   4 Boulder
 Roller  Shift+4 rolling boulder   Ctrl+Click crushing roller
 Carve   5 Small hit     6 Explode   7 Large explode
 Element 8 Water   9 Frost/Ice   0 Lava/Magma
-Stamps  B timed ruin   Shift+B permanent ruin
+Stamps  B timed ruin   Shift+B permanent ruin   K Sparring Bot AI
 History Undo %d (Z) | Redo %d (Y) | Reset All (Shift+R)
 World   R reset statues   T material   P place companion
 Mouse   Play LMB pickaxe   Fly LMB tool   RMB cave path   Shift+RMB place companion"""
@@ -356,6 +356,7 @@ var _tracer_immediate_mesh: ImmediateMesh = null
 var _play_fire_held: bool = false
 var _play_ads_held: bool = false
 var _ads_blend: float = 0.0
+var _bot_ai: VoxelCombatBotAI = null
 var _ice_path_active: bool = false
 var _last_ice_path_anchor: Vector3 = Vector3(INF, INF, INF)
 var _hero_visual_root: Node3D = null
@@ -1452,6 +1453,27 @@ func _setup_ability_system_and_beam_visuals() -> void:
 	_tracer_mesh_inst.mesh = _tracer_immediate_mesh
 	_tracer_mesh_inst.material_override = tracer_mat
 	add_child(_tracer_mesh_inst)
+
+	_bot_ai = VoxelCombatBotAI.new()
+	_bot_ai.name = "VoxelCombatBotAI"
+	_bot_ai.terrain = terrain
+	_bot_ai.companion_node = ai_companion
+	_bot_ai.ability_system = _gas
+	_bot_ai.projectile_parent = self
+	add_child(_bot_ai)
+
+	_bot_ai.bot_state_changed.connect(func(_st: int, st_name: String) -> void:
+		print("[BotAI] State -> %s" % st_name)
+	)
+	_bot_ai.bot_escaped_hazard.connect(func(_mat: int, _vel: Vector3) -> void:
+		print("[BotAI] Detected LAVA underfoot -> executing Hazard Escape Jump!")
+	)
+	_bot_ai.bot_breached_cover.connect(func(wall_pos: Vector3) -> void:
+		print("[BotAI] Line-of-Sight blocked by hero construct -> firing Breach Blast at %s!" % str(wall_pos))
+	)
+	_bot_ai.bot_lobbed_mortar.connect(func(_orig: Vector3, target_pos: Vector3) -> void:
+		print("[BotAI] Lobbed arcing Magma Mortar toward %s!" % str(target_pos))
+	)
 
 func _enter_play() -> void:
 	_mode = Mode.PLAY
@@ -2599,6 +2621,22 @@ func _unhandled_input(event: InputEvent) -> void:
 				_toggle_add_material()
 			KEY_P:
 				_place_companion_at_crosshair()
+			KEY_K:
+				if not event.echo and _bot_ai != null:
+					if not _companion_initialized:
+						var spawn_pt := _pickaxe_aim_point()
+						if not is_finite(spawn_pt.x):
+							var ref_origin := _player_feet if _mode == Mode.PLAY else camera.global_position
+							var bot_fwd := Vector3(-sin(_yaw), 0.0, -cos(_yaw)).normalized()
+							spawn_pt = ref_origin + bot_fwd * 14.0
+							var gy := _ground_probe(spawn_pt + Vector3(0.0, 12.0, 0.0), 48.0)
+							if is_finite(gy):
+								spawn_pt.y = gy
+						ai_companion.global_position = spawn_pt + Vector3(0.0, 0.15, 0.0)
+						_companion_vertical_vel = 0.0
+						_companion_initialized = true
+					var active := _bot_ai.toggle_combat_ai()
+					print("[BotAI] Sparring Combat Bot AI: %s (at %s)" % ["ENABLED" if active else "DISABLED (Path Follow)", str(ai_companion.global_position)])
 
 	elif event is InputEventMouseButton:
 		# While the cursor is released, a click recaptures instead of firing a
@@ -2664,9 +2702,17 @@ func _process(delta: float) -> void:
 
 	_update_rolling_boulders(delta)
 	_update_stream_focus(false)
-	_apply_companion_gravity_and_ground_snap(delta)
-	_poll_pending_path_query()
-	_step_companion_along_path(delta)
+	if _bot_ai != null and _bot_ai.combat_enabled and _companion_initialized:
+		var hero_pos := _player_feet if _mode == Mode.PLAY else (camera.global_position - Vector3(0.0, 1.5, 0.0))
+		var is_stunned := _companion_stun_timer > 0.0 or _charge_pinned_companion or \
+			(_gas != null and _gas.is_target_stunned(ai_companion))
+		# Update companion visual tint & stun timer
+		_update_companion_status_tint(delta)
+		_bot_ai.step_bot_ai(delta, hero_pos, _velocity, is_stunned)
+	else:
+		_apply_companion_gravity_and_ground_snap(delta)
+		_poll_pending_path_query()
+		_step_companion_along_path(delta)
 	_update_pending_pristine_hides(delta)
 	_update_hud(delta)
 
@@ -2763,8 +2809,9 @@ func _update_hud(delta: float) -> void:
 			var c_attr: VoxelAbilitySystem.HeroAttributes = _gas.target_attributes.get(ai_companion.get_instance_id(), null)
 			var c_hp := c_attr.health if c_attr != null else 750.0
 			var c_eff := _gas.format_active_effects(ai_companion)
+			var bot_txt := _bot_ai.format_bot_hud() if _bot_ai != null else "OFF"
 			comp_line = "
-Companion Target: %.0f/750 HP | Status: %s" % [c_hp, c_eff]
+Companion: %.0f/750 HP | Status: %s | Bot AI (K): %s" % [c_hp, c_eff, bot_txt]
 		var w_hud := _gas.format_weapon_hud(_hero_state == HeroState.SLIDING, _play_ads_held) if _gas != null else "Pulse Carbine"
 		tool_text = "%s | %s | HP: %.0f | Spirit: %.0f | Stamina: [%s] | Underfoot: %s | Buffs: %s
 Abilities: %s%s" % [
@@ -3413,7 +3460,7 @@ func _draw_path_ribbon(path: PackedVector3Array) -> void:
 		_path_immediate_mesh.surface_add_vertex(pt + Vector3(0.0, 0.35, 0.0))
 	_path_immediate_mesh.surface_end()
 
-func _step_companion_along_path(delta: float) -> void:
+func _update_companion_status_tint(delta: float) -> bool:
 	if _companion_stun_timer > 0.0:
 		_companion_stun_timer = maxf(0.0, _companion_stun_timer - delta)
 	var gas_stunned := _gas != null and _gas.is_target_stunned(ai_companion)
@@ -3428,10 +3475,16 @@ func _step_companion_along_path(delta: float) -> void:
 		elif (c_tags & VoxelAbilitySystem.Tag.BURNING) != 0:
 			_companion_base_mat.albedo_color = Color(1.0, 0.28, 0.06)
 			_companion_base_mat.emission = Color(1.0, 0.22, 0.04) * 1.3
+		elif _bot_ai != null and _bot_ai.combat_enabled:
+			_companion_base_mat.albedo_color = Color(0.95, 0.22, 0.55)
+			_companion_base_mat.emission = Color(0.90, 0.15, 0.45) * 0.85
 		else:
 			_companion_base_mat.albedo_color = Color(0.1, 0.95, 1.0)
 			_companion_base_mat.emission = Color(0.1, 0.85, 1.0) * 0.6
-	if _companion_stun_timer > 0.0 or gas_stunned:
+	return _companion_stun_timer > 0.0 or gas_stunned
+
+func _step_companion_along_path(delta: float) -> void:
+	if _update_companion_status_tint(delta):
 		return
 	if _charge_pinned_companion:
 		return

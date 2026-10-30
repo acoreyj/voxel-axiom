@@ -794,6 +794,7 @@ removed.
 | `Shift + R` / `Ctrl + R` | Undo every terrain edit and restore all statues to the pristine baseline |
 | `T` | Toggle add/paint material (soil / hard rock) |
 | `P` | Place the companion at the crosshair |
+| `K` | Toggle the Sparring Combat Bot AI on the companion (auto-places it) |
 | `Right Click` (Fly) | Query a 3D cave path to the crosshair |
 | `Right Click` (Play) | Hold for over-the-shoulder ADS zoom |
 | `Shift + Right Click` | Place the companion and query a path |
@@ -934,6 +935,23 @@ under the capsule, gravity drops it into the crater and the path is re-queried.
 | `companion_gravity` | `28.0` | Downward acceleration when ground is removed. |
 | `boom_snap_depth_factor` | `0.5` | Depth tolerance for stacking repeated blasts on the same spot. |
 | `boom_snap_lateral` | `0.75` | Lateral tolerance for repeating the same blast spot. |
+
+### Combat bot AI
+
+`K` toggles a sparring combat bot on the companion (auto-placing it if needed).
+`voxel_combat_bot_ai.gd` defines `class_name VoxelCombatBotAI` (`extends Node`), a 5-state
+FSM: `IDLE_FOLLOW`, `PURSUE_3D_NAV`, `STRAFE_ENGAGE`, `HAZARD_ESCAPE`, and `BREACH_COVER`.
+It uses `raycast_terrain` for line-of-sight, `get_material_at` / `sample_sdf` for cliff- and
+lava-safe strafing, `get_voxel_path` for 3D pursuit, and fires led Plasma Bolts plus arcing
+Magma Mortars. When a Kelvin Ice Dome or McGinnis Spectral Wall blocks sight within 11 m it
+fires a breach blast; lava underfoot triggers an escape jump plus lateral dash; Wall-Pin
+Stun or Frozen from the ability system locks it out. The HUD shows its live state and LoS.
+
+Standalone usage: add a `VoxelCombatBotAI` node, assign `terrain`, `companion_node`,
+`ability_system`, and `projectile_parent`, call `toggle_combat_ai()`, then call
+`step_bot_ai(delta, hero_feet, hero_vel, is_stunned_or_pinned)` each frame. Signals:
+`bot_state_changed`, `bot_fired_bolt`, `bot_lobbed_mortar`, `bot_breached_cover`, and
+`bot_escaped_hazard`.
 
 ### Statue pairs
 
