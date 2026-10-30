@@ -794,10 +794,13 @@ removed.
 | `Shift + R` / `Ctrl + R` | Undo every terrain edit and restore all statues to the pristine baseline |
 | `T` | Toggle add/paint material (soil / hard rock) |
 | `P` | Place the companion at the crosshair |
-| `Right Click` | Query a 3D cave path to the crosshair |
+| `Right Click` (Fly) | Query a 3D cave path to the crosshair |
+| `Right Click` (Play) | Hold for over-the-shoulder ADS zoom |
 | `Shift + Right Click` | Place the companion and query a path |
 | `Left Click` (Fly) | Apply the active terrain tool |
-| `Left Click` (Play) | Swing the pickaxe and chip the terrain; hold for repeated swings |
+| `Left Click` (Play) | Hold to fire the ricochet carbine (infinite ammo while sliding) |
+| `R` (Play) | Reload the 24-round magazine (`Shift + R` resets statues) |
+| `M` / `Middle Click` (Play) | Heavy melee lunge and pickaxe carve |
 | `H` | Show or hide the controls overlay |
 | `U` | Hide all UI except the reticle and pickaxe; press again to restore |
 | `Escape` | Release mouse capture; click to recapture |
@@ -894,6 +897,20 @@ aim_dir, max_distance, targets)` each frame. Cast through `start_hyper_beam()`,
 `ability_cast_blocked`, `ability_channel_ticked`, `ability_completed`,
 `status_effect_applied`, `status_effect_removed`, `damage_dealt`, and
 `elemental_combo_triggered`.
+
+### Primary weapon and ricochet rounds
+
+`VoxelAbilitySystem` also owns a `WeaponSpec`: a 24-round Pulse Carbine at ~7.1 rounds/sec
+with a 1.55 s reload. Hold LMB in Play Mode to fire. Each voxel impact chips a 0.95 m crater,
+reflects off the analytical `sample_sdf_normal()` surface, and can ricochet twice. Hits on
+the upper 32% of a target capsule are `1.85x` headshots; ricochet hits add +25%, and hits on
+Frozen or Wall-Pin Stunned targets add another +25% shatter bonus. Sliding (`Ctrl`/`C`,
+including on a Kelvin Ice Path) consumes no ammo and bypasses reload lockouts. Hold RMB for
+ADS (78° → 55° FOV and a 2.55 m camera arm); `M` / middle click lunges and swings the pickaxe.
+
+`fire_ricochet_weapon()`, `start_weapon_reload()`, and `format_weapon_hud()` expose the same
+state to custom scenes; the system emits `weapon_fired`, `weapon_reload_started`, and
+`weapon_reload_completed`.
 
 ### First-person pickaxe viewmodel
 

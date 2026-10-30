@@ -236,6 +236,7 @@ Mode    F fly / hero play   V toggle 3rd/1st person (in Play)   M (or F8) benchm
 Hero    WASD move   Shift dash (Space mid-dash = Dash-Jump!)   Ctrl/C slope slide
 Climb   Space jump/mantle   G Charge   E IcePath   Q Slam   Z HyperBeam   X CryoOrb
 Build   1 Ice Dome   2 Spectral Wall   Shift+4 roller   LMB pickaxe
+Weapon  Play: LMB Ricochet Gun (Slide=Inf Ammo!)   RMB Aim Zoom   R Reload   M Melee
 Move    W/A/S/D   Space or E up   Ctrl or Q down   Shift sprint
 Look    Mouse   Esc releases cursor   click recaptures
 Build   1 Add terrain   2 Paint   3 Paint delete   4 Boulder
@@ -350,6 +351,11 @@ var _gas: VoxelAbilitySystem = null
 var _beam_mesh_inst: MeshInstance3D = null
 var _beam_immediate_mesh: ImmediateMesh = null
 var _beam_impact_sphere: MeshInstance3D = null
+var _tracer_mesh_inst: MeshInstance3D = null
+var _tracer_immediate_mesh: ImmediateMesh = null
+var _play_fire_held: bool = false
+var _play_ads_held: bool = false
+var _ads_blend: float = 0.0
 var _ice_path_active: bool = false
 var _last_ice_path_anchor: Vector3 = Vector3(INF, INF, INF)
 var _hero_visual_root: Node3D = null
@@ -1437,9 +1443,22 @@ func _setup_ability_system_and_beam_visuals() -> void:
 	_beam_impact_sphere.visible = false
 	add_child(_beam_impact_sphere)
 
+	# 3D Ricochet Bullet Tracer Mesh (draws primary shots + SDF wall bounces)
+	_tracer_mesh_inst = MeshInstance3D.new()
+	_tracer_immediate_mesh = ImmediateMesh.new()
+	var tracer_mat := StandardMaterial3D.new()
+	tracer_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	tracer_mat.vertex_color_use_as_albedo = true
+	_tracer_mesh_inst.mesh = _tracer_immediate_mesh
+	_tracer_mesh_inst.material_override = tracer_mat
+	add_child(_tracer_mesh_inst)
+
 func _enter_play() -> void:
 	_mode = Mode.PLAY
 	_tool_pressed = false
+	_play_fire_held = false
+	_play_ads_held = false
+	_ads_blend = 0.0
 	_swing_active = false
 	_swing_hit_done = false
 	_swing_elapsed = 0.0
@@ -1480,6 +1499,9 @@ func _enter_play() -> void:
 
 func _exit_play() -> void:
 	_mode = Mode.FLY
+	_play_fire_held = false
+	_play_ads_held = false
+	_ads_blend = 0.0
 	_swing_active = false
 	_swing_hit_done = false
 	if _viewmodel_root != null:
@@ -1852,7 +1874,67 @@ func _sync_and_tick_gas_in_play(delta: float) -> void:
 	if _companion_initialized:
 		targets.append(ai_companion)
 	_gas.tick_ability_system(delta, beam_start, aim_fwd, max_ray_distance, targets)
+	if _play_fire_held:
+		_fire_primary_ricochet_carbine()
 	_render_hyper_beam_visuals()
+	_render_bullet_tracers()
+
+func _fire_primary_ricochet_carbine() -> void:
+	if _gas == null:
+		return
+	var is_sliding := (_hero_state == HeroState.SLIDING)
+	var aim_fwd := -camera.global_transform.basis.z.normalized()
+	var right_vec := camera.global_transform.basis.x.normalized()
+	var muzzle := _player_feet + Vector3(0.0, play_eye_height - 0.18, 0.0) + right_vec * 0.35 + aim_fwd * 0.55
+	var targets: Array[Node3D] = []
+	if _companion_initialized:
+		targets.append(ai_companion)
+	var res := _gas.fire_ricochet_weapon(muzzle, camera.global_position, aim_fwd, max_ray_distance, is_sliding, targets)
+	if not bool(res.get("fired", false)):
+		return
+
+	# Check if any bullet or ricochet hit an Option 1 pristine statue to trigger its voxel swap!
+	var phys_hit := _raycast_crosshair()
+	var hit_collider: Object = phys_hit.get("collider") if not phys_hit.is_empty() else null
+	var chipped: PackedVector3Array = res.get("chipped_points", PackedVector3Array())
+	if not chipped.is_empty():
+		var first_pt := chipped[0]
+		_check_and_swap_opt1_easter_island_on_blast(first_pt, 1.5, hit_collider)
+		_check_and_swap_atlas_opt1_on_blast(first_pt, 1.5, hit_collider)
+		_check_and_swap_ape_opt1_on_blast(first_pt, 1.5, hit_collider)
+
+	var dmg := float(res.get("damage", 0.0))
+	var bounces := int(res.get("ricochets", 0))
+	var is_crit := bool(res.get("crit", false))
+	if dmg > 0.0:
+		var tags := "%s%s" % [
+			"HEADSHOT CRIT! " if is_crit else "",
+			"RICOCHET x%d! " % bounces if bounces > 0 else ""
+		]
+		print("[Weapon] %sDealt %.0f bullet dmg to Companion (Ammo: %d/%d%s)" % [
+			tags, dmg, int(res.get("ammo", 0)), _gas.primary_weapon.mag_size,
+			" | SLIDE INFINITE AMMO" if is_sliding else ""
+		])
+
+func _render_bullet_tracers() -> void:
+	if _tracer_immediate_mesh == null:
+		return
+	_tracer_immediate_mesh.clear_surfaces()
+	if _gas == null or _gas.active_tracers.is_empty():
+		return
+	_tracer_immediate_mesh.surface_begin(Mesh.PRIMITIVE_LINES)
+	for seg in _gas.active_tracers:
+		var alpha := clampf(seg.ttl / 0.16, 0.0, 1.0)
+		var col := Color(1.0, 0.88, 0.2, alpha)
+		if seg.is_crit:
+			col = Color(1.0, 0.25, 0.15, alpha)
+		elif seg.bounce_index > 0:
+			col = Color(0.2, 0.95, 1.0, alpha)
+		_tracer_immediate_mesh.surface_set_color(col)
+		_tracer_immediate_mesh.surface_add_vertex(seg.from_pos)
+		_tracer_immediate_mesh.surface_set_color(col)
+		_tracer_immediate_mesh.surface_add_vertex(seg.to_pos)
+	_tracer_immediate_mesh.surface_end()
 
 func _render_hyper_beam_visuals() -> void:
 	if _beam_immediate_mesh == null:
@@ -2325,7 +2407,12 @@ func _update_kelvin_ice_path() -> void:
 		terrain.trigger_elemental_capsule(_last_ice_path_anchor, cur_anchor, play_ice_path_radius, ELEMENTAL_FROST)
 		_last_ice_path_anchor = cur_anchor
 
-func _update_hero_camera_and_visuals(_delta: float) -> void:
+func _update_hero_camera_and_visuals(delta: float) -> void:
+	var target_ads := 1.0 if (_mode == Mode.PLAY and _play_ads_held) else 0.0
+	_ads_blend = move_toward(_ads_blend, target_ads, delta * 9.0) if delta > 0.0 else target_ads
+	if _mode == Mode.PLAY:
+		camera.fov = lerpf(play_fov, 55.0, _ads_blend)
+
 	var cam_rot := Basis.from_euler(Vector3(_pitch, _yaw, 0.0))
 	var crouch_offset := -0.45 if _hero_state == HeroState.SLIDING else 0.0
 	var pivot := _player_feet + Vector3(0.0, play_eye_height + crouch_offset, 0.0)
@@ -2349,7 +2436,9 @@ func _update_hero_camera_and_visuals(_delta: float) -> void:
 		_play_pcam.rotation = Vector3(_pitch, _yaw, 0.0)
 		return
 
-	var desired_cam := pivot + cam_rot * Vector3(play_cam_shoulder_offset.x, play_cam_shoulder_offset.y, play_cam_arm_length)
+	var eff_arm := lerpf(play_cam_arm_length, 2.55, _ads_blend)
+	var eff_shoulder_x := lerpf(play_cam_shoulder_offset.x, 0.52, _ads_blend)
+	var desired_cam := pivot + cam_rot * Vector3(eff_shoulder_x, play_cam_shoulder_offset.y, eff_arm)
 	var final_cam := desired_cam
 	var voxel_hit := terrain.raycast_terrain(pivot, desired_cam)
 	if is_finite(voxel_hit.x):
@@ -2494,8 +2583,15 @@ func _unhandled_input(event: InputEvent) -> void:
 				_toggle_ui_hidden()
 			KEY_Y:
 				_perform_redo()
+			KEY_M:
+				if _mode == Mode.PLAY and not event.echo:
+					_player_vel += Vector3(-sin(_yaw), 0.0, -cos(_yaw)) * 4.5
+					_start_pickaxe_swing()
 			KEY_R:
-				if event.shift_pressed or event.ctrl_pressed or event.meta_pressed:
+				if _mode == Mode.PLAY and not event.shift_pressed and _gas != null:
+					if _gas.start_weapon_reload():
+						print("[Weapon] Reloading Pulse Carbine (%.2fs)... (Press Shift+R to reset statues)" % _gas.primary_weapon.reload_duration)
+				elif event.shift_pressed or event.ctrl_pressed or event.meta_pressed:
 					_perform_undo_all_and_reset()
 				else:
 					_reset_statues()
@@ -2511,6 +2607,8 @@ func _unhandled_input(event: InputEvent) -> void:
 			if _tool_pressed:
 				_tool_pressed = false
 				_end_undo_action()
+			_play_fire_held = false
+			_play_ads_held = false
 			if event.pressed:
 				Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 			return
@@ -2519,8 +2617,9 @@ func _unhandled_input(event: InputEvent) -> void:
 		if event.button_index == MOUSE_BUTTON_LEFT:
 			if _mode == Mode.PLAY:
 				_tool_pressed = false
+				_play_fire_held = event.pressed
 				if event.pressed:
-					_start_pickaxe_swing()
+					_fire_primary_ricochet_carbine()
 				return
 			_tool_pressed = event.pressed
 			if event.pressed:
@@ -2536,11 +2635,18 @@ func _unhandled_input(event: InputEvent) -> void:
 			else:
 				if not _active_undo_action.is_empty():
 					_end_undo_action()
-		elif event.button_index == MOUSE_BUTTON_RIGHT and event.pressed:
-			if Input.is_key_pressed(KEY_SHIFT):
-				_place_companion_at_crosshair()
-			else:
-				_query_companion_cave_path_to_crosshair()
+		elif event.button_index == MOUSE_BUTTON_MIDDLE and event.pressed and _mode == Mode.PLAY:
+			_player_vel += Vector3(-sin(_yaw), 0.0, -cos(_yaw)) * 4.5
+			_start_pickaxe_swing()
+		elif event.button_index == MOUSE_BUTTON_RIGHT:
+			if _mode == Mode.PLAY and not Input.is_key_pressed(KEY_SHIFT):
+				_play_ads_held = event.pressed
+				return
+			if event.pressed:
+				if Input.is_key_pressed(KEY_SHIFT):
+					_place_companion_at_crosshair()
+				else:
+					_query_companion_cave_path_to_crosshair()
 
 func _process(delta: float) -> void:
 	if _bench_banner_timer > 0.0:
@@ -2659,9 +2765,10 @@ func _update_hud(delta: float) -> void:
 			var c_eff := _gas.format_active_effects(ai_companion)
 			comp_line = "
 Companion Target: %.0f/750 HP | Status: %s" % [c_hp, c_eff]
-		tool_text = "%s | HP: %.0f | Spirit: %.0f | Stamina: [%s] | Underfoot: %s | Buffs: %s
+		var w_hud := _gas.format_weapon_hud(_hero_state == HeroState.SLIDING, _play_ads_held) if _gas != null else "Pulse Carbine"
+		tool_text = "%s | %s | HP: %.0f | Spirit: %.0f | Stamina: [%s] | Underfoot: %s | Buffs: %s
 Abilities: %s%s" % [
-			HERO_STATE_NAMES[_hero_state], hero_hp, spirit_val, pips, foot_mat_name, hero_buffs, cd_bar, comp_line
+			HERO_STATE_NAMES[_hero_state], w_hud, hero_hp, spirit_val, pips, foot_mat_name, hero_buffs, cd_bar, comp_line
 		]
 
 	_look_at_accum += delta

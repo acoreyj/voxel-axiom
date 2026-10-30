@@ -23,6 +23,9 @@ signal status_effect_applied(target: Node3D, effect_id: String, stacks: int, dur
 signal status_effect_removed(target: Node3D, effect_id: String)
 signal damage_dealt(target: Node3D, amount: float, is_spirit: bool, source_ability: String)
 signal elemental_combo_triggered(combo_name: String, world_pos: Vector3, radius: float)
+signal weapon_fired(ammo_remaining: int, infinite_slide_shot: bool, ricochet_count: int, hit_crit: bool)
+signal weapon_reload_started(reload_seconds: float)
+signal weapon_reload_completed(mag_size: int)
 
 # ============================================================================
 # 1. Gameplay Tags Bitmask
@@ -217,7 +220,33 @@ class AbilitySpec extends RefCounted:
 		return base_voxel_radius + spirit_power * spirit_radius_scale
 
 # ============================================================================
-# 5. Sub-Stepped Bouncing Voxel Projectile (Viscous / Kelvin Orb)
+# 5. Primary Weapon Spec, SDF Ricochet Raycaster & 3D Tracer Segments
+# ============================================================================
+class WeaponSpec extends RefCounted:
+	var display_name: String = "Pulse Carbine"
+	var mag_size: int = 24
+	var current_ammo: int = 24
+	var fire_interval: float = 0.14
+	var fire_cooldown: float = 0.0
+	var reload_duration: float = 1.55
+	var reload_remaining: float = 0.0
+	var is_reloading: bool = false
+	var base_bullet_damage: float = 24.0
+	var headshot_multiplier: float = 1.85
+	var ricochet_bonus_multiplier: float = 1.25
+	var max_ricochets: int = 2
+	var min_ricochet_cos: float = 0.12
+	var bullet_chip_radius: float = 0.95
+
+class BulletTracerSegment extends RefCounted:
+	var from_pos: Vector3 = Vector3.ZERO
+	var to_pos: Vector3 = Vector3.ZERO
+	var bounce_index: int = 0
+	var is_crit: bool = false
+	var ttl: float = 0.16
+
+# ============================================================================
+# 5b. Sub-Stepped Bouncing Voxel Projectile (Viscous / Kelvin Orb)
 # ============================================================================
 class BouncingVoxelProjectile extends RefCounted:
 	var position: Vector3 = Vector3.ZERO
@@ -253,6 +282,10 @@ var beam_voxel_tick_accum: float = 0.0
 var beam_last_hit_pos: Vector3 = Vector3(INF, INF, INF)
 var beam_current_origin: Vector3 = Vector3.ZERO
 var beam_current_end: Vector3 = Vector3.ZERO
+
+## Primary Weapon & Active 3D Bullet/Ricochet Tracers
+var primary_weapon: WeaponSpec = WeaponSpec.new()
+var active_tracers: Array[BulletTracerSegment] = []
 
 ## Active Sub-Stepped Bouncing Projectiles
 var active_projectiles: Array[BouncingVoxelProjectile] = []
@@ -712,6 +745,184 @@ func spawn_bouncing_cryo_orb(origin: Vector3, aim_dir: Vector3, current_tags: in
 
 ## Ticks all cooldowns, status effects (DoTs, voxel-ice break checks), channeled beams,
 ## and sub-stepped bouncing projectiles.
+func start_weapon_reload() -> bool:
+	if primary_weapon.is_reloading or primary_weapon.current_ammo >= primary_weapon.mag_size:
+		return false
+	primary_weapon.is_reloading = true
+	primary_weapon.reload_remaining = primary_weapon.reload_duration
+	emit_signal("weapon_reload_started", primary_weapon.reload_duration)
+	return true
+
+func format_weapon_hud(is_sliding: bool, is_ads: bool) -> String:
+	var w := primary_weapon
+	var ads_tag := " [ADS]" if is_ads else ""
+	if w.is_reloading:
+		return "%s%s: RELOADING (%.1fs)" % [w.display_name, ads_tag, w.reload_remaining]
+	var slide_tag := " [SLIDE: INFINITE AMMO!]" if is_sliding else ""
+	return "%s%s: %d/%d%s" % [w.display_name, ads_tag, w.current_ammo, w.mag_size, slide_tag]
+
+## Ray-cylinder/capsule intersection for enemy/companion hitboxes with Headshot weakpoint detection.
+## Returns {"hit": bool, "t": float, "point": Vector3, "headshot": bool}
+func _intersect_ray_with_target(ray_from: Vector3, ray_to: Vector3, target: Node3D, radius: float = 0.72, height: float = 1.95) -> Dictionary:
+	if not is_instance_valid(target):
+		return {"hit": false}
+	var base := target.global_position
+	var seg := ray_to - ray_from
+	var seg_len := seg.length()
+	if seg_len <= 1e-4:
+		return {"hit": false}
+	var dir := seg / seg_len
+
+	# Closest approach in 3D to the vertical target spine [base + (0, 0.25, 0) .. base + (0, height, 0)]
+	var center := base + Vector3(0.0, height * 0.5, 0.0)
+	var to_center := center - ray_from
+	var proj := clampf(to_center.dot(dir), 0.0, seg_len)
+	var closest_ray_pt := ray_from + dir * proj
+
+	if closest_ray_pt.y < base.y - 0.15 or closest_ray_pt.y > base.y + height + 0.20:
+		return {"hit": false}
+	var horiz_dist := Vector2(closest_ray_pt.x - base.x, closest_ray_pt.z - base.z).length()
+	if horiz_dist > radius:
+		return {"hit": false}
+
+	# Top 32% of capsule is the Headshot Weakpoint zone!
+	var rel_y := clampf((closest_ray_pt.y - base.y) / height, 0.0, 1.0)
+	var is_headshot := (rel_y >= 0.68)
+	return {
+		"hit": true,
+		"dist": proj,
+		"point": closest_ray_pt,
+		"headshot": is_headshot,
+	}
+
+## Fires a primary round with Deadlock Slide-Infinite-Ammo, Headshot Crits,
+## Voxel Micro-Chipping, and up to `max_ricochets` SDF Surface-Normal Bounces!
+func fire_ricochet_weapon(
+	muzzle_pos: Vector3,
+	aim_origin: Vector3,
+	aim_dir: Vector3,
+	max_dist: float,
+	is_sliding_infinite_ammo: bool,
+	targets: Array[Node3D]
+) -> Dictionary:
+	var w := primary_weapon
+	if (hero_tags & (Tag.STUNNED | Tag.FROZEN)) != 0 and (hero_tags & Tag.UNSTOPPABLE) == 0:
+		return {"fired": false, "reason": "stunned"}
+	if w.fire_cooldown > 0.0:
+		return {"fired": false, "reason": "cooldown"}
+	if w.is_reloading:
+		if not is_sliding_infinite_ammo:
+			return {"fired": false, "reason": "reloading"}
+		# Sliding cancels reload stall and fires with infinite slide ammo!
+		w.is_reloading = false
+		w.reload_remaining = 0.0
+
+	if w.current_ammo <= 0 and not is_sliding_infinite_ammo:
+		start_weapon_reload()
+		return {"fired": false, "reason": "empty_reloading"}
+
+	w.fire_cooldown = w.fire_interval
+	if not is_sliding_infinite_ammo:
+		w.current_ammo = maxi(0, w.current_ammo - 1)
+		if w.current_ammo == 0:
+			start_weapon_reload()
+
+	var cur_from := aim_origin
+	var cur_dir := aim_dir.normalized()
+	var rem_dist := max_dist
+	var bounce_count := 0
+	var any_crit := false
+	var total_damage_dealt := 0.0
+	var hit_target_node: Node3D = null
+	var chipped_points: PackedVector3Array = PackedVector3Array()
+
+	for seg_idx in range(w.max_ricochets + 1):
+		var seg_end := cur_from + cur_dir * rem_dist
+		var vox_hit := Vector3(INF, INF, INF)
+		if terrain != null:
+			vox_hit = terrain.raycast_terrain(cur_from, seg_end)
+		var vox_dist := cur_from.distance_to(vox_hit) if is_finite(vox_hit.x) else INF
+
+		# Check if any target is hit before the voxel wall on this segment
+		var best_target: Node3D = null
+		var best_target_hit: Dictionary = {}
+		var best_target_dist := vox_dist
+		for t in targets:
+			var th := _intersect_ray_with_target(cur_from, seg_end, t)
+			if bool(th.get("hit", false)) and float(th.get("dist", INF)) < best_target_dist:
+				best_target = t
+				best_target_hit = th
+				best_target_dist = float(th.get("dist", INF))
+
+		var tracer_start := muzzle_pos if seg_idx == 0 else cur_from
+		if best_target != null:
+			var hit_pt: Vector3 = best_target_hit.get("point", seg_end)
+			var is_headshot := bool(best_target_hit.get("headshot", false))
+			any_crit = any_crit or is_headshot
+
+			var t_Seg := BulletTracerSegment.new()
+			t_Seg.from_pos = tracer_start
+			t_Seg.to_pos = hit_pt
+			t_Seg.bounce_index = seg_idx
+			t_Seg.is_crit = is_headshot
+			active_tracers.append(t_Seg)
+
+			var dmg := w.base_bullet_damage
+			if is_headshot:
+				dmg *= w.headshot_multiplier
+			if seg_idx > 0:
+				dmg *= w.ricochet_bonus_multiplier
+			# Bonus 25% shatter damage against Frozen or Wall-Pin Stunned targets!
+			if is_target_stunned(best_target):
+				dmg *= 1.25
+
+			total_damage_dealt += deal_ability_damage(best_target, dmg, false, "pulse_carbine_ricochet" if seg_idx > 0 else "pulse_carbine")
+			hit_target_node = best_target
+			break
+
+		if is_finite(vox_hit.x):
+			var t_seg := BulletTracerSegment.new()
+			t_seg.from_pos = tracer_start
+			t_seg.to_pos = vox_hit
+			t_seg.bounce_index = seg_idx
+			t_seg.is_crit = false
+			active_tracers.append(t_seg)
+
+			chipped_points.push_back(vox_hit)
+			if terrain != null:
+				terrain.trigger_explosion(vox_hit, w.bullet_chip_radius)
+
+			# Compute analytical O(1) SDF normal for Ricochet bounce!
+			if seg_idx < w.max_ricochets and terrain != null and terrain.has_method("sample_sdf_normal"):
+				var surf_n: Vector3 = terrain.sample_sdf_normal(vox_hit)
+				if surf_n.length_squared() > 1e-4:
+					cur_dir = cur_dir.bounce(surf_n).normalized()
+					cur_from = vox_hit + surf_n * 0.35
+					rem_dist = maxf(8.0, (rem_dist - vox_dist) * 0.65)
+					bounce_count += 1
+					continue
+			break
+		else:
+			var t_seg := BulletTracerSegment.new()
+			t_seg.from_pos = tracer_start
+			t_seg.to_pos = seg_end
+			t_seg.bounce_index = seg_idx
+			t_seg.is_crit = false
+			active_tracers.append(t_seg)
+			break
+
+	emit_signal("weapon_fired", w.current_ammo, is_sliding_infinite_ammo, bounce_count, any_crit)
+	return {
+		"fired": true,
+		"ammo": w.current_ammo,
+		"infinite_slide": is_sliding_infinite_ammo,
+		"ricochets": bounce_count,
+		"crit": any_crit,
+		"damage": total_damage_dealt,
+		"target": hit_target_node,
+		"chipped_points": chipped_points,
+	}
+
 func tick_ability_system(
 	delta: float,
 	beam_origin: Vector3,
@@ -719,6 +930,22 @@ func tick_ability_system(
 	max_beam_dist: float,
 	targets: Array[Node3D]
 ) -> void:
+	# 0. Tick Primary Weapon fire cooldown, reload timer & 3D bullet tracers
+	if primary_weapon.fire_cooldown > 0.0:
+		primary_weapon.fire_cooldown = maxf(0.0, primary_weapon.fire_cooldown - delta)
+	if primary_weapon.is_reloading:
+		primary_weapon.reload_remaining -= delta
+		if primary_weapon.reload_remaining <= 0.0:
+			primary_weapon.is_reloading = false
+			primary_weapon.reload_remaining = 0.0
+			primary_weapon.current_ammo = primary_weapon.mag_size
+			emit_signal("weapon_reload_completed", primary_weapon.mag_size)
+
+	for i in range(active_tracers.size() - 1, -1, -1):
+		active_tracers[i].ttl -= delta
+		if active_tracers[i].ttl <= 0.0:
+			active_tracers.remove_at(i)
+
 	# 1. Tick ability cooldowns & charge regeneration
 	var eff_cdr := clampf(hero_attributes.cooldown_reduction, 0.0, 0.65)
 	for a in abilities:
