@@ -234,7 +234,7 @@ const TOOL_KEYS := ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"]
 const CONTROLS_TEXT := """CONTROLS  (H hide keys | U hide all UI)
 Mode    F fly / hero play   V toggle 3rd/1st person (in Play)   M (or F8) benchmark
 Hero    WASD move   Shift dash (Space mid-dash = Dash-Jump!)   Ctrl/C slope slide
-Climb   Space jump/mantle   G Shoulder Charge (Wall-Pin/Breach!)   E Ice Path   Q Slam
+Climb   Space jump/mantle   G Charge   E IcePath   Q Slam   Z HyperBeam   X CryoOrb
 Move    W/A/S/D   Space or E up   Ctrl or Q down   Shift sprint
 Look    Mouse   Esc releases cursor   click recaptures
 Build   1 Add terrain   2 Paint   3 Paint delete   4 Boulder
@@ -345,6 +345,10 @@ var _charge_dir: Vector3 = Vector3.FORWARD
 var _charge_pinned_companion: bool = false
 var _companion_stun_timer: float = 0.0
 var _companion_base_mat: StandardMaterial3D = null
+var _gas: VoxelAbilitySystem = null
+var _beam_mesh_inst: MeshInstance3D = null
+var _beam_immediate_mesh: ImmediateMesh = null
+var _beam_impact_sphere: MeshInstance3D = null
 var _ice_path_active: bool = false
 var _last_ice_path_anchor: Vector3 = Vector3(INF, INF, INF)
 var _hero_visual_root: Node3D = null
@@ -542,6 +546,7 @@ func _ready() -> void:
 	_clear_undo_history_to_current_baseline()
 	_setup_phantom_camera()
 	_setup_hero_visual_rig()
+	_setup_ability_system_and_beam_visuals()
 	_update_stream_focus(true)
 	_check_cli_benchmark_autostart()
 	_check_cli_trailer_autostart()
@@ -1389,6 +1394,48 @@ func _setup_hero_visual_rig() -> void:
 	_hero_visor_mesh.position = Vector3(0.0, play_eye_height - 0.12, -play_body_radius * 0.72)
 	_hero_visual_root.add_child(_hero_visor_mesh)
 
+func _setup_ability_system_and_beam_visuals() -> void:
+	_gas = VoxelAbilitySystem.new()
+	_gas.name = "VoxelAbilitySystem"
+	_gas.terrain = terrain
+	_gas.owner_node = self
+	add_child(_gas)
+	_gas.register_target(ai_companion, 750.0)
+
+	_gas.ability_cast_blocked.connect(func(ability_id: String, reason: String) -> void:
+		print("[GAS] %s blocked: %s" % [ability_id, reason])
+	)
+	_gas.status_effect_applied.connect(func(target: Node3D, effect_id: String, stacks: int, dur: float) -> void:
+		var t_name := "Hero" if target == self else "Companion"
+		print("[GAS] Status Applied -> %s: %s (stacks=%d, %.1fs)" % [t_name, effect_id.to_upper(), stacks, dur])
+	)
+	_gas.elemental_combo_triggered.connect(func(combo_name: String, world_pos: Vector3, radius: float) -> void:
+		print("[GAS] *** %s *** at %s (scaled radius=%.1f m)!" % [combo_name, str(world_pos), radius])
+	)
+
+	# 3D Bebop Hyper Beam ribbon & molten impact core
+	_beam_mesh_inst = MeshInstance3D.new()
+	_beam_immediate_mesh = ImmediateMesh.new()
+	var beam_mat := StandardMaterial3D.new()
+	beam_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	beam_mat.albedo_color = Color(1.0, 0.42, 0.08)
+	_beam_mesh_inst.mesh = _beam_immediate_mesh
+	_beam_mesh_inst.material_override = beam_mat
+	add_child(_beam_mesh_inst)
+
+	_beam_impact_sphere = MeshInstance3D.new()
+	var imp_sph := SphereMesh.new()
+	imp_sph.radius = 0.85
+	imp_sph.height = 1.7
+	var imp_mat := StandardMaterial3D.new()
+	imp_mat.albedo_color = Color(1.0, 0.55, 0.1)
+	imp_mat.emission_enabled = true
+	imp_mat.emission = Color(1.0, 0.35, 0.05) * 2.5
+	imp_sph.material = imp_mat
+	_beam_impact_sphere.mesh = imp_sph
+	_beam_impact_sphere.visible = false
+	add_child(_beam_impact_sphere)
+
 func _enter_play() -> void:
 	_mode = Mode.PLAY
 	_tool_pressed = false
@@ -1777,9 +1824,62 @@ func _process_play(delta: float) -> void:
 		_hero_state = HeroState.GROUNDED
 
 	_velocity = Vector3(_player_vel.x, _player_vel_y, _player_vel.z)
+	_sync_and_tick_gas_in_play(delta)
 	_update_kelvin_ice_path()
 	_update_hero_camera_and_visuals(delta)
 	_update_pickaxe_swing(delta)
+
+func _sync_and_tick_gas_in_play(delta: float) -> void:
+	if _gas == null:
+		return
+	if _player_grounded:
+		_gas.hero_tags = (_gas.hero_tags & ~VoxelAbilitySystem.Tag.AIRBORNE) | VoxelAbilitySystem.Tag.GROUNDED
+	else:
+		_gas.hero_tags = (_gas.hero_tags & ~VoxelAbilitySystem.Tag.GROUNDED) | VoxelAbilitySystem.Tag.AIRBORNE
+
+	if _ice_path_active:
+		_gas.apply_status_effect(self, VoxelAbilitySystem.StatusEffectSpec.make_ice_path_surge(0.25))
+	if _foot_material == 3: # Lava -> applies Burning DoT to hero
+		_gas.apply_status_effect(self, VoxelAbilitySystem.StatusEffectSpec.make_burning(24.0, 2.5))
+	elif _foot_material == 4 and _gas.hero_effects.has("burning"): # Water -> cleanses Burning!
+		_gas.hero_effects.erase("burning")
+		_gas._recompute_entity_tags_and_stats(self)
+
+	var aim_fwd := -camera.global_transform.basis.z.normalized()
+	var beam_start := _player_feet + Vector3(0.0, play_eye_height - 0.15, 0.0) + aim_fwd * 0.65
+	var targets: Array[Node3D] = []
+	if _companion_initialized:
+		targets.append(ai_companion)
+	_gas.tick_ability_system(delta, beam_start, aim_fwd, max_ray_distance, targets)
+	_render_hyper_beam_visuals()
+
+func _render_hyper_beam_visuals() -> void:
+	if _beam_immediate_mesh == null:
+		return
+	_beam_immediate_mesh.clear_surfaces()
+	if _gas == null or _gas.active_beam_ability == null or _mode != Mode.PLAY:
+		if _beam_impact_sphere != null:
+			_beam_impact_sphere.visible = false
+		return
+	var a := _gas.beam_current_origin
+	var b := _gas.beam_current_end
+	var up := Vector3.UP * 0.14
+	var side := (b - a).cross(Vector3.UP).normalized() * 0.14
+	_beam_immediate_mesh.surface_begin(Mesh.PRIMITIVE_LINES)
+	_beam_immediate_mesh.surface_add_vertex(a)
+	_beam_immediate_mesh.surface_add_vertex(b)
+	_beam_immediate_mesh.surface_add_vertex(a + up)
+	_beam_immediate_mesh.surface_add_vertex(b + up)
+	_beam_immediate_mesh.surface_add_vertex(a - up)
+	_beam_immediate_mesh.surface_add_vertex(b - up)
+	_beam_immediate_mesh.surface_add_vertex(a + side)
+	_beam_immediate_mesh.surface_add_vertex(b + side)
+	_beam_immediate_mesh.surface_add_vertex(a - side)
+	_beam_immediate_mesh.surface_add_vertex(b - side)
+	_beam_immediate_mesh.surface_end()
+	if _beam_impact_sphere != null:
+		_beam_impact_sphere.visible = true
+		_beam_impact_sphere.global_position = b
 
 func _apply_hero_horizontal_accel(delta: float, wish_dir: Vector3, want_slide: bool) -> void:
 	var horiz_vel := Vector3(_player_vel.x, 0.0, _player_vel.z)
@@ -2016,6 +2116,12 @@ func _try_jump() -> void:
 func _try_shoulder_charge() -> void:
 	if _mode != Mode.PLAY or _hero_state == HeroState.MANTLING or _hero_state == HeroState.SHOULDER_CHARGE:
 		return
+	if _gas != null:
+		var check := _gas.can_activate_ability("abrams_shoulder_charge", _gas.hero_tags)
+		if not bool(check.get("ok", false)):
+			print("[GAS] Shoulder Charge blocked: %s" % String(check.get("reason", "")))
+			return
+		_gas.commit_ability_cooldown("abrams_shoulder_charge")
 	_hero_state = HeroState.SHOULDER_CHARGE
 	_charge_timer = 0.0
 	_charge_pinned_companion = false
@@ -2109,7 +2215,7 @@ func _step_hero_shoulder_charge(delta: float) -> void:
 				if not _charge_pinned_companion and can_breach_mat and wall_thick > 0.05 and wall_thick <= play_charge_breach_max_thickness:
 					var tunnel_end := hit_pos + _charge_dir * (wall_thick + 0.9)
 					terrain.carve_capsule(hit_pos - _charge_dir * 0.4, tunnel_end, 2.3)
-					print("[WallPin] BREACHED thin %s wall (thickness=%.2f m) at %s ΓÇö keeping charge momentum!" % [
+					print("[WallPin] BREACHED thin %s wall (thickness=%.2f m) at %s — keeping charge momentum!" % [
 						mat_name, wall_thick, str(hit_pos)
 					])
 					_player_feet = next_feet
@@ -2126,9 +2232,15 @@ func _step_hero_shoulder_charge(delta: float) -> void:
 						hit_pos.z + wall_n_xz.z * 0.65
 					)
 					_companion_stun_timer = play_charge_pin_stun_seconds
-					print("[WallPin] PINNED AI Companion against %s wall at %s (cos=%.2f, thickness=%.2f m) -> STUNNED for %.1f s!" % [
-						mat_name, str(hit_pos), impact_cos, wall_thick, play_charge_pin_stun_seconds
-					])
+					if _gas != null:
+						var base_dmg := _gas.get_ability("abrams_shoulder_charge").compute_scaled_damage(_gas.hero_attributes.get_spirit_power())
+						# Bonus 50% Shatter Damage if pinned against already-cracked rock!
+						var shatter_mult := 1.5 if wall_dmg >= 0.30 else 1.0
+						var dealt := _gas.deal_ability_damage(ai_companion, base_dmg * shatter_mult, false, "abrams_shoulder_charge")
+						_gas.apply_status_effect(ai_companion, VoxelAbilitySystem.StatusEffectSpec.make_wall_pin_stun(play_charge_pin_stun_seconds))
+						print("[WallPin+GAS] PINNED Companion against %s wall -> dealt %.0f dmg (shatter=%.1fx) & applied WALL-PIN STUN (%.1fs)!" % [
+							mat_name, dealt, shatter_mult, play_charge_pin_stun_seconds
+						])
 				else:
 					print("[WallPin] Heavy Shoulder Charge slammed %s wall at %s (cos=%.2f, thickness=%.2f m)!" % [
 						mat_name, str(hit_pos), impact_cos, wall_thick
@@ -2160,6 +2272,12 @@ func _step_hero_shoulder_charge(delta: float) -> void:
 func _try_ground_slam() -> void:
 	if _mode != Mode.PLAY or _player_grounded or _hero_state == HeroState.MANTLING:
 		return
+	if _gas != null:
+		var check := _gas.can_activate_ability("lash_ground_strike", _gas.hero_tags | VoxelAbilitySystem.Tag.AIRBORNE)
+		if not bool(check.get("ok", false)):
+			print("[GAS] Ground Strike blocked: %s" % String(check.get("reason", "")))
+			return
+		_gas.commit_ability_cooldown("lash_ground_strike")
 	_hero_state = HeroState.GROUND_SLAM
 	var aim_fwd := Vector3(-sin(_yaw), 0.0, -cos(_yaw)) * 8.0
 	_player_vel.x = aim_fwd.x
@@ -2177,10 +2295,18 @@ func _step_hero_ground_slam(delta: float) -> void:
 		_player_vel_y = 0.0
 		_player_grounded = true
 		_hero_state = HeroState.GROUNDED
-		var dom_mat := terrain.get_dominant_material_in_sphere(hit, play_ground_slam_radius * 0.65) if terrain.has_method("get_dominant_material_in_sphere") else MATERIAL_SOIL
-		var mat_name: String = MATERIAL_ID_NAMES[dom_mat] if dom_mat >= 0 and dom_mat < MATERIAL_ID_NAMES.size() else "Terrain"
-		print("[HeroController] Ground Strike impacted %s at %s -> carving %.1f m crater!" % [mat_name, str(hit), play_ground_slam_radius])
-		terrain.trigger_explosion(hit, play_ground_slam_radius)
+		if _gas != null:
+			var targets: Array[Node3D] = []
+			if _companion_initialized:
+				targets.append(ai_companion)
+			var res := _gas.resolve_ground_strike_combo(hit, targets)
+			var dom_mat := int(res.get("material", MATERIAL_SOIL))
+			var mat_name: String = MATERIAL_ID_NAMES[dom_mat] if dom_mat >= 0 and dom_mat < MATERIAL_ID_NAMES.size() else "Terrain"
+			print("[GAS] Ground Strike impacted %s -> %s (radius=%.1f m, dmg=%.0f)!" % [
+				mat_name, String(res.get("combo", "Crater")), float(res.get("radius", play_ground_slam_radius)), float(res.get("damage", 125.0))
+			])
+		else:
+			terrain.trigger_explosion(hit, play_ground_slam_radius)
 		return
 	_player_feet = next_feet
 
@@ -2282,9 +2408,28 @@ func _unhandled_input(event: InputEvent) -> void:
 			KEY_E:
 				if _mode == Mode.PLAY and not event.echo:
 					_ice_path_active = not _ice_path_active
+					if _gas != null:
+						var a_ice := _gas.get_ability("kelvin_ice_path")
+						if a_ice != null:
+							a_ice.is_toggled_on = _ice_path_active
 					if not _ice_path_active:
 						_last_ice_path_anchor = Vector3(INF, INF, INF)
-					print("[HeroController] Kelvin Ice Path skyway: %s" % ("ACTIVE" if _ice_path_active else "OFF"))
+					print("[GAS] Kelvin Ice Path skyway: %s" % ("ACTIVE (+18 Spirit, +24% Speed)" if _ice_path_active else "OFF"))
+			KEY_Z:
+				if _mode == Mode.PLAY and not event.echo and _gas != null \
+						and not (event.ctrl_pressed or event.meta_pressed):
+					if _gas.start_hyper_beam(_gas.hero_tags):
+						print("[GAS] Bebop Hyper Beam CHANNELING (2.6s molten laser trench, Unstoppable)!")
+				elif event.shift_pressed and (event.ctrl_pressed or event.meta_pressed):
+					_perform_redo()
+				else:
+					_perform_undo()
+			KEY_X:
+				if _mode == Mode.PLAY and not event.echo and _gas != null:
+					var aim_fwd := -camera.global_transform.basis.z.normalized()
+					var orb_origin := _player_feet + Vector3(0.0, play_eye_height - 0.1, 0.0)
+					if _gas.spawn_bouncing_cryo_orb(orb_origin, aim_fwd, _gas.hero_tags, self):
+						print("[GAS] Fired Cryo-Bounce Orb (ricochets off SDF normals, Chills/Freezes companion in Voxel Ice)!")
 			KEY_G:
 				if _mode == Mode.PLAY and not event.echo:
 					_try_shoulder_charge()
@@ -2320,11 +2465,6 @@ func _unhandled_input(event: InputEvent) -> void:
 				controls_label.visible = _controls_visible and not _ui_hidden
 			KEY_U:
 				_toggle_ui_hidden()
-			KEY_Z:
-				if event.shift_pressed and (event.ctrl_pressed or event.meta_pressed):
-					_perform_redo()
-				else:
-					_perform_undo()
 			KEY_Y:
 				_perform_redo()
 			KEY_R:
@@ -2477,12 +2617,25 @@ func _update_hud(delta: float) -> void:
 		return
 
 	var mode_name := ("Hero 3P" if play_third_person else "Hero 1P") if _mode == Mode.PLAY else "Fly"
-	var pips := "Γûá".repeat(_stamina_charges) + "Γûí".repeat(maxi(0, play_max_stamina - _stamina_charges))
+	var pips := "■".repeat(_stamina_charges) + "□".repeat(maxi(0, play_max_stamina - _stamina_charges))
 	var foot_mat_name: String = MATERIAL_ID_NAMES[_foot_material] if _foot_material >= 0 and _foot_material < MATERIAL_ID_NAMES.size() else "Air"
-	var ice_tag := " | IcePath: ON (E)" if _ice_path_active else ""
-	var tool_text := "%s | Stamina: [%s] | Underfoot: %s%s" % [
-		HERO_STATE_NAMES[_hero_state], pips, foot_mat_name, ice_tag
-	] if _mode == Mode.PLAY else "[%s] %s%s" % [TOOL_KEYS[_active_tool], TOOL_NAMES[_active_tool], material_state]
+	var tool_text := "[%s] %s%s" % [TOOL_KEYS[_active_tool], TOOL_NAMES[_active_tool], material_state]
+	if _mode == Mode.PLAY:
+		var spirit_val := _gas.hero_attributes.get_spirit_power() if _gas != null else 42.0
+		var hero_hp := _gas.hero_attributes.health if _gas != null else 750.0
+		var hero_buffs := _gas.format_active_effects(self) if _gas != null else "None"
+		var cd_bar := _gas.format_cooldown_bar() if _gas != null else ""
+		var comp_line := ""
+		if _companion_initialized and _gas != null:
+			var c_attr: VoxelAbilitySystem.HeroAttributes = _gas.target_attributes.get(ai_companion.get_instance_id(), null)
+			var c_hp := c_attr.health if c_attr != null else 750.0
+			var c_eff := _gas.format_active_effects(ai_companion)
+			comp_line = "
+Companion Target: %.0f/750 HP | Status: %s" % [c_hp, c_eff]
+		tool_text = "%s | HP: %.0f | Spirit: %.0f | Stamina: [%s] | Underfoot: %s | Buffs: %s
+Abilities: %s%s" % [
+			HERO_STATE_NAMES[_hero_state], hero_hp, spirit_val, pips, foot_mat_name, hero_buffs, cd_bar, comp_line
+		]
 
 	_look_at_accum += delta
 	if _look_at_accum >= LOOK_AT_REFRESH_INTERVAL:
@@ -3038,7 +3191,7 @@ func _stamp_asset_at_crosshair(recreate_delay: float) -> void:
 		])
 	else:
 		_active_undo_action.clear()
-		push_warning("[VoxelTerrain3D] Failed to stamp '%s' ΓÇö bake one first: voxel_baker <model.obj> %s" % [
+		push_warning("[VoxelTerrain3D] Failed to stamp '%s' — bake one first: voxel_baker <model.obj> %s" % [
 			stamp_asset_path, stamp_asset_path
 		])
 
@@ -3063,7 +3216,7 @@ func _query_companion_cave_path_to_crosshair() -> void:
 		ai_companion.global_position = goal_pos
 		_companion_vertical_vel = 0.0
 		_companion_initialized = true
-		print("[Nav3D] Companion placed at ", goal_pos, " ΓÇö Right-click another spot to path there!")
+		print("[Nav3D] Companion placed at ", goal_pos, " — Right-click another spot to path there!")
 		return
 
 	_pending_path_goal = goal_pos
@@ -3129,10 +3282,22 @@ func _draw_path_ribbon(path: PackedVector3Array) -> void:
 func _step_companion_along_path(delta: float) -> void:
 	if _companion_stun_timer > 0.0:
 		_companion_stun_timer = maxf(0.0, _companion_stun_timer - delta)
-		if _companion_base_mat != null:
-			var stunned := _companion_stun_timer > 0.0
-			_companion_base_mat.albedo_color = Color(1.0, 0.45, 0.1) if stunned else Color(0.1, 0.95, 1.0)
-			_companion_base_mat.emission = (Color(1.0, 0.4, 0.05) * 1.1) if stunned else (Color(0.1, 0.85, 1.0) * 0.6)
+	var gas_stunned := _gas != null and _gas.is_target_stunned(ai_companion)
+	if _companion_base_mat != null and _gas != null:
+		var c_tags := int(_gas.target_tags.get(ai_companion.get_instance_id(), 0))
+		if (c_tags & VoxelAbilitySystem.Tag.FROZEN) != 0:
+			_companion_base_mat.albedo_color = Color(0.55, 0.96, 1.0)
+			_companion_base_mat.emission = Color(0.35, 0.90, 1.0) * 1.6
+		elif _companion_stun_timer > 0.0 or (c_tags & VoxelAbilitySystem.Tag.STUNNED) != 0:
+			_companion_base_mat.albedo_color = Color(1.0, 0.45, 0.1)
+			_companion_base_mat.emission = Color(1.0, 0.4, 0.05) * 1.2
+		elif (c_tags & VoxelAbilitySystem.Tag.BURNING) != 0:
+			_companion_base_mat.albedo_color = Color(1.0, 0.28, 0.06)
+			_companion_base_mat.emission = Color(1.0, 0.22, 0.04) * 1.3
+		else:
+			_companion_base_mat.albedo_color = Color(0.1, 0.95, 1.0)
+			_companion_base_mat.emission = Color(0.1, 0.85, 1.0) * 0.6
+	if _companion_stun_timer > 0.0 or gas_stunned:
 		return
 	if _charge_pinned_companion:
 		return
@@ -4360,14 +4525,14 @@ func _build_benchmark_markdown_report(aborted: bool) -> String:
 		hw.get("completed_at_utc", hw.get("timestamp_utc", "")),
 		float(hw.get("total_duration_sec", 0.0)),
 	])
-	lines.append("- **Pre-Pass Terrain Reset**: `Enabled (%s)` ΓÇö pristine terrain & statues restored before every pass" % _bench_last_reset_method)
+	lines.append("- **Pre-Pass Terrain Reset**: `Enabled (%s)` — pristine terrain & statues restored before every pass" % _bench_last_reset_method)
 	lines.append("- **CPU**: %s (`%s`, %d logical threads, %d voxel worker threads)" % [
 		hw.get("cpu_name", "Unknown"),
 		hw.get("cpu_arch", ""),
 		int(hw.get("cpu_threads", 0)),
 		int(hw.get("voxel_worker_threads", 0)),
 	])
-	lines.append("- **GPU**: %s ΓÇö %s (%s, API `%s`, driver `%s` / `%s`)" % [
+	lines.append("- **GPU**: %s — %s (%s, API `%s`, driver `%s` / `%s`)" % [
 		hw.get("gpu_name", "Unknown"),
 		hw.get("gpu_vendor", ""),
 		hw.get("gpu_type", ""),

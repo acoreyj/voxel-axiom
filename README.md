@@ -770,6 +770,8 @@ removed.
 | `Shift` | Fly speed boost; stamina dash in Play mode (tap `Space` during the dash for a Dash-Jump) |
 | `V` | Toggle 3rd-person over-the-shoulder / 1st-person view in Play mode |
 | `G` | Shoulder Charge in Play mode (swept wall-pin, thin-wall breach, target capture) |
+| `Z` | Bebop Hyper Beam in Play mode (`Ctrl + Z` still undoes) |
+| `X` | Fire a bouncing Cryo Orb in Play mode |
 | Mouse | Look |
 | `1` | Add terrain |
 | `2` | Paint terrain (hold and drag) |
@@ -786,7 +788,7 @@ removed.
 | `B` | Stamp configured asset with reconstitution timer |
 | `Shift + B` | Stamp configured asset permanently |
 | `R` | Reset all six demo statues |
-| `Z` / `Ctrl + Z` | Undo the last edit, stroke, stamp, or statue swap |
+| `Z` / `Ctrl + Z` | Undo the last edit, stroke, stamp, or statue swap (`Ctrl + Z` in Play mode) |
 | `Y` / `Ctrl + Y` / `Ctrl + Shift + Z` | Redo the last undone action |
 | `Shift + R` / `Ctrl + R` | Undo every terrain edit and restore all statues to the pristine baseline |
 | `T` | Toggle add/paint material (soil / hard rock) |
@@ -853,6 +855,36 @@ stamina/dash/slide, mantling, shoulder charge, camera, and abilities. It exposes
 `wall_breached`. Assign `terrain` (a `VoxelTerrain3D`), optionally fill `chargeable_targets`,
 then call `step_controller(delta, input_move, want_jump, want_dash, want_crouch_slide,
 want_shoulder_charge)` from your own `_process`.
+
+### GAS-lite ability system
+
+`voxel_ability_system.gd` defines `class_name VoxelAbilitySystem` (`extends Node`), a
+data-driven ability and status layer wired into Play Mode. It owns gameplay-tag masks,
+`HeroAttributes` (base stats plus modifier stacks), `StatusEffectSpec` (timed buffs,
+Burning DoT, stacking Chilled, Frozen, Wall-Pin Stun, Ice Surge), `AbilitySpec` (delivery
+mode, cooldown/charges, Spirit scaling), 11 Hz channel ticks, and SDF-bouncing projectiles.
+
+| Key | Ability | Behavior |
+| --- | --- | --- |
+| `E` | Kelvin Ice Path | Toggle a Frost capsule bridge and grant Ice Surge (+18 Spirit, +24% speed). |
+| `G` | Abrams Shoulder Charge | Capture a target, deal `110 + 1.5 * Spirit` on a wall pin, +50% shatter bonus on cracked rock, and apply Wall-Pin Stun. |
+| `Q` | Lash Ground Strike | Airborne slam with Lava/Ice/Water elemental combo variants. |
+| `Z` | Bebop Hyper Beam | 2.6 s CHANNELING + UNSTOPPABLE lava trench; voxel edits are throttled to 11 Hz. |
+| `X` | Cryo Bounce Orb | Two-charge ricochet orb; bounces off `sweep_sphere` normals and applies Chilled/Frozen ice shells. |
+
+Status reactions are automatic: standing on Lava applies Burning, Water cleanses it, three
+Chilled stacks promote to Frozen (stamping a destructible voxel ice shell), and explosions
+or Lava can break the shell early. The HUD shows HP, Spirit, stamina pips, active buffs, and
+the five-ability cooldown bar.
+
+Standalone usage: add a `VoxelAbilitySystem` node, assign `terrain` and `owner_node`,
+optionally call `register_target()`, then call `tick_ability_system(delta, beam_origin,
+aim_dir, max_distance, targets)` each frame. Cast through `start_hyper_beam()`,
+`spawn_bouncing_cryo_orb()`, `resolve_ground_strike_combo()`, and gate casts with
+`can_activate_ability()` / `commit_ability_cooldown()`. Signals: `ability_cast_started`,
+`ability_cast_blocked`, `ability_channel_ticked`, `ability_completed`,
+`status_effect_applied`, `status_effect_removed`, `damage_dealt`, and
+`elemental_combo_triggered`.
 
 ### First-person pickaxe viewmodel
 
