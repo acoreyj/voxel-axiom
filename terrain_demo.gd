@@ -235,6 +235,7 @@ const CONTROLS_TEXT := """CONTROLS  (H hide keys | U hide all UI)
 Mode    F fly / hero play   V toggle 3rd/1st person (in Play)   M (or F8) benchmark
 Hero    WASD move   Shift dash (Space mid-dash = Dash-Jump!)   Ctrl/C slope slide
 Climb   Space jump/mantle   G Charge   E IcePath   Q Slam   Z HyperBeam   X CryoOrb
+Build   1 Ice Dome   2 Spectral Wall   Shift+4 roller   LMB pickaxe
 Move    W/A/S/D   Space or E up   Ctrl or Q down   Shift sprint
 Look    Mouse   Esc releases cursor   click recaptures
 Build   1 Add terrain   2 Paint   3 Paint delete   4 Boulder
@@ -2384,7 +2385,33 @@ func _unhandled_input(event: InputEvent) -> void:
 			return
 		if _mode == Mode.BENCHMARK and event.keycode not in [KEY_ESCAPE, KEY_H, KEY_U, KEY_F]:
 			return
-		if _mode == Mode.PLAY and event.keycode in [KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_0, KEY_B]:
+		if _mode == Mode.PLAY and _gas != null:
+			if event.keycode == KEY_1:
+				var dome_res := _gas.cast_or_dismiss_frozen_shelter(_player_feet, _gas.hero_tags)
+				if dome_res.get("action") == "spawned":
+					print("[GAS] Spawned Kelvin Frozen Shelter (Hollow Ice Dome #%d, r=%.1fm, TTL=%.1fs - press 1 again to shatter early)!" % [
+						int(dome_res.get("structure_id", 0)), float(dome_res.get("radius", 8.5)), float(dome_res.get("duration", 6.5))
+					])
+				elif dome_res.get("action") == "dismissed":
+					print("[GAS] Dismissed Kelvin Frozen Shelter (#%d) early!" % int(dome_res.get("structure_id", 0)))
+				return
+			if event.keycode == KEY_2:
+				var fwd := Vector3(-sin(_yaw), 0.0, -cos(_yaw)).normalized()
+				var aim_pt := _pickaxe_aim_point()
+				if not is_finite(aim_pt.x) or aim_pt.distance_to(_player_feet) > 28.0:
+					aim_pt = _player_feet + fwd * 10.0
+					var g_y := _ground_probe(aim_pt + Vector3(0.0, 6.0, 0.0), 24.0)
+					if is_finite(g_y):
+						aim_pt.y = g_y
+				var wall_res := _gas.cast_or_dismiss_spectral_wall(aim_pt, fwd, _gas.hero_tags)
+				if wall_res.get("action") == "spawned":
+					print("[GAS] Raised McGinnis Spectral Wall (#%d, width=%.1fm, 3-Hit Rock, TTL=%.1fs - press 2 to drop or G to Wall-Pin into it)!" % [
+						int(wall_res.get("structure_id", 0)), float(wall_res.get("width", 14.0)), float(wall_res.get("duration", 7.5))
+					])
+				elif wall_res.get("action") == "dismissed":
+					print("[GAS] Dropped McGinnis Spectral Wall (#%d) early!" % int(wall_res.get("structure_id", 0)))
+				return
+		if _mode == Mode.PLAY and event.keycode in [KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_0, KEY_B]:
 			return
 		match event.keycode:
 			KEY_ESCAPE:

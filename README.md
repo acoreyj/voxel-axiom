@@ -705,7 +705,10 @@ Runtime methods:
 | `add_capsule_with_material(from, to, radius, material)` | `void` | Swept capsule fill with material `1..7`. |
 | `trigger_elemental_capsule(from, to, radius, kind)` | `void` | Swept water/frost/lava reaction along the segment. |
 | `stamp_asset(vreg_path, chunk_coords, recreate_delay_seconds)` | `int` | Stamp a `.vreg`; returns `structure_id`, or 0 on failure. |
-| `remove_structure(structure_id)` | `bool` | Restore the pre-stamp world. |
+| `remove_structure(structure_id)` | `bool` | Restore the pre-stamp world or dismiss a temporary construct early. |
+| `spawn_temporary_dome(center, radius, wall_thickness, material, duration)` | `int` | Hollow shell construct (e.g. Kelvin Ice Dome) with an auto-expire TTL; returns `structure_id`. |
+| `spawn_temporary_wall(from, to, height, thickness, material, duration)` | `int` | Oriented barrier slab (e.g. McGinnis Spectral Wall) with an auto-expire TTL; returns `structure_id`. |
+| `get_structure_remaining_ttl(structure_id)` | `float` | Remaining construct lifetime in seconds, or 0.0 once expired/dismissed. |
 | `raycast_terrain(from, to)` | `Vector3` | Surface hit, or `+INF` on miss. |
 | `raycast_terrain_material(from, to)` | `int` | Material ID, or -1 on miss. |
 | `raycast_terrain_normal(from, to)` | `Vector3` | Surface normal at the first hit, or `+INF` on miss. |
@@ -717,8 +720,6 @@ Runtime methods:
 | `get_dominant_material_in_sphere(center, radius)` | `int` | Most common non-air material ID, or 0. |
 | `sweep_sphere(from, to, radius)` | `Vector3` | Swept-sphere SDF contact for wall-pin / charge checks, or `+INF` when clear. |
 | `measure_wall_thickness(impact_pos, direction, max_thickness)` | `float` | Wall thickness in meters, or `max_thickness + 1.0` when solid throughout. |
-| `sweep_sphere(from, to, radius)` | `Vector3` | Sweep a sphere along a segment against the SDF; contact point or `+INF` when clear. |
-| `measure_wall_thickness(impact_pos, direction, max_thickness)` | `float` | Thickness of the wall along `direction`, or `max_thickness + 1.0` when solid throughout. |
 | `get_surface_height(x, z)` | `float` | Top surface height at world X/Z. |
 | `undo()` / `redo()` | `bool` | Revert or re-apply one history action. |
 | `undo_all()` / `redo_all()` | `int` | Coalesced full-stack revert or re-apply. |
@@ -773,8 +774,8 @@ removed.
 | `Z` | Bebop Hyper Beam in Play mode (`Ctrl + Z` still undoes) |
 | `X` | Fire a bouncing Cryo Orb in Play mode |
 | Mouse | Look |
-| `1` | Add terrain |
-| `2` | Paint terrain (hold and drag) |
+| `1` | Add terrain (Fly) / Kelvin Frozen Shelter (Play) |
+| `2` | Paint terrain (Fly, hold and drag) / McGinnis Spectral Wall (Play) |
 | `3` | Paint delete (hold and drag) |
 | `4` | Place boulder (static 5-hit voxel stamp) |
 | `Shift + 4` | Rolling boulder mode; click spawns a dynamic `RigidBody3D` that bakes into 5-hit voxels once it settles |
@@ -871,11 +872,19 @@ mode, cooldown/charges, Spirit scaling), 11 Hz channel ticks, and SDF-bouncing p
 | `Q` | Lash Ground Strike | Airborne slam with Lava/Ice/Water elemental combo variants. |
 | `Z` | Bebop Hyper Beam | 2.6 s CHANNELING + UNSTOPPABLE lava trench; voxel edits are throttled to 11 Hz. |
 | `X` | Cryo Bounce Orb | Two-charge ricochet orb; bounces off `sweep_sphere` normals and applies Chilled/Frozen ice shells. |
+| `1` | Kelvin Frozen Shelter | Hollow 8.5 m Ice Dome (TTL 6.5 s); press again to shatter early. |
+| `2` | McGinnis Spectral Wall | 14 m × 6.5 m 3-hit Hard Rock barrier (TTL 7.5 s); press again to drop, or pin a target into it with `G`. |
 
 Status reactions are automatic: standing on Lava applies Burning, Water cleanses it, three
 Chilled stacks promote to Frozen (stamping a destructible voxel ice shell), and explosions
 or Lava can break the shell early. The HUD shows HP, Spirit, stamina pips, active buffs, and
-the five-ability cooldown bar.
+the seven-ability cooldown bar with live temporary-construct TTL countdowns.
+
+Temporary constructs use `spawn_temporary_dome()` / `spawn_temporary_wall()` and auto-expire
+when their TTL elapses or on a second press of the same key. Expiration restores only the
+voxel samples the construct itself modified (`ConstructVoxelBackup`), so craters blasted into
+the ground or walls while the construct was active remain carved; the per-voxel delta backup
+also preserves pre-existing damage and colors.
 
 Standalone usage: add a `VoxelAbilitySystem` node, assign `terrain` and `owner_node`,
 optionally call `register_target()`, then call `tick_ability_system(delta, beam_origin,

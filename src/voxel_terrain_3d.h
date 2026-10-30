@@ -90,6 +90,18 @@ public:
     /// pre-stamp TSDF, material, and color state. Returns false when the engine is
     /// not ready or `p_structure_id` is unknown.
     bool remove_structure(int64_t p_structure_id);
+    /// Spawns a hollow hemispherical shell (Kelvin Frozen Shelter style) with an
+    /// auto-expire TTL. Returns the structure ID, or 0 when the engine is not ready
+    /// or no chunks are in range. `p_wall_thickness` is the shell thickness in meters.
+    int spawn_temporary_dome(Vector3 p_center, float p_radius, float p_wall_thickness,
+                             int p_material_id, float p_duration_seconds);
+    /// Spawns an oriented solid barrier slab between `p_from` and `p_to` (McGinnis
+    /// Spectral Wall style) with an auto-expire TTL. Returns the structure ID, or 0.
+    int spawn_temporary_wall(Vector3 p_from, Vector3 p_to, float p_height, float p_thickness,
+                             int p_material_id, float p_duration_seconds);
+    /// Remaining lifetime in seconds of an active temporary construct, or 0.0 when
+    /// expired/dismissed or unknown.
+    [[nodiscard]] float get_structure_remaining_ttl(int p_structure_id) const;
     /// Engine-side voxel raycast against resident TSDF chunks. Returns the
     /// interpolated surface point, or a Vector3 of +INF when nothing is hit
     /// (ray starts inside solid, ends in air, or crosses only unloaded space).

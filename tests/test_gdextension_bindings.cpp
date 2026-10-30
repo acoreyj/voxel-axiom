@@ -914,6 +914,89 @@ void test_gdextension_fast_sdf_surface_queries_and_capsule_edits() {
     std::printf("[PASS] test_gdextension_fast_sdf_surface_queries_and_capsule_edits (O(1) SDF/normal/material/damage + capsule CSG verified)\n");
 }
 
+// ============================================================================
+// 7. Temporary Voxel Hero Constructs with Auto-Expire TTLs (Kelvin Ice Dome &
+//    McGinnis Spectral Wall) + Mid-Fight Partial Destruction & Crater Preservation
+// ============================================================================
+void test_gdextension_temporary_hero_constructs_dome_and_wall_ttl() {
+    ++g_tests_run;
+
+    const std::filesystem::path save_dir = "/tmp/voxel_gdextension_constructs_ttl_test";
+    std::filesystem::remove_all(save_dir);
+
+    VoxelTerrain3D terrain;
+    terrain.set_save_directory_path(save_dir.string());
+    terrain.set_view_distance_chunks(1);
+    terrain.set_prefetch_distance_chunks(0);
+    terrain.set_world_height_chunks(3);
+    terrain.set_upload_budget_ms(8.0f);
+    terrain._enter_tree();
+
+    terrain.set_stream_focus(Vector3(16.0f, 68.0f, 16.0f), Vector3(0.0f, 0.0f, 0.0f));
+    wait_until_terrain_fully_committed(terrain);
+
+    const float surf_y = terrain.get_surface_height(16.0f, 16.0f);
+    const Vector3 dome_center(16.0f, surf_y, 16.0f);
+    const Vector3 dome_roof_pt(16.0f, surf_y + 7.5f, 16.0f);
+    const Vector3 dome_interior_pt(16.0f, surf_y + 3.0f, 16.0f);
+
+    // Before spawning Kelvin's Ice Dome, both roof and interior are open air (SDF > 0)
+    REQUIRE(terrain.sample_sdf(dome_roof_pt) > 0.5f);
+    REQUIRE(terrain.sample_sdf(dome_interior_pt) > 0.5f);
+
+    // 1. Spawn Kelvin Frozen Shelter (radius=8.5m, wall_thickness=2.2m, Ice=6, TTL=2.0s)
+    const int dome_id = terrain.spawn_temporary_dome(
+        dome_center, 8.5f, 2.2f, static_cast<int>(voxel::MaterialHardness::kMaterialIce), 2.0f);
+    REQUIRE(dome_id > 0);
+    REQUIRE(terrain.get_structure_remaining_ttl(dome_id) > 1.8f);
+    wait_until_terrain_fully_committed(terrain);
+
+    // Verify the dome roof is solid Ice while the interior remains hollow Air!
+    REQUIRE(terrain.sample_sdf(dome_roof_pt) <= 0.0f);
+    REQUIRE(terrain.get_material_at(dome_roof_pt) == static_cast<int>(voxel::MaterialHardness::kMaterialIce));
+    REQUIRE(terrain.sample_sdf(dome_interior_pt) > 1.0f);
+
+    // 2. Blast a crater into the ground next to the dome while the dome is active
+    const Vector3 side_crater_pt(8.0f, surf_y, 16.0f);
+    terrain.trigger_explosion(side_crater_pt, 3.5f);
+    wait_until_terrain_fully_committed(terrain);
+    REQUIRE(terrain.sample_sdf(side_crater_pt) > 0.25f);
+
+    // 3. Advance _process() past the 2.0s TTL so the Ice Dome auto-expires
+    for (int step = 0; step < 15; ++step) {
+        terrain._process(0.20);
+    }
+    wait_until_terrain_fully_committed(terrain);
+
+    // Dome roof has melted back to Air (TTL=0), while the side crater remains carved!
+    REQUIRE(terrain.get_structure_remaining_ttl(dome_id) == 0.0f);
+    REQUIRE(terrain.sample_sdf(dome_roof_pt) > 0.5f);
+    REQUIRE(terrain.sample_sdf(side_crater_pt) > 0.25f);
+
+    // 4. Spawn McGinnis Spectral Wall (HardRock=2, height=6m, thickness=2.2m, TTL=10s) and dismiss early
+    const Vector3 wall_a(10.0f, surf_y, 10.0f);
+    const Vector3 wall_b(22.0f, surf_y, 10.0f);
+    const Vector3 wall_mid(16.0f, surf_y + 3.0f, 10.0f);
+    REQUIRE(terrain.sample_sdf(wall_mid) > 0.5f);
+
+    const int wall_id = terrain.spawn_temporary_wall(
+        wall_a, wall_b, 6.0f, 2.2f, static_cast<int>(voxel::MaterialHardness::kMaterialHardRock), 10.0f);
+    REQUIRE(wall_id > 0);
+    wait_until_terrain_fully_committed(terrain);
+    REQUIRE(terrain.sample_sdf(wall_mid) <= 0.0f);
+    REQUIRE(terrain.get_material_at(wall_mid) == static_cast<int>(voxel::MaterialHardness::kMaterialHardRock));
+
+    // Dismiss the wall early via remove_structure(wall_id)
+    REQUIRE(terrain.remove_structure(wall_id));
+    wait_until_terrain_fully_committed(terrain);
+    REQUIRE(terrain.sample_sdf(wall_mid) > 0.5f);
+
+    terrain._exit_tree();
+    std::filesystem::remove_all(save_dir);
+
+    std::printf("[PASS] test_gdextension_temporary_hero_constructs_dome_and_wall_ttl (hollow Ice Dome TTL + Spectral Wall dismiss + crater preservation verified)\n");
+}
+
 } // namespace
 
 int main() {
@@ -931,6 +1014,7 @@ int main() {
     test_gdextension_undo_redo_and_benchmark_pass_reset();
     test_gdextension_underground_atomic_crater_commit_no_see_through();
     test_gdextension_fast_sdf_surface_queries_and_capsule_edits();
+    test_gdextension_temporary_hero_constructs_dome_and_wall_ttl();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",
                 g_tests_run, g_assertions_checked);
     return EXIT_SUCCESS;

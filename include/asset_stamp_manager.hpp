@@ -22,6 +22,14 @@ enum class StampBlendMode : uint8_t {
     Overwrite = 1  // Asset completely replaces chunk voxels where asset is non-empty
 };
 
+struct ConstructVoxelBackup {
+    uint32_t linear_index = 0;
+    int16_t pre_tsdf = 0;
+    uint8_t pre_material = 0;
+    uint8_t pre_damage = 0;
+    uint16_t pre_color = VoxelColor::kUnpainted;
+};
+
 struct StampedStructureInstance {
     uint32_t id = 0;
     std::string name;
@@ -31,6 +39,11 @@ struct StampedStructureInstance {
 
     bool is_damaged = false;
     float time_since_damaged = 0.0f;
+
+    // Temporary procedural hero constructs (Kelvin Ice Dome, McGinnis Wall, etc.)
+    bool is_temporary_construct = false;
+    float ttl_remaining_seconds = 0.0f;
+    std::unordered_map<ChunkKey, std::vector<ConstructVoxelBackup>, ChunkKeyHash> construct_backups;
 
     std::vector<ChunkKey> stamped_chunk_keys;
 
@@ -318,6 +331,171 @@ public:
                             ensure_chunk_ready_fn, out_before_chunks, out_after_chunks, slot_mgr);
     }
 
+    /// Spawns a procedural SDF construct (such as a hollow Kelvin Ice Dome or McGinnis
+    /// barrier wall) with an optional auto-expire TTL (`ttl_seconds > 0.0f`). Records
+    /// per-voxel pre-construct backups so that when the construct expires or is dismissed
+    /// early via `remove_structure()`, only the construct's own voxels revert while any
+    /// craters blasted into nearby terrain remain intact.
+    [[nodiscard]] uint32_t stamp_procedural_sdf(
+        ChunkStore& store,
+        DualDirtyScheduler& dirty_scheduler,
+        VoxelNavigationManager& nav_mgr,
+        IVec3 sample_min,
+        IVec3 sample_max,
+        uint8_t material_id,
+        float ttl_seconds,
+        std::string construct_name,
+        const std::function<float(float sx, float sy, float sz)>& sdf_eval_fn,
+        const std::function<void(ChunkStore&, ChunkKey)>& ensure_chunk_ready_fn = {},
+        std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash>* out_before_chunks = nullptr,
+        std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash>* out_after_chunks = nullptr,
+        ServerSlotManager* slot_mgr = nullptr) {
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        const uint32_t struct_id = ++next_structure_id_;
+
+        const int32_t world_h = store.world_height_chunks();
+        const int32_t cx_min = ChunkKey::floor_div(sample_min.x, 32);
+        const int32_t cy_min = std::max<int32_t>(0, ChunkKey::floor_div(sample_min.y, 32));
+        const int32_t cz_min = ChunkKey::floor_div(sample_min.z, 32);
+        const int32_t cx_max = ChunkKey::floor_div(sample_max.x, 32);
+        const int32_t cy_max = std::min<int32_t>(world_h - 1, ChunkKey::floor_div(sample_max.y, 32));
+        const int32_t cz_max = ChunkKey::floor_div(sample_max.z, 32);
+
+        StampedStructureInstance inst{};
+        inst.id = struct_id;
+        inst.name = std::move(construct_name);
+        inst.origin_chunk = ChunkKey::from_coords(cx_min, cy_min, cz_min);
+        inst.blend_mode = StampBlendMode::Union;
+        inst.recreate_delay_seconds = 0.0f;
+        inst.is_temporary_construct = (ttl_seconds > 0.0f);
+        inst.ttl_remaining_seconds = std::max(0.0f, ttl_seconds);
+
+        std::unordered_set<ChunkKey, ChunkKeyHash> unique_dirtied_chunks;
+        std::unordered_set<NavigationGroupKey, NavigationGroupKeyHash> affected_nav_groups;
+        const float delta = TsdfFormat::kDefaultTruncationDelta;
+
+        for (int32_t cz = cz_min; cz <= cz_max; ++cz) {
+            for (int32_t cy = cy_min; cy <= cy_max; ++cy) {
+                for (int32_t cx = cx_min; cx <= cx_max; ++cx) {
+                    const ChunkKey target_key = ChunkKey::from_coords(cx, cy, cz);
+                    ChunkSlot* slot = store.get_or_create_slot(target_key);
+
+                    if (ensure_chunk_ready_fn) {
+                        for (int32_t dz = -1; dz <= 1; ++dz) {
+                            for (int32_t dy = -1; dy <= 1; ++dy) {
+                                const int32_t ny = target_key.y() + dy;
+                                if (ny < 0 || ny >= world_h) continue;
+                                for (int32_t dx = -1; dx <= 1; ++dx) {
+                                    const ChunkKey nk = target_key.offset(dx, dy, dz);
+                                    ChunkSlot* nslot = store.get_or_create_slot(nk);
+                                    bool needs_gen = false;
+                                    {
+                                        std::shared_lock<std::shared_mutex> rl(nslot->mutex);
+                                        needs_gen = (nslot->state != ChunkLifecycleState::Resident);
+                                    }
+                                    if (needs_gen) {
+                                        ensure_chunk_ready_fn(store, nk);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    std::unique_lock<std::shared_mutex> slot_lock(slot->mutex);
+                    ChunkStateSnapshot pre_snap = capture_baseline_unlocked(*slot);
+
+                    const IVec3 chunk_min = target_key.min_world_sample();
+                    const int32_t lx0 = std::max<int32_t>(0, sample_min.x - chunk_min.x);
+                    const int32_t ly0 = std::max<int32_t>(0, sample_min.y - chunk_min.y);
+                    const int32_t lz0 = std::max<int32_t>(0, sample_min.z - chunk_min.z);
+                    const int32_t lx1 = std::min<int32_t>(31, sample_max.x - chunk_min.x);
+                    const int32_t ly1 = std::min<int32_t>(31, sample_max.y - chunk_min.y);
+                    const int32_t lz1 = std::min<int32_t>(31, sample_max.z - chunk_min.z);
+
+                    std::vector<ConstructVoxelBackup> chunk_backups;
+                    bool chunk_modified = false;
+
+                    for (int32_t lz = lz0; lz <= lz1; ++lz) {
+                        const float sz = static_cast<float>(chunk_min.z + lz);
+                        for (int32_t ly = ly0; ly <= ly1; ++ly) {
+                            const float sy = static_cast<float>(chunk_min.y + ly);
+                            for (int32_t lx = lx0; lx <= lx1; ++lx) {
+                                const float sx = static_cast<float>(chunk_min.x + lx);
+                                const float d_vox = sdf_eval_fn(sx, sy, sz);
+                                if (d_vox >= delta) {
+                                    continue;
+                                }
+
+                                const LocalCoord lc{lx, ly, lz};
+                                const uint32_t lin = lc.to_linear_index();
+                                const int16_t q_cur = slot->get_tsdf(lc);
+                                const int16_t q_con = TsdfFormat::encode(d_vox, delta);
+                                if (q_con < q_cur) {
+                                    chunk_backups.push_back(ConstructVoxelBackup{
+                                        lin,
+                                        q_cur,
+                                        slot->get_material(lc),
+                                        slot->get_damage(lc),
+                                        slot->get_color(lc)
+                                    });
+                                    bool changed = false;
+                                    (void)slot->set_tsdf(lc, q_con, store.tsdf_pool(), &changed);
+                                    if (d_vox <= 0.0f) {
+                                        (void)slot->set_material(lc, material_id, store.material_pool());
+                                        (void)slot->clear_damage(lc);
+                                        (void)slot->clear_color(lc);
+                                    }
+                                    chunk_modified = true;
+                                }
+                            }
+                        }
+                    }
+
+                    if (chunk_modified) {
+                        slot->try_demote_if_uniform(store.tsdf_pool(), store.material_pool());
+                        slot->version.fetch_add(1, std::memory_order_release);
+                        slot->state = ChunkLifecycleState::Resident;
+                        slot->dirty_persist = true;
+
+                        inst.pre_stamp_baselines[target_key] = std::move(pre_snap);
+                        inst.baselines[target_key] = capture_baseline_unlocked(*slot);
+                        inst.construct_backups[target_key] = std::move(chunk_backups);
+                        inst.stamped_chunk_keys.push_back(target_key);
+
+                        add_chunk_and_resident_neighbors_to_dirty(
+                            store, target_key, unique_dirtied_chunks, affected_nav_groups);
+                    }
+                }
+            }
+        }
+
+        if (inst.stamped_chunk_keys.empty()) {
+            return 0;
+        }
+
+        if (out_before_chunks) {
+            *out_before_chunks = inst.pre_stamp_baselines;
+        }
+        if (out_after_chunks) {
+            *out_after_chunks = inst.baselines;
+        }
+
+        publish_dirty_and_nav_update(store, dirty_scheduler, nav_mgr,
+                                     unique_dirtied_chunks, affected_nav_groups, slot_mgr);
+        structures_.emplace(struct_id, std::move(inst));
+        return struct_id;
+    }
+
+    [[nodiscard]] float get_structure_remaining_ttl(uint32_t structure_id) const noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = structures_.find(structure_id);
+        if (it == structures_.end() || !it->second.is_temporary_construct) {
+            return 0.0f;
+        }
+        return std::max(0.0f, it->second.ttl_remaining_seconds);
+    }
+
     /// Removes a previously stamped structure by `structure_id`, restoring every affected chunk
     /// to its exact pre-stamp baseline (TSDF, materials, and colors) and triggering remeshing + nav sync.
     bool remove_structure(
@@ -338,24 +516,8 @@ public:
         const StampedStructureInstance inst = std::move(it->second);
         structures_.erase(it);
 
-        std::unordered_set<ChunkKey, ChunkKeyHash> unique_dirtied_chunks;
-        std::unordered_set<NavigationGroupKey, NavigationGroupKeyHash> affected_nav_groups;
-
-        for (const auto& [ck, pre_base] : inst.pre_stamp_baselines) {
-            ChunkSlot* slot = store.get_or_create_slot(ck);
-            std::unique_lock<std::shared_mutex> slot_lock(slot->mutex);
-            if (out_before_chunks) {
-                (*out_before_chunks)[ck] = capture_baseline_unlocked(*slot);
-            }
-            restore_baseline_unlocked(*slot, pre_base, store);
-            if (out_after_chunks) {
-                (*out_after_chunks)[ck] = pre_base;
-            }
-            add_chunk_and_resident_neighbors_to_dirty(
-                store, ck, unique_dirtied_chunks, affected_nav_groups);
-        }
-
-        publish_dirty_and_nav_update(store, dirty_scheduler, nav_mgr, unique_dirtied_chunks, affected_nav_groups, slot_mgr);
+        revert_structure_instance_unlocked(
+            inst, store, dirty_scheduler, nav_mgr, out_before_chunks, out_after_chunks, slot_mgr);
 
         if (on_structure_removed_) {
             on_structure_removed_(inst.id, inst.name);
@@ -367,6 +529,9 @@ public:
     void notify_chunk_damaged(ChunkKey ck) {
         std::lock_guard<std::mutex> lock(mutex_);
         for (auto& [id, inst] : structures_) {
+            if (inst.is_temporary_construct) {
+                continue;
+            }
             if (std::find(inst.stamped_chunk_keys.begin(), inst.stamped_chunk_keys.end(), ck) !=
                 inst.stamped_chunk_keys.end()) {
                 if (!inst.is_damaged) {
@@ -394,8 +559,19 @@ public:
 
         std::lock_guard<std::mutex> lock(mutex_);
         std::vector<uint32_t> recreated_ids;
+        std::vector<uint32_t> expired_construct_ids;
 
         for (auto& [id, inst] : structures_) {
+            if (inst.is_temporary_construct) {
+                if (inst.ttl_remaining_seconds > 0.0f) {
+                    inst.ttl_remaining_seconds -= delta_seconds;
+                    if (inst.ttl_remaining_seconds <= 0.0f) {
+                        expired_construct_ids.push_back(id);
+                    }
+                }
+                continue;
+            }
+
             if (!inst.is_damaged || inst.recreate_delay_seconds <= 0.0f) {
                 // If recreate_delay_seconds <= 0, structure stays destroyed permanently!
                 continue;
@@ -428,6 +604,20 @@ public:
             }
         }
 
+        for (const uint32_t exp_id : expired_construct_ids) {
+            auto it = structures_.find(exp_id);
+            if (it == structures_.end()) {
+                continue;
+            }
+            const StampedStructureInstance inst = std::move(it->second);
+            structures_.erase(it);
+            revert_structure_instance_unlocked(
+                inst, store, dirty_scheduler, nav_mgr, nullptr, nullptr, slot_mgr);
+            if (on_structure_removed_) {
+                on_structure_removed_(inst.id, inst.name);
+            }
+        }
+
         return recreated_ids;
     }
 
@@ -443,6 +633,78 @@ public:
     }
 
 private:
+    static void revert_structure_instance_unlocked(
+        const StampedStructureInstance& inst,
+        ChunkStore& store,
+        DualDirtyScheduler& dirty_scheduler,
+        VoxelNavigationManager& nav_mgr,
+        std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash>* out_before_chunks,
+        std::unordered_map<ChunkKey, ChunkStateSnapshot, ChunkKeyHash>* out_after_chunks,
+        ServerSlotManager* slot_mgr) {
+
+        std::unordered_set<ChunkKey, ChunkKeyHash> unique_dirtied_chunks;
+        std::unordered_set<NavigationGroupKey, NavigationGroupKeyHash> affected_nav_groups;
+
+        if (!inst.construct_backups.empty()) {
+            for (const auto& [ck, backups] : inst.construct_backups) {
+                ChunkSlot* slot = store.get_or_create_slot(ck);
+                std::unique_lock<std::shared_mutex> slot_lock(slot->mutex);
+                if (out_before_chunks) {
+                    (*out_before_chunks)[ck] = capture_baseline_unlocked(*slot);
+                }
+                (void)slot->promote_to_dense(store.tsdf_pool());
+                for (const ConstructVoxelBackup& b : backups) {
+                    const LocalCoord lc = LocalCoord::from_linear_index(b.linear_index);
+                    const int16_t cur_q = slot->get_tsdf_linear(b.linear_index);
+                    // If the voxel was originally Air, or is still solid, restore its
+                    // pre-construct state. If it was originally Solid ground and an
+                    // explosion carved it into Air while the construct was active,
+                    // preserve the carved crater!
+                    if (b.pre_tsdf >= 0 || cur_q < 0) {
+                        (void)slot->set_tsdf(lc, b.pre_tsdf, store.tsdf_pool());
+                        (void)slot->set_material_linear(b.linear_index, b.pre_material, store.material_pool());
+                        if (b.pre_damage != 0U) {
+                            (void)slot->set_damage_linear(b.linear_index, b.pre_damage, store.material_pool());
+                        } else {
+                            (void)slot->clear_damage(lc);
+                        }
+                        if (b.pre_color != VoxelColor::kUnpainted) {
+                            (void)slot->set_color_linear(b.linear_index, b.pre_color, store.tsdf_pool());
+                        } else {
+                            (void)slot->clear_color(lc);
+                        }
+                    }
+                }
+                slot->try_demote_if_uniform(store.tsdf_pool(), store.material_pool());
+                slot->version.fetch_add(1, std::memory_order_release);
+                slot->state = ChunkLifecycleState::Resident;
+                slot->dirty_persist = true;
+                if (out_after_chunks) {
+                    (*out_after_chunks)[ck] = capture_baseline_unlocked(*slot);
+                }
+                add_chunk_and_resident_neighbors_to_dirty(
+                    store, ck, unique_dirtied_chunks, affected_nav_groups);
+            }
+        } else {
+            for (const auto& [ck, pre_base] : inst.pre_stamp_baselines) {
+                ChunkSlot* slot = store.get_or_create_slot(ck);
+                std::unique_lock<std::shared_mutex> slot_lock(slot->mutex);
+                if (out_before_chunks) {
+                    (*out_before_chunks)[ck] = capture_baseline_unlocked(*slot);
+                }
+                restore_baseline_unlocked(*slot, pre_base, store);
+                if (out_after_chunks) {
+                    (*out_after_chunks)[ck] = pre_base;
+                }
+                add_chunk_and_resident_neighbors_to_dirty(
+                    store, ck, unique_dirtied_chunks, affected_nav_groups);
+            }
+        }
+
+        publish_dirty_and_nav_update(store, dirty_scheduler, nav_mgr,
+                                     unique_dirtied_chunks, affected_nav_groups, slot_mgr);
+    }
+
     [[nodiscard]] static StampedStructureInstance::ChunkBaseline capture_baseline_unlocked(
         const ChunkSlot& slot) {
         return ChunkStateSnapshot::capture_unlocked(slot);

@@ -182,6 +182,7 @@ enum DeliveryMode {
 	AIRBORNE_SLAM,
 	HITSCAN_BEAM,
 	ARC_PROJECTILE,
+	TEMP_CONSTRUCT,
 }
 
 class AbilitySpec extends RefCounted:
@@ -206,6 +207,8 @@ class AbilitySpec extends RefCounted:
 	var base_voxel_radius: float = 3.5
 	var spirit_radius_scale: float = 0.035
 	var is_toggled_on: bool = false
+	var construct_duration: float = 6.5
+	var active_structure_id: int = 0
 
 	func compute_scaled_damage(spirit_power: float) -> float:
 		return base_damage + spirit_power * spirit_damage_scale
@@ -332,6 +335,32 @@ func _register_default_deadlock_loadout() -> void:
 	a_orb.spirit_damage_scale = 1.2
 	a_orb.base_voxel_radius = 3.0
 	abilities.append(a_orb)
+
+	# Ability 6 (Key 1 in Play): Kelvin "Frozen Shelter" (Hollow Ice Dome, press 1 again to dismiss)
+	var a_dome := AbilitySpec.new()
+	a_dome.slot_index = 6
+	a_dome.ability_id = "kelvin_frozen_shelter"
+	a_dome.display_name = "Ice Dome"
+	a_dome.hotkey_label = "1"
+	a_dome.delivery_mode = DeliveryMode.TEMP_CONSTRUCT
+	a_dome.base_cooldown = 12.0
+	a_dome.construct_duration = 6.5
+	a_dome.base_voxel_radius = 8.5
+	a_dome.spirit_radius_scale = 0.03
+	abilities.append(a_dome)
+
+	# Ability 7 (Key 2 in Play): McGinnis "Spectral Wall" (3-Hit Rock Barrier, press 2 again to drop)
+	var a_wall := AbilitySpec.new()
+	a_wall.slot_index = 7
+	a_wall.ability_id = "mcginnis_spectral_wall"
+	a_wall.display_name = "Spectral Wall"
+	a_wall.hotkey_label = "2"
+	a_wall.delivery_mode = DeliveryMode.TEMP_CONSTRUCT
+	a_wall.base_cooldown = 9.0
+	a_wall.construct_duration = 7.5
+	a_wall.base_voxel_radius = 7.0 # Half-width of wall (14 m total)
+	a_wall.spirit_radius_scale = 0.04
+	abilities.append(a_wall)
 
 func register_target(target: Node3D, max_hp: float = 750.0) -> void:
 	if not is_instance_valid(target):
@@ -488,6 +517,14 @@ func format_cooldown_bar() -> String:
 	for a in abilities:
 		if a.delivery_mode == DeliveryMode.TOGGLE_CHANNEL:
 			parts.append("[%s] %s: %s" % [a.hotkey_label, a.display_name, "ON" if a.is_toggled_on else "OFF"])
+		elif a.delivery_mode == DeliveryMode.TEMP_CONSTRUCT and a.active_structure_id > 0:
+			var rem: float = terrain.get_structure_remaining_ttl(a.active_structure_id) \
+				if (terrain != null and terrain.has_method("get_structure_remaining_ttl")) else 0.0
+			if rem > 0.0:
+				parts.append("[%s] %s: ACTIVE %.1fs (press %s to drop)" % [a.hotkey_label, a.display_name, rem, a.hotkey_label])
+			else:
+				a.active_structure_id = 0
+				parts.append("[%s] %s: %.1fs" % [a.hotkey_label, a.display_name, a.cooldown_remaining] if a.cooldown_remaining > 0.0 else "[%s] %s: READY" % [a.hotkey_label, a.display_name])
 		elif a.max_charges > 1:
 			if a.charges < a.max_charges:
 				parts.append("[%s] %s: %d/%d (%.1fs)" % [a.hotkey_label, a.display_name, a.charges, a.max_charges, a.cooldown_remaining])
@@ -572,6 +609,71 @@ func start_hyper_beam(current_tags: int) -> bool:
 	beam_last_hit_pos = Vector3(INF, INF, INF)
 	_recompute_entity_tags_and_stats(owner_node)
 	return true
+
+## Casts or dismisses Kelvin's Frozen Shelter (Hollow Voxel Ice Dome, `Key 1` in Play Mode).
+func cast_or_dismiss_frozen_shelter(center: Vector3, current_tags: int) -> Dictionary:
+	var a := get_ability("kelvin_frozen_shelter")
+	if a == null or terrain == null or not terrain.has_method("spawn_temporary_dome"):
+		return {"action": "failed", "reason": "missing spawn_temporary_dome binding"}
+
+	# If dome is currently active, pressing Key 1 again dismisses it early!
+	if a.active_structure_id > 0:
+		var rem: float = terrain.get_structure_remaining_ttl(a.active_structure_id)
+		if rem > 0.0:
+			var old_id := a.active_structure_id
+			a.active_structure_id = 0
+			terrain.remove_structure(old_id)
+			return {"action": "dismissed", "structure_id": old_id}
+		a.active_structure_id = 0
+
+	var check := can_activate_ability("kelvin_frozen_shelter", current_tags)
+	if not bool(check.get("ok", false)):
+		emit_signal("ability_cast_blocked", "kelvin_frozen_shelter", String(check.get("reason", "")))
+		return {"action": "blocked", "reason": String(check.get("reason", ""))}
+
+	var spirit := hero_attributes.get_spirit_power()
+	var dome_r := a.compute_scaled_radius(spirit)
+	var struct_id: int = terrain.spawn_temporary_dome(center, dome_r, 2.0, MAT_ICE, a.construct_duration)
+	if struct_id > 0:
+		commit_ability_cooldown("kelvin_frozen_shelter")
+		a.active_structure_id = struct_id
+		return {"action": "spawned", "structure_id": struct_id, "radius": dome_r, "duration": a.construct_duration}
+	return {"action": "failed", "reason": "no chunks in range"}
+
+## Casts or drops McGinnis's Spectral Wall (3-Hit Destructible Stone Barrier, `Key 2` in Play Mode).
+func cast_or_dismiss_spectral_wall(center: Vector3, forward_dir: Vector3, current_tags: int) -> Dictionary:
+	var a := get_ability("mcginnis_spectral_wall")
+	if a == null or terrain == null or not terrain.has_method("spawn_temporary_wall"):
+		return {"action": "failed", "reason": "missing spawn_temporary_wall binding"}
+
+	# If wall is currently active, pressing Key 2 again drops it early!
+	if a.active_structure_id > 0:
+		var rem: float = terrain.get_structure_remaining_ttl(a.active_structure_id)
+		if rem > 0.0:
+			var old_id := a.active_structure_id
+			a.active_structure_id = 0
+			terrain.remove_structure(old_id)
+			return {"action": "dismissed", "structure_id": old_id}
+		a.active_structure_id = 0
+
+	var check := can_activate_ability("mcginnis_spectral_wall", current_tags)
+	if not bool(check.get("ok", false)):
+		emit_signal("ability_cast_blocked", "mcginnis_spectral_wall", String(check.get("reason", "")))
+		return {"action": "blocked", "reason": String(check.get("reason", ""))}
+
+	var spirit := hero_attributes.get_spirit_power()
+	var half_width := a.compute_scaled_radius(spirit)
+	var right_dir := Vector3(-forward_dir.z, 0.0, forward_dir.x).normalized()
+	if right_dir.length_squared() < 1e-4:
+		right_dir = Vector3.RIGHT
+	var wall_a := center - right_dir * half_width
+	var wall_b := center + right_dir * half_width
+	var struct_id: int = terrain.spawn_temporary_wall(wall_a, wall_b, 6.5, 2.2, MAT_HARD_ROCK, a.construct_duration)
+	if struct_id > 0:
+		commit_ability_cooldown("mcginnis_spectral_wall")
+		a.active_structure_id = struct_id
+		return {"action": "spawned", "structure_id": struct_id, "width": half_width * 2.0, "duration": a.construct_duration}
+	return {"action": "failed", "reason": "no chunks in range"}
 
 ## Spawns a Sub-Stepped SDF-Bouncing Cryo Orb (`Key X`).
 func spawn_bouncing_cryo_orb(origin: Vector3, aim_dir: Vector3, current_tags: int, parent_for_mesh: Node3D) -> bool:

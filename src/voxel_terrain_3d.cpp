@@ -91,6 +91,12 @@ void VoxelTerrain3D::_bind_methods() {
                          &VoxelTerrain3D::stamp_asset, DEFVAL(0.0f));
     ClassDB::bind_method(D_METHOD("remove_structure", "structure_id"),
                          &VoxelTerrain3D::remove_structure);
+    ClassDB::bind_method(D_METHOD("spawn_temporary_dome", "center", "radius", "wall_thickness", "material_id", "duration_seconds"),
+                         &VoxelTerrain3D::spawn_temporary_dome);
+    ClassDB::bind_method(D_METHOD("spawn_temporary_wall", "from", "to", "height", "thickness", "material_id", "duration_seconds"),
+                         &VoxelTerrain3D::spawn_temporary_wall);
+    ClassDB::bind_method(D_METHOD("get_structure_remaining_ttl", "structure_id"),
+                         &VoxelTerrain3D::get_structure_remaining_ttl);
     ClassDB::bind_method(D_METHOD("undo"), &VoxelTerrain3D::undo);
     ClassDB::bind_method(D_METHOD("redo"), &VoxelTerrain3D::redo);
     ClassDB::bind_method(D_METHOD("undo_all"), &VoxelTerrain3D::undo_all);
@@ -790,6 +796,179 @@ bool VoxelTerrain3D::remove_structure(int64_t p_structure_id) {
         _log(buf);
     }
     return removed;
+}
+
+int VoxelTerrain3D::spawn_temporary_dome(
+    Vector3 p_center,
+    float p_radius,
+    float p_wall_thickness,
+    int p_material_id,
+    float p_duration_seconds) {
+    if (!core_engine || p_radius <= 0.5f || p_wall_thickness <= 0.1f) {
+        return 0;
+    }
+    drain_pending_edits_for_undo_redo();
+
+    const float s = (voxel_scale > 0.0f) ? voxel_scale : 1.0f;
+    const float inv_s = 1.0f / s;
+    const float cx = p_center.x * inv_s;
+    const float cy = p_center.y * inv_s;
+    const float cz = p_center.z * inv_s;
+    const float r_outer = p_radius * inv_s;
+    const float half_t = std::max(0.6f, 0.5f * p_wall_thickness * inv_s);
+    const float r_mid = std::max(half_t, r_outer - half_t);
+    const float pad = half_t + voxel::TsdfFormat::kDefaultTruncationDelta + 1.0f;
+
+    const voxel::IVec3 smin{
+        static_cast<int32_t>(std::floor(cx - r_outer - pad)),
+        static_cast<int32_t>(std::floor(cy - 1.5f - pad)),
+        static_cast<int32_t>(std::floor(cz - r_outer - pad))
+    };
+    const voxel::IVec3 smax{
+        static_cast<int32_t>(std::ceil(cx + r_outer + pad)),
+        static_cast<int32_t>(std::ceil(cy + r_outer + pad)),
+        static_cast<int32_t>(std::ceil(cz + r_outer + pad))
+    };
+
+    const uint8_t mat_id = static_cast<uint8_t>(std::clamp(p_material_id, 1, 7));
+    auto stamps_before = stamp_manager_.capture_manager_snapshot();
+    std::unordered_map<voxel::ChunkKey, voxel::ChunkStateSnapshot, voxel::ChunkKeyHash> before_chunks;
+    std::unordered_map<voxel::ChunkKey, voxel::ChunkStateSnapshot, voxel::ChunkKeyHash> after_chunks;
+
+    const uint32_t id = stamp_manager_.stamp_procedural_sdf(
+        core_engine->store,
+        core_engine->dirty_scheduler,
+        navigation_manager,
+        smin,
+        smax,
+        mat_id,
+        p_duration_seconds,
+        "temporary_dome",
+        [cx, cy, cz, r_mid, half_t](float sx, float sy, float sz) noexcept -> float {
+            const float dx = sx - cx;
+            const float dy = sy - cy;
+            const float dz = sz - cz;
+            const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+            const float d_shell = std::abs(dist - r_mid) - half_t;
+            const float d_base_plane = (cy - 1.0f) - sy;
+            return std::max(d_shell, d_base_plane);
+        },
+        [this](voxel::ChunkStore& st, voxel::ChunkKey ck) {
+            voxel::WorkerDensityGrid34 grid34(core_engine->ledger);
+            (void)core_engine->save_manager->load_or_generate_chunk(
+                st, ck, core_engine->procgen, grid34);
+        },
+        &before_chunks,
+        &after_chunks,
+        &server_slot_manager);
+
+    if (id > 0 && (!before_chunks.empty() || !after_chunks.empty())) {
+        voxel::UndoRedoEntry entry{};
+        entry.action_name = "spawn_temporary_dome";
+        entry.before_chunks = std::move(before_chunks);
+        entry.after_chunks = std::move(after_chunks);
+        entry.stamps_before = std::move(stamps_before);
+        entry.stamps_after = stamp_manager_.capture_manager_snapshot();
+        undo_redo_manager_.record_entry(std::move(entry));
+    }
+    return static_cast<int>(id);
+}
+
+int VoxelTerrain3D::spawn_temporary_wall(
+    Vector3 p_from,
+    Vector3 p_to,
+    float p_height,
+    float p_thickness,
+    int p_material_id,
+    float p_duration_seconds) {
+    if (!core_engine || p_height <= 0.5f || p_thickness <= 0.1f) {
+        return 0;
+    }
+    drain_pending_edits_for_undo_redo();
+
+    const float s = (voxel_scale > 0.0f) ? voxel_scale : 1.0f;
+    const float inv_s = 1.0f / s;
+    const float ax = p_from.x * inv_s;
+    const float ay = p_from.y * inv_s;
+    const float az = p_from.z * inv_s;
+    const float bx = p_to.x * inv_s;
+    const float by = p_to.y * inv_s;
+    const float bz = p_to.z * inv_s;
+    const float h_vox = p_height * inv_s;
+    const float half_t = std::max(0.6f, 0.5f * p_thickness * inv_s);
+    const float pad = half_t + voxel::TsdfFormat::kDefaultTruncationDelta + 1.0f;
+
+    const voxel::IVec3 smin{
+        static_cast<int32_t>(std::floor(std::min(ax, bx) - pad)),
+        static_cast<int32_t>(std::floor(std::min(ay, by) - 1.0f - pad)),
+        static_cast<int32_t>(std::floor(std::min(az, bz) - pad))
+    };
+    const voxel::IVec3 smax{
+        static_cast<int32_t>(std::ceil(std::max(ax, bx) + pad)),
+        static_cast<int32_t>(std::ceil(std::max(ay, by) + h_vox + pad)),
+        static_cast<int32_t>(std::ceil(std::max(az, bz) + pad))
+    };
+
+    const uint8_t mat_id = static_cast<uint8_t>(std::clamp(p_material_id, 1, 7));
+    auto stamps_before = stamp_manager_.capture_manager_snapshot();
+    std::unordered_map<voxel::ChunkKey, voxel::ChunkStateSnapshot, voxel::ChunkKeyHash> before_chunks;
+    std::unordered_map<voxel::ChunkKey, voxel::ChunkStateSnapshot, voxel::ChunkKeyHash> after_chunks;
+
+    const float abx = bx - ax;
+    const float abz = bz - az;
+    const float ab_len_sq = abx * abx + abz * abz;
+
+    const uint32_t id = stamp_manager_.stamp_procedural_sdf(
+        core_engine->store,
+        core_engine->dirty_scheduler,
+        navigation_manager,
+        smin,
+        smax,
+        mat_id,
+        p_duration_seconds,
+        "temporary_wall",
+        [ax, ay, az, by, abx, abz, ab_len_sq, h_vox, half_t](float sx, float sy, float sz) noexcept -> float {
+            float t = 0.0f;
+            if (ab_len_sq > 1e-6f) {
+                t = std::clamp(((sx - ax) * abx + (sz - az) * abz) / ab_len_sq, 0.0f, 1.0f);
+            }
+            const float cx = ax + t * abx;
+            const float cz = az + t * abz;
+            const float base_y = (ay + t * (by - ay)) - 0.8f;
+            const float top_y = base_y + h_vox + 0.8f;
+            const float dx = sx - cx;
+            const float dz = sz - cz;
+            const float d_horiz = std::sqrt(dx * dx + dz * dz) - half_t;
+            const float d_vert = std::max(base_y - sy, sy - top_y);
+            return std::max(d_horiz, d_vert);
+        },
+        [this](voxel::ChunkStore& st, voxel::ChunkKey ck) {
+            voxel::WorkerDensityGrid34 grid34(core_engine->ledger);
+            (void)core_engine->save_manager->load_or_generate_chunk(
+                st, ck, core_engine->procgen, grid34);
+        },
+        &before_chunks,
+        &after_chunks,
+        &server_slot_manager);
+
+    if (id > 0 && (!before_chunks.empty() || !after_chunks.empty())) {
+        voxel::UndoRedoEntry entry{};
+        entry.action_name = "spawn_temporary_wall";
+        entry.before_chunks = std::move(before_chunks);
+        entry.after_chunks = std::move(after_chunks);
+        entry.stamps_before = std::move(stamps_before);
+        entry.stamps_after = stamp_manager_.capture_manager_snapshot();
+        undo_redo_manager_.record_entry(std::move(entry));
+    }
+    return static_cast<int>(id);
+}
+
+float VoxelTerrain3D::get_structure_remaining_ttl(int p_structure_id) const {
+    if (!core_engine || p_structure_id <= 0) {
+        return 0.0f;
+    }
+    return stamp_manager_.get_structure_remaining_ttl(
+        static_cast<uint32_t>(p_structure_id));
 }
 
 bool VoxelTerrain3D::undo() {
