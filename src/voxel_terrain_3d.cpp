@@ -107,6 +107,10 @@ void VoxelTerrain3D::_bind_methods() {
                          &VoxelTerrain3D::raycast_terrain_material);
     ClassDB::bind_method(D_METHOD("raycast_terrain_normal", "from", "to"),
                          &VoxelTerrain3D::raycast_terrain_normal);
+    ClassDB::bind_method(D_METHOD("sweep_sphere", "from", "to", "radius"),
+                         &VoxelTerrain3D::sweep_sphere);
+    ClassDB::bind_method(D_METHOD("measure_wall_thickness", "impact_pos", "direction", "max_thickness"),
+                         &VoxelTerrain3D::measure_wall_thickness);
     ClassDB::bind_method(D_METHOD("sample_sdf", "world_pos"), &VoxelTerrain3D::sample_sdf);
     ClassDB::bind_method(D_METHOD("sample_sdf_normal", "world_pos"), &VoxelTerrain3D::sample_sdf_normal);
     ClassDB::bind_method(D_METHOD("get_material_at", "world_pos"), &VoxelTerrain3D::get_material_at);
@@ -999,6 +1003,100 @@ Vector3 VoxelTerrain3D::raycast_terrain_normal(Vector3 p_from, Vector3 p_to) con
         return hit;
     }
     return sample_sdf_normal(hit);
+}
+
+Vector3 VoxelTerrain3D::sweep_sphere(Vector3 p_from, Vector3 p_to, float p_radius) const {
+    const float inf = std::numeric_limits<float>::infinity();
+    if (!core_engine) {
+        return Vector3(inf, inf, inf);
+    }
+    const float r = std::max(0.0f, p_radius);
+    if (r <= 1e-4f) {
+        return raycast_terrain(p_from, p_to);
+    }
+
+    const float dx = p_to.x - p_from.x;
+    const float dy = p_to.y - p_from.y;
+    const float dz = p_to.z - p_from.z;
+    const float len = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (len <= 1e-5f) {
+        return Vector3(inf, inf, inf);
+    }
+
+    const float s = (voxel_scale > 0.0f) ? voxel_scale : 1.0f;
+    const float step = 0.35f * s;
+    const int steps = std::max(1, static_cast<int>(std::ceil(len / step)));
+
+    float prev_clearance = sample_sdf(p_from) - r;
+    float prev_t = 0.0f;
+
+    for (int i = 1; i <= steps; ++i) {
+        const float t = static_cast<float>(i) / static_cast<float>(steps);
+        const Vector3 cur_center(p_from.x + dx * t, p_from.y + dy * t, p_from.z + dz * t);
+        const float cur_clearance = sample_sdf(cur_center) - r;
+        if (cur_clearance <= 0.0f) {
+            const float denom = prev_clearance - cur_clearance;
+            const float frac = (denom > 1e-6f) ? std::clamp(prev_clearance / denom, 0.0f, 1.0f) : 0.5f;
+            const float hit_t = (prev_clearance <= 0.0f) ? 0.0f : (prev_t + frac * (t - prev_t));
+            const Vector3 hit_center(p_from.x + dx * hit_t, p_from.y + dy * hit_t, p_from.z + dz * hit_t);
+            const Vector3 surf_n = sample_sdf_normal(hit_center);
+            const float center_sdf = std::max(0.0f, sample_sdf(hit_center));
+            return Vector3(
+                hit_center.x - surf_n.x * center_sdf,
+                hit_center.y - surf_n.y * center_sdf,
+                hit_center.z - surf_n.z * center_sdf);
+        }
+        prev_clearance = cur_clearance;
+        prev_t = t;
+    }
+    return Vector3(inf, inf, inf);
+}
+
+float VoxelTerrain3D::measure_wall_thickness(Vector3 p_impact_pos, Vector3 p_direction,
+                                             float p_max_thickness) const {
+    if (!core_engine || p_max_thickness <= 0.0f) {
+        return 0.0f;
+    }
+    const float dir_len = std::sqrt(
+        p_direction.x * p_direction.x +
+        p_direction.y * p_direction.y +
+        p_direction.z * p_direction.z);
+    if (dir_len <= 1e-5f) {
+        return p_max_thickness + 1.0f;
+    }
+    const float nx = p_direction.x / dir_len;
+    const float ny = p_direction.y / dir_len;
+    const float nz = p_direction.z / dir_len;
+
+    const float s = (voxel_scale > 0.0f) ? voxel_scale : 1.0f;
+    const float step = 0.25f * s;
+    const int max_steps = std::max(2, static_cast<int>(std::ceil(p_max_thickness / step)));
+
+    bool entered_solid = false;
+    float prev_d = sample_sdf(p_impact_pos);
+    if (prev_d <= 0.0f) {
+        entered_solid = true;
+    }
+    float prev_dist = 0.0f;
+
+    for (int i = 1; i <= max_steps; ++i) {
+        const float dist = std::min(p_max_thickness, static_cast<float>(i) * step);
+        const Vector3 pt(
+            p_impact_pos.x + nx * dist,
+            p_impact_pos.y + ny * dist,
+            p_impact_pos.z + nz * dist);
+        const float cur_d = sample_sdf(pt);
+        if (cur_d <= 0.0f) {
+            entered_solid = true;
+        } else if (entered_solid && cur_d > 0.0f) {
+            const float denom = cur_d - prev_d;
+            const float frac = (denom > 1e-6f) ? std::clamp(-prev_d / denom, 0.0f, 1.0f) : 0.5f;
+            return prev_dist + frac * (dist - prev_dist);
+        }
+        prev_d = cur_d;
+        prev_dist = dist;
+    }
+    return entered_solid ? (p_max_thickness + 1.0f) : 0.0f;
 }
 
 float VoxelTerrain3D::sample_sdf(Vector3 p_world_pos) const {

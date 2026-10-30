@@ -113,17 +113,44 @@ extends Node3D
 @export var ape_albedo_path: String = "res://models/ape/ape_albedo.png"
 @export var ape_vreg_path: String = "models/ape/ape_statue.vreg"
 
-## First-person Play mode (F toggles Fly <-> Play). Play drops an eye-height body
-## onto the voxel surface below the camera: WASD runs, Shift sprints, Space jumps,
-## and LMB chips the terrain at the crosshair.
-@export var play_eye_height: float = 1.75
-@export var play_walk_speed: float = 5.0
-@export var play_run_speed: float = 9.0
-@export var play_jump_speed: float = 6.0
+## Deadlock-Style Third-Person / First-Person Hero Play Mode (F toggles Fly <-> Play,
+## V toggles 3rd-Person Over-the-Shoulder <-> 1st-Person). Uses VoxelTerrain3D's O(1)
+## C++ SDF & surface queries (`sample_sdf`, `sample_sdf_normal`, `get_material_at`,
+## `get_damage_at`, `trigger_elemental_capsule`) for sub-voxel capsule collide-and-slide,
+## 3-probe ledge mantling, downhill slope sliding, stamina dash-jumps, Kelvin Ice Paths (E),
+## and Lash Ground Strike crater slams (Q).
+@export var play_eye_height: float = 1.65
+@export var play_walk_speed: float = 6.8
+@export var play_run_speed: float = 9.5
+@export var play_jump_speed: float = 8.4
 @export var play_gravity: float = 24.0
-@export var play_step_height: float = 0.6
-@export var play_body_radius: float = 0.4
-@export var play_fov: float = 75.0
+@export var play_step_height: float = 0.60
+@export var play_body_radius: float = 0.45
+@export var play_body_height: float = 1.85
+@export var play_fov: float = 78.0
+@export var play_third_person: bool = true
+@export var play_cam_arm_length: float = 4.2
+@export var play_cam_shoulder_offset: Vector3 = Vector3(0.65, 0.35, 0.0)
+@export var play_max_stamina: int = 3
+@export var play_stamina_regen_seconds: float = 2.4
+@export var play_dash_speed: float = 18.5
+@export var play_dash_duration: float = 0.26
+@export var play_dash_jump_horiz_boost: float = 15.5
+@export var play_dash_jump_vert_speed: float = 8.8
+@export var play_slide_max_speed: float = 17.5
+@export var play_mantle_reach: float = 0.85
+@export var play_mantle_min_height: float = 0.65
+@export var play_mantle_max_height: float = 2.35
+@export var play_mantle_duration: float = 0.34
+@export var play_ice_path_radius: float = 3.2
+@export var play_ground_slam_radius: float = 5.5
+@export var play_charge_speed: float = 16.0
+@export var play_charge_duration: float = 1.15
+@export var play_charge_capture_radius: float = 1.65
+@export var play_charge_pin_min_cos: float = 0.60
+@export var play_charge_breach_max_thickness: float = 2.2
+@export var play_charge_wall_pin_blast_radius: float = 4.2
+@export var play_charge_pin_stun_seconds: float = 1.5
 ## Radius of the pickaxe chip carved on the swing's impact frame.
 @export var pickaxe_hit_radius: float = 1.5
 ## Point in the swing (0-1 of its length) where the tool bites the terrain.
@@ -139,7 +166,7 @@ const BASE_WRIST_ROT := Vector3(-0.20, -0.10, 0.06)
 ## elemental reactions (8-0). `TOOL_KEYS` is the keycap shown in the HUD.
 enum Tool { ADD_TERRAIN, PAINT, PAINT_DELETE, BOULDER, SMALL_HIT, EXPLODE, LARGE_EXPLODE, WATER_QUENCH, FROST_ICE, LAVA_MAGMA }
 
-## Fly is the original free camera; Play is the first-person pickaxe body;
+## Fly is the free camera; Play is the Deadlock-style 3rd/1st-person Hero Controller;
 ## Benchmark sweeps multiple VoxelTerrain3D settings and logs hardware + FPS/latency metrics.
 enum Mode { FLY, PLAY, BENCHMARK }
 
@@ -199,11 +226,15 @@ const BENCHMARK_PRESETS := [
 	},
 ]
 
+enum HeroState { GROUNDED, AIRBORNE, DASHING, SLIDING, MANTLING, GROUND_SLAM, SHOULDER_CHARGE }
+const HERO_STATE_NAMES := ["Grounded", "Airborne", "Dashing", "Sliding", "Mantling", "Ground Slam", "Shoulder Charge"]
+
 const TOOL_NAMES := ["Add terrain", "Paint terrain", "Paint delete", "Place boulder", "Small hit", "Explode", "Large explode", "Water quench", "Frost / Ice", "Lava / Magma"]
 const TOOL_KEYS := ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"]
 const CONTROLS_TEXT := """CONTROLS  (H hide keys | U hide all UI)
-Mode    F fly / play   M (or F8) run / abort benchmark suite
-Play    WASD run   Shift sprint   Space jump   LMB swing pickaxe
+Mode    F fly / hero play   V toggle 3rd/1st person (in Play)   M (or F8) benchmark
+Hero    WASD move   Shift dash (Space mid-dash = Dash-Jump!)   Ctrl/C slope slide
+Climb   Space jump/mantle   G Shoulder Charge (Wall-Pin/Breach!)   E Ice Path   Q Slam
 Move    W/A/S/D   Space or E up   Ctrl or Q down   Shift sprint
 Look    Mouse   Esc releases cursor   click recaptures
 Build   1 Add terrain   2 Paint   3 Paint delete   4 Boulder
@@ -293,9 +324,32 @@ var _pitch: float = -0.25
 var _velocity: Vector3 = Vector3.ZERO
 
 var _mode: int = Mode.FLY
+var _hero_state: int = HeroState.GROUNDED
 var _player_feet: Vector3 = Vector3.ZERO
+var _player_vel: Vector3 = Vector3.ZERO
 var _player_vel_y: float = 0.0
 var _player_grounded: bool = false
+var _ground_normal: Vector3 = Vector3.UP
+var _foot_material: int = MATERIAL_SOIL
+var _foot_damage: float = 0.0
+var _stamina_charges: int = 3
+var _stamina_regen_progress: float = 0.0
+var _dash_timer: float = 0.0
+var _dash_dir: Vector3 = Vector3.FORWARD
+var _coyote_timer: float = 0.0
+var _mantle_timer: float = 0.0
+var _mantle_start_pos: Vector3 = Vector3.ZERO
+var _mantle_target_pos: Vector3 = Vector3.ZERO
+var _charge_timer: float = 0.0
+var _charge_dir: Vector3 = Vector3.FORWARD
+var _charge_pinned_companion: bool = false
+var _companion_stun_timer: float = 0.0
+var _companion_base_mat: StandardMaterial3D = null
+var _ice_path_active: bool = false
+var _last_ice_path_anchor: Vector3 = Vector3(INF, INF, INF)
+var _hero_visual_root: Node3D = null
+var _hero_torso_mesh: MeshInstance3D = null
+var _hero_visor_mesh: MeshInstance3D = null
 var _last_safe_feet: Vector3 = Vector3.ZERO
 var _spawn_pending: bool = false
 var _spawn_wait: float = 0.0
@@ -487,6 +541,7 @@ func _ready() -> void:
 	# so Undo / undo_all() never erases the initial showcase statues.
 	_clear_undo_history_to_current_baseline()
 	_setup_phantom_camera()
+	_setup_hero_visual_rig()
 	_update_stream_focus(true)
 	_check_cli_benchmark_autostart()
 	_check_cli_trailer_autostart()
@@ -502,6 +557,7 @@ func _setup_path_debug_visuals() -> void:
 	cap_mat.emission_enabled = true
 	cap_mat.emission = Color(0.1, 0.85, 1.0) * 0.6
 	cap.material = cap_mat
+	_companion_base_mat = cap_mat
 	_companion_mesh_inst.mesh = cap
 	_companion_mesh_inst.position = Vector3(0.0, 0.9, 0.0)
 	ai_companion.add_child(_companion_mesh_inst)
@@ -1299,6 +1355,40 @@ func _spawn_pickaxe_impact_sparks(world_pos: Vector3, hit_normal: Vector3) -> vo
 	_impact_sparks.restart()
 	_impact_sparks.emitting = true
 
+
+func _setup_hero_visual_rig() -> void:
+	_hero_visual_root = Node3D.new()
+	_hero_visual_root.name = "HeroVisualRig"
+	_hero_visual_root.visible = false
+	add_child(_hero_visual_root)
+
+	# Stylized Deadlock-inspired hero capsule body
+	_hero_torso_mesh = MeshInstance3D.new()
+	var cap := CapsuleMesh.new()
+	cap.radius = play_body_radius * 0.88
+	cap.height = play_body_height
+	var body_mat := StandardMaterial3D.new()
+	body_mat.albedo_color = Color(0.18, 0.24, 0.34)
+	body_mat.metallic = 0.35
+	body_mat.roughness = 0.45
+	cap.material = body_mat
+	_hero_torso_mesh.mesh = cap
+	_hero_torso_mesh.position = Vector3(0.0, play_body_height * 0.5, 0.0)
+	_hero_visual_root.add_child(_hero_torso_mesh)
+
+	# Glowing visor showing hero facing & pitch
+	_hero_visor_mesh = MeshInstance3D.new()
+	var visor_box := BoxMesh.new()
+	visor_box.size = Vector3(0.48, 0.16, 0.28)
+	var visor_mat := StandardMaterial3D.new()
+	visor_mat.albedo_color = Color(0.15, 0.95, 1.0)
+	visor_mat.emission_enabled = true
+	visor_mat.emission = Color(0.15, 0.90, 1.0) * 1.4
+	visor_box.material = visor_mat
+	_hero_visor_mesh.mesh = visor_box
+	_hero_visor_mesh.position = Vector3(0.0, play_eye_height - 0.12, -play_body_radius * 0.72)
+	_hero_visual_root.add_child(_hero_visor_mesh)
+
 func _enter_play() -> void:
 	_mode = Mode.PLAY
 	_tool_pressed = false
@@ -1312,6 +1402,10 @@ func _enter_play() -> void:
 		_shoulder_pivot.rotation = BASE_SHOULDER_ROT
 		_elbow_pivot.rotation = BASE_ELBOW_ROT
 		_wrist_pivot.rotation = BASE_WRIST_ROT
+	_ice_path_active = false
+	_last_ice_path_anchor = Vector3(INF, INF, INF)
+	_stamina_charges = play_max_stamina
+	_stamina_regen_progress = 0.0
 	var eye := camera.global_position
 	var ground_y := _ground_probe(eye + Vector3(0.0, play_step_height, 0.0), 400.0)
 	_spawn_pending = not is_finite(ground_y)
@@ -1320,22 +1414,21 @@ func _enter_play() -> void:
 	if is_finite(ground_y):
 		_player_feet.y = ground_y
 	else:
-		# Taking over while hovering over a void: spawn on the visible terrain
-		# under the crosshair instead of dropping into the void below.
 		var aim := _pickaxe_aim_point()
 		if is_finite(aim.x):
 			var aim_ground := _ground_probe(aim + Vector3(0.0, play_step_height, 0.0), 400.0)
 			_player_feet = Vector3(aim.x, aim_ground if is_finite(aim_ground) else aim.y, aim.z)
 			_spawn_pending = false
 	_last_safe_feet = _player_feet
+	_player_vel = Vector3.ZERO
 	_player_vel_y = 0.0
 	_player_grounded = true
+	_hero_state = HeroState.GROUNDED
 	camera.fov = play_fov
-	_play_pcam.global_position = _player_feet + Vector3(0.0, play_eye_height, 0.0)
-	_play_pcam.rotation = camera.rotation
+	_update_hero_camera_and_visuals(0.0)
 	_play_pcam.priority = 1
 	_fly_pcam.priority = 0
-	print("[FirstPerson] Play mode (F to fly)")
+	print("[HeroController] Entered Play Mode (3rd-Person=%s | V toggles view | Shift=Dash | Space=Jump/Mantle | Ctrl=Slide | E=Ice Path | Q=Ground Slam)" % str(play_third_person))
 
 func _exit_play() -> void:
 	_mode = Mode.FLY
@@ -1343,14 +1436,18 @@ func _exit_play() -> void:
 	_swing_hit_done = false
 	if _viewmodel_root != null:
 		_viewmodel_root.visible = false
+	_ice_path_active = false
+	_player_vel = Vector3.ZERO
 	_player_vel_y = 0.0
 	_player_grounded = false
 	_velocity = Vector3.ZERO
+	if _hero_visual_root != null:
+		_hero_visual_root.visible = false
 	camera.fov = _base_fov
 	_fly_pcam.global_transform = camera.global_transform
 	_fly_pcam.priority = 1
 	_play_pcam.priority = 0
-	print("[FirstPerson] Fly mode (F to play)")
+	print("[HeroController] Exited to Fly Mode (F to enter Hero Play Mode)")
 
 func _start_pickaxe_swing() -> void:
 	if _swing_active:
@@ -1532,18 +1629,58 @@ func _process_play(delta: float) -> void:
 		if is_finite(spawn_ground):
 			_player_feet = Vector3(_player_feet.x, spawn_ground, _player_feet.z)
 			_last_safe_feet = _player_feet
+			_player_vel = Vector3.ZERO
 			_player_vel_y = 0.0
 			_player_grounded = true
+			_hero_state = HeroState.GROUNDED
 			_spawn_pending = false
 		else:
+			_player_vel = Vector3.ZERO
 			_player_vel_y = 0.0
 			_player_grounded = false
-			_play_pcam.global_position = _player_feet + Vector3(0.0, play_eye_height, 0.0)
-			_play_pcam.rotation = Vector3(_pitch, _yaw, 0.0)
+			_update_hero_camera_and_visuals(delta)
 			_update_pickaxe_swing(delta)
 			if _spawn_wait > 4.0:
 				_spawn_pending = false
 			return
+
+	# 1. Regenerate Deadlock stamina charges (3 pips)
+	if _stamina_charges < play_max_stamina:
+		_stamina_regen_progress += delta / maxf(0.1, play_stamina_regen_seconds)
+		if _stamina_regen_progress >= 1.0:
+			_stamina_regen_progress -= 1.0
+			_stamina_charges = mini(play_max_stamina, _stamina_charges + 1)
+	else:
+		_stamina_regen_progress = 0.0
+
+	# 2. Sample O(1) SDF surface normal, material ID, and fracture damage beneath hero feet
+	if terrain.has_method("sample_sdf_normal"):
+		_ground_normal = terrain.sample_sdf_normal(_player_feet + Vector3(0.0, 0.2, 0.0))
+		_foot_material = maxi(0, terrain.get_material_at(_player_feet - Vector3(0.0, 0.15, 0.0)))
+		_foot_damage = terrain.get_damage_at(_player_feet - Vector3(0.0, 0.15, 0.0))
+
+	# 3. Handle active Ledge Mantle trajectory
+	if _hero_state == HeroState.MANTLING:
+		_step_hero_mantle(delta)
+		_update_kelvin_ice_path()
+		_update_hero_camera_and_visuals(delta)
+		_update_pickaxe_swing(delta)
+		return
+
+	# 4. Handle active Lash Ground Slam dive
+	if _hero_state == HeroState.GROUND_SLAM:
+		_step_hero_ground_slam(delta)
+		_update_hero_camera_and_visuals(delta)
+		_update_pickaxe_swing(delta)
+		return
+
+	# 4b. Handle active Abrams Shoulder Charge + Swept Wall-Pin / Thin-Wall Breach
+	if _hero_state == HeroState.SHOULDER_CHARGE:
+		_step_hero_shoulder_charge(delta)
+		_update_kelvin_ice_path()
+		_update_hero_camera_and_visuals(delta)
+		_update_pickaxe_swing(delta)
+		return
 
 	var forward := Vector3(-sin(_yaw), 0.0, -cos(_yaw))
 	var right := Vector3(cos(_yaw), 0.0, -sin(_yaw))
@@ -1556,67 +1693,179 @@ func _process_play(delta: float) -> void:
 		input_dir -= right
 	if Input.is_key_pressed(KEY_D):
 		input_dir += right
+	var wish_dir := input_dir.normalized() if input_dir.length_squared() > 1e-4 else Vector3.ZERO
+	var want_slide := Input.is_key_pressed(KEY_CTRL) or Input.is_key_pressed(KEY_C)
 
-	var speed := play_run_speed if Input.is_key_pressed(KEY_SHIFT) else play_walk_speed
-	var wish := input_dir.normalized() * speed if input_dir.length_squared() > 0.0 else Vector3.ZERO
-	_velocity = wish
-	_move_player_horizontal(wish * delta)
+	# 5. Step active Dash window or horizontal locomotion + slope slide + surface friction
+	if _hero_state == HeroState.DASHING:
+		_dash_timer += delta
+		if _dash_timer >= play_dash_duration:
+			_hero_state = HeroState.GROUNDED if _player_grounded else HeroState.AIRBORNE
+		else:
+			_player_vel.x = _dash_dir.x * play_dash_speed
+			_player_vel.z = _dash_dir.z * play_dash_speed
+			_player_vel_y = maxf(_player_vel_y - play_gravity * 0.25 * delta, -3.5)
+	else:
+		_apply_hero_horizontal_accel(delta, wish_dir, want_slide)
 
+	# 6. Swept horizontal motion + O(1) SDF capsule wall depenetration + Auto-Mantle check
+	_move_player_horizontal(Vector3(_player_vel.x, 0.0, _player_vel.z) * delta, wish_dir)
+	if _hero_state == HeroState.MANTLING:
+		_update_hero_camera_and_visuals(delta)
+		_update_pickaxe_swing(delta)
+		return
+
+	# 7. Vertical gravity integration, SDF ceiling bump & walkable slope ground snap
 	var prev_y := _player_feet.y
-	_player_vel_y = maxf(_player_vel_y - play_gravity * delta, -80.0)
+	if _hero_state != HeroState.DASHING:
+		_player_vel_y = maxf(_player_vel_y - play_gravity * delta, -70.0)
 	_player_feet.y += _player_vel_y * delta
+
+	if terrain.has_method("sample_sdf") and _player_vel_y > 0.0:
+		var head_pt := _player_feet + Vector3(0.0, play_body_height, 0.0)
+		var head_sdf := terrain.sample_sdf(head_pt)
+		if head_sdf < play_body_radius:
+			var head_n := terrain.sample_sdf_normal(head_pt)
+			if head_n.y < -0.25:
+				_player_feet.y -= (play_body_radius - head_sdf)
+				_player_vel_y = 0.0
+
 	var probe_top := maxf(prev_y, _player_feet.y) + play_step_height
 	var ground_y := _ground_probe(
 		Vector3(_player_feet.x, probe_top, _player_feet.z),
 		probe_top - _player_feet.y + 1.0
 	)
 	if not is_finite(ground_y) and not _player_grounded:
-		# Rescue a body that slipped just inside a freshly remeshed surface.
 		var rescue_y := _ground_probe(Vector3(_player_feet.x, _player_feet.y + 2.0, _player_feet.z), 4.0)
 		if is_finite(rescue_y) and rescue_y >= _player_feet.y - 0.2:
 			ground_y = rescue_y
 	if is_finite(ground_y):
-		var within_step := ground_y - prev_y <= play_step_height + 0.05
+		var within_step := ground_y - prev_y <= play_step_height + 0.08
 		var crossing := _player_feet.y <= ground_y
 		var snap_to_ground := _player_grounded and _player_vel_y <= 0.0 \
-			and _player_feet.y - ground_y <= 0.35
-		if within_step and (crossing or snap_to_ground):
+			and _player_feet.y - ground_y <= 0.38
+		var walkable_slope := true
+		if terrain.has_method("sample_sdf_normal"):
+			var surf_n := terrain.sample_sdf_normal(Vector3(_player_feet.x, ground_y, _player_feet.z))
+			walkable_slope = (surf_n.y >= 0.65)
+			if walkable_slope:
+				_ground_normal = surf_n
+		if within_step and walkable_slope and (crossing or snap_to_ground):
 			_player_feet.y = ground_y
 			_player_vel_y = 0.0
 			_player_grounded = true
+			_coyote_timer = 0.14
+			if _hero_state == HeroState.AIRBORNE:
+				_hero_state = HeroState.GROUNDED
 		else:
 			_player_grounded = false
 	else:
 		_player_grounded = false
 
+	if not _player_grounded:
+		_coyote_timer = maxf(0.0, _coyote_timer - delta)
+		if _hero_state == HeroState.GROUNDED or _hero_state == HeroState.SLIDING:
+			_hero_state = HeroState.AIRBORNE
+
 	if _player_grounded:
 		_last_safe_feet = _player_feet
 	elif _player_feet.y < _last_safe_feet.y - 80.0 or _player_feet.y < -64.0:
-		# Safety net for a missed ground sample while chunks stream in.
 		_player_feet = _last_safe_feet
+		_player_vel = Vector3.ZERO
 		_player_vel_y = 0.0
 		_player_grounded = true
+		_hero_state = HeroState.GROUNDED
 
-	_play_pcam.global_position = _player_feet + Vector3(0.0, play_eye_height, 0.0)
-	_play_pcam.rotation = Vector3(_pitch, _yaw, 0.0)
+	_velocity = Vector3(_player_vel.x, _player_vel_y, _player_vel.z)
+	_update_kelvin_ice_path()
+	_update_hero_camera_and_visuals(delta)
 	_update_pickaxe_swing(delta)
 
-func _move_player_horizontal(motion: Vector3) -> void:
-	if motion.length_squared() < 0.000001:
-		return
-	if not _player_path_blocked(motion):
-		_player_feet += motion
-		return
-	var slide_x := Vector3(motion.x, 0.0, 0.0)
-	var slide_z := Vector3(0.0, 0.0, motion.z)
-	if absf(slide_x.x) > 0.0001 and not _player_path_blocked(slide_x):
-		_player_feet += slide_x
-	if absf(slide_z.z) > 0.0001 and not _player_path_blocked(slide_z):
-		_player_feet += slide_z
+func _apply_hero_horizontal_accel(delta: float, wish_dir: Vector3, want_slide: bool) -> void:
+	var horiz_vel := Vector3(_player_vel.x, 0.0, _player_vel.z)
+	var horiz_speed := horiz_vel.length()
+	var on_ice := (_foot_material == 6)   # kMaterialIce
+	var in_water := (_foot_material == 4) # kMaterialWater
+	var on_lava := (_foot_material == 3)  # kMaterialLava
 
-## Voxel terrain has no physics collider, so walls are found with the engine's
-## voxel raycast; pristine statue colliders come from the physics space. Rays sit
-## just above the climbable step height so 0.5 m voxel steps do not block walking.
+	if _player_grounded:
+		var slope_steepness := clampf(1.0 - _ground_normal.y, 0.0, 1.0)
+		var can_slide := want_slide and (horiz_speed > 4.8 or slope_steepness > 0.05 or on_ice)
+		if can_slide:
+			if _hero_state != HeroState.SLIDING and horiz_speed < 11.5:
+				var slide_dir := wish_dir if wish_dir.length_squared() > 1e-4 else horiz_vel.normalized()
+				if slide_dir.length_squared() > 1e-4:
+					horiz_vel = slide_dir * 11.5
+			_hero_state = HeroState.SLIDING
+		elif _hero_state == HeroState.SLIDING and (not want_slide or horiz_speed < 2.0):
+			_hero_state = HeroState.GROUNDED
+
+		if _hero_state == HeroState.SLIDING:
+			var downhill := Vector3(_ground_normal.x, 0.0, _ground_normal.z)
+			if downhill.length_squared() > 1e-5:
+				horiz_vel += downhill.normalized() * (26.0 * (slope_steepness * 2.5 + 0.15) * delta)
+			var slide_fric := 2.6 * (0.20 if on_ice else 1.0)
+			horiz_vel = horiz_vel.move_toward(Vector3.ZERO, slide_fric * delta)
+			var cap := play_slide_max_speed * (1.2 if on_ice else 1.0)
+			if horiz_vel.length() > cap:
+				horiz_vel = horiz_vel.normalized() * cap
+		else:
+			var top_speed := play_walk_speed * (0.76 if in_water else (1.18 if on_ice else 1.0))
+			var target_vel := wish_dir * top_speed
+			var fric := 14.0 * (0.18 if on_ice else 1.0)
+			var accel := 42.0 if wish_dir.length_squared() > 1e-4 else fric
+			horiz_vel = horiz_vel.move_toward(target_vel, accel * delta)
+
+		if on_lava:
+			_player_vel_y = 9.2
+			_player_grounded = false
+			_hero_state = HeroState.AIRBORNE
+	else:
+		# Preserve Dash-Jump momentum in air while allowing air-strafe control
+		if wish_dir.length_squared() > 1e-4:
+			var proj := horiz_vel.dot(wish_dir)
+			var max_air := play_walk_speed * 1.15
+			if proj < max_air:
+				horiz_vel += wish_dir * minf(16.0 * delta, max_air - proj)
+		horiz_vel = horiz_vel.move_toward(Vector3.ZERO, 1.1 * delta)
+
+	_player_vel.x = horiz_vel.x
+	_player_vel.z = horiz_vel.z
+
+func _move_player_horizontal(motion: Vector3, wish_dir: Vector3 = Vector3.ZERO) -> void:
+	if motion.length_squared() >= 0.000001:
+		if not _player_path_blocked(motion):
+			_player_feet += motion
+		else:
+			# If blocked by a wall while airborne (or jumping), try 3-probe SDF Ledge Mantle!
+			if not _player_grounded and wish_dir.length_squared() > 1e-4:
+				if _try_start_ledge_mantle(wish_dir):
+					return
+			var slide_x := Vector3(motion.x, 0.0, 0.0)
+			var slide_z := Vector3(0.0, 0.0, motion.z)
+			if absf(slide_x.x) > 0.0001 and not _player_path_blocked(slide_x):
+				_player_feet += slide_x
+			if absf(slide_z.z) > 0.0001 and not _player_path_blocked(slide_z):
+				_player_feet += slide_z
+
+	# Continuous O(1) SDF sphere depenetration so hero capsule glides smoothly along curved cave walls
+	if terrain.has_method("sample_sdf"):
+		for h in [play_step_height + 0.15, 1.15, 1.55]:
+			var pt := _player_feet + Vector3(0.0, h, 0.0)
+			var d := terrain.sample_sdf(pt)
+			if d < play_body_radius:
+				var n := terrain.sample_sdf_normal(pt)
+				var push := Vector3(n.x, 0.0, n.z)
+				if push.length_squared() > 1e-4:
+					push = push.normalized()
+					_player_feet += push * (play_body_radius - d)
+					var vn := _player_vel.x * push.x + _player_vel.z * push.z
+					if vn < 0.0:
+						_player_vel.x -= push.x * vn
+						_player_vel.z -= push.z * vn
+
+## Voxel terrain walls are checked via O(1) SDF/DDA raycasts; pristine statue colliders
+## come from PhysicsServer3D. Rays sit just above step_height so 0.5 m steps don't block.
 func _player_path_blocked(motion: Vector3) -> bool:
 	var dir := motion.normalized()
 	var distance := motion.length() + play_body_radius
@@ -1631,11 +1880,368 @@ func _player_path_blocked(motion: Vector3) -> bool:
 			return true
 	return false
 
-func _try_jump() -> void:
-	if _mode != Mode.PLAY or not _player_grounded:
-		return
-	_player_vel_y = play_jump_speed
+## 3-Probe SDF + Raycast Ledge Mantling:
+##   1. Forward chest raycast locates a steep wall face.
+##   2. Downward probe past the wall lip locates a walkable ledge top within [min_h, max_h].
+##   3. O(1) sample_sdf checks at waist & head above the ledge verify capsule clearance.
+func _try_start_ledge_mantle(move_dir: Vector3) -> bool:
+	var fwd := Vector3(move_dir.x, 0.0, move_dir.z).normalized()
+	if fwd.length_squared() < 1e-4:
+		return false
+
+	var chest_from := _player_feet + Vector3(0.0, 1.05, 0.0)
+	var chest_to := chest_from + fwd * (play_body_radius + play_mantle_reach)
+	var wall_hit := terrain.raycast_terrain(chest_from, chest_to)
+	if not is_finite(wall_hit.x):
+		return false
+
+	if terrain.has_method("sample_sdf_normal"):
+		var wall_n := terrain.sample_sdf_normal(wall_hit)
+		if absf(wall_n.y) > 0.62:
+			return false
+
+	var lip_xz := wall_hit + fwd * (play_body_radius + 0.25)
+	var top_from := Vector3(lip_xz.x, _player_feet.y + play_mantle_max_height + 0.35, lip_xz.z)
+	var top_to := Vector3(lip_xz.x, _player_feet.y + play_mantle_min_height, lip_xz.z)
+	var ledge_hit := terrain.raycast_terrain(top_from, top_to)
+	if not is_finite(ledge_hit.y):
+		return false
+
+	var climb_h := ledge_hit.y - _player_feet.y
+	if climb_h < play_mantle_min_height or climb_h > play_mantle_max_height:
+		return false
+
+	if terrain.has_method("sample_sdf"):
+		var ledge_n := terrain.sample_sdf_normal(ledge_hit)
+		if ledge_n.y < 0.65:
+			return false
+		var waist_sdf := terrain.sample_sdf(ledge_hit + Vector3(0.0, 0.90, 0.0))
+		var head_sdf := terrain.sample_sdf(ledge_hit + Vector3(0.0, 1.65, 0.0))
+		if waist_sdf < play_body_radius * 0.75 or head_sdf < play_body_radius * 0.75:
+			return false
+
+	_hero_state = HeroState.MANTLING
+	_mantle_timer = 0.0
+	_mantle_start_pos = _player_feet
+	_mantle_target_pos = ledge_hit
+	_player_vel = Vector3.ZERO
+	_player_vel_y = 0.0
 	_player_grounded = false
+	print("[HeroController] Ledge Mantle started -> climbing +%.2f m onto crater/cliff rim!" % climb_h)
+	return true
+
+func _step_hero_mantle(delta: float) -> void:
+	_mantle_timer += delta
+	var t := clampf(_mantle_timer / maxf(0.08, play_mantle_duration), 0.0, 1.0)
+	if t < 0.55:
+		var u := smoothstep(0.0, 1.0, t / 0.55)
+		_player_feet.x = lerpf(_mantle_start_pos.x, _mantle_target_pos.x, u * 0.25)
+		_player_feet.z = lerpf(_mantle_start_pos.z, _mantle_target_pos.z, u * 0.25)
+		_player_feet.y = lerpf(_mantle_start_pos.y, _mantle_target_pos.y + 0.12, u)
+	else:
+		var u := smoothstep(0.0, 1.0, (t - 0.55) / 0.45)
+		_player_feet.x = lerpf(_mantle_start_pos.x, _mantle_target_pos.x, 0.25 + 0.75 * u)
+		_player_feet.z = lerpf(_mantle_start_pos.z, _mantle_target_pos.z, 0.25 + 0.75 * u)
+		_player_feet.y = lerpf(_mantle_target_pos.y + 0.12, _mantle_target_pos.y, u)
+
+	if t >= 1.0:
+		_player_feet = _mantle_target_pos
+		var exit_dir := _mantle_target_pos - _mantle_start_pos
+		exit_dir.y = 0.0
+		if exit_dir.length_squared() > 1e-4:
+			var boost := exit_dir.normalized() * 4.8
+			_player_vel.x = boost.x
+			_player_vel.z = boost.z
+		_player_vel_y = 0.0
+		_player_grounded = true
+		_hero_state = HeroState.GROUNDED
+
+func _try_dash() -> void:
+	if _mode != Mode.PLAY or _hero_state == HeroState.DASHING or _hero_state == HeroState.MANTLING:
+		return
+	if _stamina_charges <= 0:
+		return
+	_stamina_charges -= 1
+	var forward := Vector3(-sin(_yaw), 0.0, -cos(_yaw))
+	var right := Vector3(cos(_yaw), 0.0, -sin(_yaw))
+	var move_in := Vector3.ZERO
+	if Input.is_key_pressed(KEY_W): move_in += forward
+	if Input.is_key_pressed(KEY_S): move_in -= forward
+	if Input.is_key_pressed(KEY_A): move_in -= right
+	if Input.is_key_pressed(KEY_D): move_in += right
+	_dash_dir = move_in.normalized() if move_in.length_squared() > 1e-4 else forward
+	_dash_timer = 0.0
+	_hero_state = HeroState.DASHING
+	_player_vel.x = _dash_dir.x * play_dash_speed
+	_player_vel.z = _dash_dir.z * play_dash_speed
+	_player_vel_y = maxf(_player_vel_y, 0.0)
+
+func _try_jump() -> void:
+	if _mode != Mode.PLAY:
+		return
+	var forward := Vector3(-sin(_yaw), 0.0, -cos(_yaw))
+	var right := Vector3(cos(_yaw), 0.0, -sin(_yaw))
+	var move_in := Vector3.ZERO
+	if Input.is_key_pressed(KEY_W): move_in += forward
+	if Input.is_key_pressed(KEY_S): move_in -= forward
+	if Input.is_key_pressed(KEY_A): move_in -= right
+	if Input.is_key_pressed(KEY_D): move_in += right
+	var climb_dir := move_in.normalized() if move_in.length_squared() > 1e-4 else forward
+
+	# 1. Deadlock Dash-Jump combo: pressing Space inside the active Dash window launches a long arc!
+	if _hero_state == HeroState.DASHING and _dash_timer >= 0.04 and _dash_timer <= 0.24:
+		_hero_state = HeroState.AIRBORNE
+		_player_grounded = false
+		_coyote_timer = 0.0
+		_player_vel.x = _dash_dir.x * play_dash_jump_horiz_boost
+		_player_vel.z = _dash_dir.z * play_dash_jump_horiz_boost
+		_player_vel_y = play_dash_jump_vert_speed
+		print("[HeroController] Dash-Jump triggered! Horiz speed=%.1f m/s" % play_dash_jump_horiz_boost)
+		return
+
+	# 2. Try Ledge Mantle if close to a cliff/crater wall
+	if _try_start_ledge_mantle(climb_dir):
+		return
+
+	# 3. Standard or Coyote-Time Jump (with slide-jump speed preservation)
+	if _player_grounded or _coyote_timer > 0.0:
+		if _hero_state == HeroState.SLIDING:
+			_player_vel.x *= 1.12
+			_player_vel.z *= 1.12
+		_player_vel_y = play_jump_speed
+		_player_grounded = false
+		_coyote_timer = 0.0
+		_hero_state = HeroState.AIRBORNE
+
+func _try_shoulder_charge() -> void:
+	if _mode != Mode.PLAY or _hero_state == HeroState.MANTLING or _hero_state == HeroState.SHOULDER_CHARGE:
+		return
+	_hero_state = HeroState.SHOULDER_CHARGE
+	_charge_timer = 0.0
+	_charge_pinned_companion = false
+	_charge_dir = Vector3(-sin(_yaw), 0.0, -cos(_yaw)).normalized()
+	_player_vel = _charge_dir * play_charge_speed
+	print("[HeroController] Abrams Shoulder Charge started! (Steer with mouse | Captures companion & pins/breaches walls)")
+
+func _step_hero_shoulder_charge(delta: float) -> void:
+	_charge_timer += delta
+	if _charge_timer >= play_charge_duration:
+		_charge_pinned_companion = false
+		_hero_state = HeroState.GROUNDED if _player_grounded else HeroState.AIRBORNE
+		return
+
+	# Smoothly steer charge direction toward current camera yaw (clamped turn rate)
+	var desired_dir := Vector3(-sin(_yaw), 0.0, -cos(_yaw)).normalized()
+	_charge_dir = _charge_dir.lerp(desired_dir, clampf(2.2 * delta, 0.0, 1.0)).normalized()
+
+	var step_dist := play_charge_speed * delta
+	var horiz_step := _charge_dir * step_dist
+	var next_feet := _player_feet + horiz_step
+
+	# Phase A: Sweep Capture Corridor for AI Companion
+	if not _charge_pinned_companion and _companion_initialized:
+		var to_comp := ai_companion.global_position - _player_feet
+		if absf(to_comp.y) <= 2.4:
+			var horiz_comp := Vector3(to_comp.x, 0.0, to_comp.z)
+			var fwd_proj := horiz_comp.dot(_charge_dir)
+			if fwd_proj >= -0.35 and fwd_proj <= step_dist + play_charge_capture_radius:
+				var lat_dist := (horiz_comp - _charge_dir * fwd_proj).length()
+				if lat_dist <= play_charge_capture_radius:
+					_charge_pinned_companion = true
+					print("[WallPin] Captured AI Companion on Shoulder Charge bumper!")
+
+	# Phase B: Swept Sphere Wall-Pin Detection (voxel SDF sweep_sphere + pristine statue PhysicsServer3D ray)
+	var lead_extra := 0.85 if _charge_pinned_companion else 0.25
+	var sweep_r := play_body_radius * 0.92
+	var hit_pos := Vector3(INF, INF, INF)
+	var hit_collider: Object = null
+
+	for h in [0.85, 1.35]:
+		var from_pt := _player_feet + Vector3(0.0, h, 0.0)
+		var to_pt := next_feet + Vector3(0.0, h, 0.0) + _charge_dir * (play_body_radius + lead_extra)
+		var vox_contact: Vector3 = terrain.sweep_sphere(from_pt, to_pt, sweep_r) if terrain.has_method("sweep_sphere") else terrain.raycast_terrain(from_pt, to_pt)
+		if is_finite(vox_contact.x):
+			hit_pos = vox_contact
+			break
+		var query := PhysicsRayQueryParameters3D.create(from_pt, to_pt)
+		var phys_hit := get_world_3d().direct_space_state.intersect_ray(query)
+		if not phys_hit.is_empty():
+			hit_pos = phys_hit.position
+			hit_collider = phys_hit.get("collider")
+			break
+
+	if is_finite(hit_pos.x):
+		# If we slammed into an Option 1 pristine statue, swap it to destructible voxels first!
+		if hit_collider != null:
+			_check_and_swap_opt1_easter_island_on_blast(hit_pos, play_charge_wall_pin_blast_radius, hit_collider)
+			_check_and_swap_atlas_opt1_on_blast(hit_pos, play_charge_wall_pin_blast_radius, hit_collider)
+			_check_and_swap_ape_opt1_on_blast(hit_pos, play_charge_wall_pin_blast_radius, hit_collider)
+
+		var wall_normal := terrain.sample_sdf_normal(hit_pos) if terrain.has_method("sample_sdf_normal") else -_charge_dir
+		if absf(wall_normal.y) < 0.62:
+			var wall_n_xz := Vector3(wall_normal.x, 0.0, wall_normal.z).normalized()
+			if wall_n_xz.length_squared() < 1e-4:
+				wall_n_xz = -_charge_dir
+			var impact_cos := -_charge_dir.dot(wall_n_xz)
+
+			# Outcome 1: Glancing Wall Hit (< 53 deg into wall) -> slide smoothly along wall tangent!
+			if impact_cos < play_charge_pin_min_cos:
+				var slide_dir := (_charge_dir - wall_n_xz * _charge_dir.dot(wall_n_xz)).normalized()
+				if slide_dir.length_squared() > 1e-4:
+					_charge_dir = slide_dir
+					next_feet = _player_feet + _charge_dir * (step_dist * maxf(0.45, 1.0 - impact_cos))
+			else:
+				# Direct Wall Impact! Inspect material, damage ratio, and wall thickness
+				var wall_mat := terrain.get_material_at(hit_pos) if terrain.has_method("get_material_at") else MATERIAL_SOIL
+				var wall_dmg := terrain.get_damage_at(hit_pos) if terrain.has_method("get_damage_at") else 0.0
+				var wall_thick := terrain.measure_wall_thickness(
+					hit_pos, _charge_dir, play_charge_breach_max_thickness + 1.0
+				) if terrain.has_method("measure_wall_thickness") else 99.0
+
+				var mat_name: String = MATERIAL_ID_NAMES[wall_mat] if wall_mat >= 0 and wall_mat < MATERIAL_ID_NAMES.size() else "Rock"
+				var can_breach_mat := (
+					wall_mat == MATERIAL_SOIL or
+					wall_mat == 6 or # Ice
+					(wall_mat == MATERIAL_ROCK and wall_dmg >= 0.60)
+				)
+
+				# Outcome 2: Thin-Wall Breach (smash straight through thin Soil/Ice/cracked walls!)
+				if not _charge_pinned_companion and can_breach_mat and wall_thick > 0.05 and wall_thick <= play_charge_breach_max_thickness:
+					var tunnel_end := hit_pos + _charge_dir * (wall_thick + 0.9)
+					terrain.carve_capsule(hit_pos - _charge_dir * 0.4, tunnel_end, 2.3)
+					print("[WallPin] BREACHED thin %s wall (thickness=%.2f m) at %s ΓÇö keeping charge momentum!" % [
+						mat_name, wall_thick, str(hit_pos)
+					])
+					_player_feet = next_feet
+					return
+
+				# Outcome 3: Solid Wall-Pin & Stun!
+				if _companion_initialized and _goal_mesh_inst.visible:
+					_rebake_in_progress = true
+				terrain.trigger_explosion(hit_pos, play_charge_wall_pin_blast_radius)
+				if _charge_pinned_companion:
+					ai_companion.global_position = Vector3(
+						hit_pos.x + wall_n_xz.x * 0.65,
+						_player_feet.y + 0.15,
+						hit_pos.z + wall_n_xz.z * 0.65
+					)
+					_companion_stun_timer = play_charge_pin_stun_seconds
+					print("[WallPin] PINNED AI Companion against %s wall at %s (cos=%.2f, thickness=%.2f m) -> STUNNED for %.1f s!" % [
+						mat_name, str(hit_pos), impact_cos, wall_thick, play_charge_pin_stun_seconds
+					])
+				else:
+					print("[WallPin] Heavy Shoulder Charge slammed %s wall at %s (cos=%.2f, thickness=%.2f m)!" % [
+						mat_name, str(hit_pos), impact_cos, wall_thick
+					])
+
+				_charge_pinned_companion = false
+				_player_vel = wall_n_xz * 3.8
+				_player_vel_y = 3.2
+				_player_grounded = false
+				_hero_state = HeroState.AIRBORNE
+				return
+
+	# Advance hero and drag pinned companion on front bumper
+	_player_feet = next_feet
+	var ground_y := _ground_probe(_player_feet + Vector3(0.0, play_step_height + 0.3, 0.0), 2.2)
+	if is_finite(ground_y):
+		_player_feet.y = ground_y
+		_player_vel_y = 0.0
+		_player_grounded = true
+	else:
+		_player_vel_y = maxf(_player_vel_y - play_gravity * delta, -40.0)
+		_player_feet.y += _player_vel_y * delta
+		_player_grounded = false
+
+	if _charge_pinned_companion:
+		ai_companion.global_position = _player_feet + _charge_dir * 1.15 + Vector3(0.0, 0.15, 0.0)
+		_companion_vertical_vel = 0.0
+
+func _try_ground_slam() -> void:
+	if _mode != Mode.PLAY or _player_grounded or _hero_state == HeroState.MANTLING:
+		return
+	_hero_state = HeroState.GROUND_SLAM
+	var aim_fwd := Vector3(-sin(_yaw), 0.0, -cos(_yaw)) * 8.0
+	_player_vel.x = aim_fwd.x
+	_player_vel.z = aim_fwd.z
+	_player_vel_y = -28.0
+	print("[HeroController] Lash Ground Strike dive initiated!")
+
+func _step_hero_ground_slam(delta: float) -> void:
+	var step_vec := Vector3(_player_vel.x, _player_vel_y, _player_vel.z) * delta
+	var next_feet := _player_feet + step_vec
+	var hit := terrain.raycast_terrain(_player_feet + Vector3(0.0, 0.8, 0.0), next_feet - Vector3(0.0, 0.4, 0.0))
+	if is_finite(hit.y) and next_feet.y <= hit.y + 0.25:
+		_player_feet = hit
+		_player_vel = Vector3.ZERO
+		_player_vel_y = 0.0
+		_player_grounded = true
+		_hero_state = HeroState.GROUNDED
+		var dom_mat := terrain.get_dominant_material_in_sphere(hit, play_ground_slam_radius * 0.65) if terrain.has_method("get_dominant_material_in_sphere") else MATERIAL_SOIL
+		var mat_name: String = MATERIAL_ID_NAMES[dom_mat] if dom_mat >= 0 and dom_mat < MATERIAL_ID_NAMES.size() else "Terrain"
+		print("[HeroController] Ground Strike impacted %s at %s -> carving %.1f m crater!" % [mat_name, str(hit), play_ground_slam_radius])
+		terrain.trigger_explosion(hit, play_ground_slam_radius)
+		return
+	_player_feet = next_feet
+
+func _update_kelvin_ice_path() -> void:
+	if not _ice_path_active or not terrain.has_method("trigger_elemental_capsule"):
+		_last_ice_path_anchor = Vector3(INF, INF, INF)
+		return
+	var pitch_offset := clampf(sin(_pitch) * 0.85, -0.55, 0.65)
+	var cur_anchor := _player_feet + Vector3(0.0, pitch_offset - 0.35, 0.0)
+	if not is_finite(_last_ice_path_anchor.x):
+		_last_ice_path_anchor = cur_anchor
+		terrain.trigger_elemental_sphere(cur_anchor, play_ice_path_radius, ELEMENTAL_FROST)
+		return
+	if cur_anchor.distance_to(_last_ice_path_anchor) >= 1.1:
+		terrain.trigger_elemental_capsule(_last_ice_path_anchor, cur_anchor, play_ice_path_radius, ELEMENTAL_FROST)
+		_last_ice_path_anchor = cur_anchor
+
+func _update_hero_camera_and_visuals(_delta: float) -> void:
+	var cam_rot := Basis.from_euler(Vector3(_pitch, _yaw, 0.0))
+	var crouch_offset := -0.45 if _hero_state == HeroState.SLIDING else 0.0
+	var pivot := _player_feet + Vector3(0.0, play_eye_height + crouch_offset, 0.0)
+
+	if _hero_visual_root != null:
+		_hero_visual_root.visible = (_mode == Mode.PLAY and play_third_person)
+		_hero_visual_root.global_position = _player_feet
+		var lean_pitch := 0.0
+		if _hero_state == HeroState.DASHING:
+			lean_pitch = -0.28
+		elif _hero_state == HeroState.SLIDING:
+			lean_pitch = 0.42
+		elif _hero_state == HeroState.MANTLING:
+			lean_pitch = -0.35
+		elif _hero_state == HeroState.SHOULDER_CHARGE:
+			lean_pitch = -0.38
+		_hero_visual_root.rotation = Vector3(lean_pitch, _yaw, 0.0)
+
+	if not play_third_person:
+		_play_pcam.global_position = pivot
+		_play_pcam.rotation = Vector3(_pitch, _yaw, 0.0)
+		return
+
+	var desired_cam := pivot + cam_rot * Vector3(play_cam_shoulder_offset.x, play_cam_shoulder_offset.y, play_cam_arm_length)
+	var final_cam := desired_cam
+	var voxel_hit := terrain.raycast_terrain(pivot, desired_cam)
+	if is_finite(voxel_hit.x):
+		var dist := maxf(0.5, pivot.distance_to(voxel_hit) - 0.35)
+		final_cam = pivot + (desired_cam - pivot).normalized() * dist
+	var query := PhysicsRayQueryParameters3D.create(pivot, final_cam)
+	var phys_hit := get_world_3d().direct_space_state.intersect_ray(query)
+	if not phys_hit.is_empty():
+		var dist := maxf(0.5, pivot.distance_to(phys_hit.position) - 0.35)
+		final_cam = pivot + (desired_cam - pivot).normalized() * dist
+
+	if terrain.has_method("sample_sdf"):
+		var cam_sdf := terrain.sample_sdf(final_cam)
+		if cam_sdf < 0.32:
+			var cam_n := terrain.sample_sdf_normal(final_cam)
+			final_cam += cam_n * (0.32 - cam_sdf)
+
+	_play_pcam.global_position = final_cam
+	_play_pcam.rotation = Vector3(_pitch, _yaw, 0.0)
 
 func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
@@ -1665,6 +2271,26 @@ func _unhandled_input(event: InputEvent) -> void:
 					Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 			KEY_F:
 				_toggle_mode()
+			KEY_V:
+				if _mode == Mode.PLAY:
+					play_third_person = not play_third_person
+					_update_hero_camera_and_visuals(0.0)
+					print("[HeroController] Camera view: %s" % ("3rd-Person Over-the-Shoulder" if play_third_person else "1st-Person"))
+			KEY_SHIFT:
+				if _mode == Mode.PLAY and not event.echo:
+					_try_dash()
+			KEY_E:
+				if _mode == Mode.PLAY and not event.echo:
+					_ice_path_active = not _ice_path_active
+					if not _ice_path_active:
+						_last_ice_path_anchor = Vector3(INF, INF, INF)
+					print("[HeroController] Kelvin Ice Path skyway: %s" % ("ACTIVE" if _ice_path_active else "OFF"))
+			KEY_G:
+				if _mode == Mode.PLAY and not event.echo:
+					_try_shoulder_charge()
+			KEY_Q:
+				if _mode == Mode.PLAY and not event.echo:
+					_try_ground_slam()
 			KEY_SPACE:
 				_try_jump()
 			KEY_1:
@@ -1792,7 +2418,7 @@ func _process_fly(delta: float) -> void:
 	_fly_pcam.global_transform = camera.global_transform
 
 func _update_stream_focus(force: bool) -> void:
-	var cur_pos := camera.global_position
+	var cur_pos := _player_feet if _mode == Mode.PLAY else camera.global_position
 	# Chunks stay 32^3 samples, so their world size scales with the node's voxel size.
 	var chunk_size := 32.0 * terrain.voxel_scale
 	var cur_chunk := Vector3i(
@@ -1850,9 +2476,13 @@ func _update_hud(delta: float) -> void:
 		]
 		return
 
-	var mode_name := "Play" if _mode == Mode.PLAY else "Fly"
-	var tool_text := "Pickaxe" if _mode == Mode.PLAY \
-		else "%s%s" % [TOOL_NAMES[_active_tool], material_state]
+	var mode_name := ("Hero 3P" if play_third_person else "Hero 1P") if _mode == Mode.PLAY else "Fly"
+	var pips := "Γûá".repeat(_stamina_charges) + "Γûí".repeat(maxi(0, play_max_stamina - _stamina_charges))
+	var foot_mat_name: String = MATERIAL_ID_NAMES[_foot_material] if _foot_material >= 0 and _foot_material < MATERIAL_ID_NAMES.size() else "Air"
+	var ice_tag := " | IcePath: ON (E)" if _ice_path_active else ""
+	var tool_text := "%s | Stamina: [%s] | Underfoot: %s%s" % [
+		HERO_STATE_NAMES[_hero_state], pips, foot_mat_name, ice_tag
+	] if _mode == Mode.PLAY else "[%s] %s%s" % [TOOL_KEYS[_active_tool], TOOL_NAMES[_active_tool], material_state]
 
 	_look_at_accum += delta
 	if _look_at_accum >= LOOK_AT_REFRESH_INTERVAL:
@@ -2408,7 +3038,7 @@ func _stamp_asset_at_crosshair(recreate_delay: float) -> void:
 		])
 	else:
 		_active_undo_action.clear()
-		push_warning("[VoxelTerrain3D] Failed to stamp '%s' — bake one first: voxel_baker <model.obj> %s" % [
+		push_warning("[VoxelTerrain3D] Failed to stamp '%s' ΓÇö bake one first: voxel_baker <model.obj> %s" % [
 			stamp_asset_path, stamp_asset_path
 		])
 
@@ -2433,7 +3063,7 @@ func _query_companion_cave_path_to_crosshair() -> void:
 		ai_companion.global_position = goal_pos
 		_companion_vertical_vel = 0.0
 		_companion_initialized = true
-		print("[Nav3D] Companion placed at ", goal_pos, " — Right-click another spot to path there!")
+		print("[Nav3D] Companion placed at ", goal_pos, " ΓÇö Right-click another spot to path there!")
 		return
 
 	_pending_path_goal = goal_pos
@@ -2497,6 +3127,15 @@ func _draw_path_ribbon(path: PackedVector3Array) -> void:
 	_path_immediate_mesh.surface_end()
 
 func _step_companion_along_path(delta: float) -> void:
+	if _companion_stun_timer > 0.0:
+		_companion_stun_timer = maxf(0.0, _companion_stun_timer - delta)
+		if _companion_base_mat != null:
+			var stunned := _companion_stun_timer > 0.0
+			_companion_base_mat.albedo_color = Color(1.0, 0.45, 0.1) if stunned else Color(0.1, 0.95, 1.0)
+			_companion_base_mat.emission = (Color(1.0, 0.4, 0.05) * 1.1) if stunned else (Color(0.1, 0.85, 1.0) * 0.6)
+		return
+	if _charge_pinned_companion:
+		return
 	if _rebake_in_progress or _has_pending_path_query:
 		return
 	if _current_waypoint_idx >= _active_waypoints.size():
@@ -3721,14 +4360,14 @@ func _build_benchmark_markdown_report(aborted: bool) -> String:
 		hw.get("completed_at_utc", hw.get("timestamp_utc", "")),
 		float(hw.get("total_duration_sec", 0.0)),
 	])
-	lines.append("- **Pre-Pass Terrain Reset**: `Enabled (%s)` — pristine terrain & statues restored before every pass" % _bench_last_reset_method)
+	lines.append("- **Pre-Pass Terrain Reset**: `Enabled (%s)` ΓÇö pristine terrain & statues restored before every pass" % _bench_last_reset_method)
 	lines.append("- **CPU**: %s (`%s`, %d logical threads, %d voxel worker threads)" % [
 		hw.get("cpu_name", "Unknown"),
 		hw.get("cpu_arch", ""),
 		int(hw.get("cpu_threads", 0)),
 		int(hw.get("voxel_worker_threads", 0)),
 	])
-	lines.append("- **GPU**: %s — %s (%s, API `%s`, driver `%s` / `%s`)" % [
+	lines.append("- **GPU**: %s ΓÇö %s (%s, API `%s`, driver `%s` / `%s`)" % [
 		hw.get("gpu_name", "Unknown"),
 		hw.get("gpu_vendor", ""),
 		hw.get("gpu_type", ""),

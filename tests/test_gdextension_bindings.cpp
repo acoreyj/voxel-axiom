@@ -867,6 +867,18 @@ void test_gdextension_fast_sdf_surface_queries_and_capsule_edits() {
     const float dmg_ratio = terrain.get_damage_at(boulder_pos);
     REQUIRE(dmg_ratio > 0.25f && dmg_ratio < 0.45f);
 
+    // 3b. Verify sweep_sphere (Swept Wall-Pin Detection) and measure_wall_thickness against the boulder
+    const Vector3 sweep_from(9.5f, boulder_pos.y + 2.0f, boulder_pos.z);
+    const Vector3 sweep_to(22.5f, boulder_pos.y + 2.0f, boulder_pos.z);
+    const Vector3 pin_contact = terrain.sweep_sphere(sweep_from, sweep_to, 0.6f);
+    REQUIRE(std::isfinite(pin_contact.x));
+    REQUIRE(pin_contact.x < boulder_pos.x);
+    const Vector3 pin_normal = terrain.sample_sdf_normal(pin_contact);
+    REQUIRE(pin_normal.x < -0.4f);
+    const float wall_thick = terrain.measure_wall_thickness(
+        pin_contact, Vector3(1.0f, 0.0f, 0.0f), 12.0f);
+    REQUIRE(wall_thick > 3.5f && wall_thick < 10.5f);
+
     // 4. Swept capsule carve (tunnel / beam) and Frost capsule (continuous Ice Path)
     const Vector3 cap_from(6.0f, surf_y - 1.5f, 8.0f);
     const Vector3 cap_to(26.0f, surf_y - 1.5f, 8.0f);

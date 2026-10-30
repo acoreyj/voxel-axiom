@@ -102,6 +102,16 @@ public:
     /// Returns the surface normal at the first `raycast_terrain` hit (central-difference
     /// gradient of `sample_sdf`), or +INF when nothing is hit.
     [[nodiscard]] Vector3 raycast_terrain_normal(Vector3 p_from, Vector3 p_to) const;
+    /// Sweeps a sphere of `p_radius` world meters along `p_from` -> `p_to` against the
+    /// trilinear SDF field. Returns the exact surface contact point, or +INF when clear.
+    /// Unlike a thin raycast this catches narrow pillars, statue edges, and door rims
+    /// across the full width of the hero's shoulders.
+    [[nodiscard]] Vector3 sweep_sphere(Vector3 p_from, Vector3 p_to, float p_radius) const;
+    /// Steps from `p_impact_pos` along `p_direction` through solid samples until the SDF
+    /// exits into air, returning the wall thickness in meters, or `p_max_thickness + 1.0`
+    /// when the wall stays solid all the way through.
+    [[nodiscard]] float measure_wall_thickness(Vector3 p_impact_pos, Vector3 p_direction,
+                                               float p_max_thickness) const;
     /// O(1) trilinear reconstruction of the signed-density field at a world position
     /// (negative = solid). Falls back to the procedural generator for unloaded chunks.
     [[nodiscard]] float sample_sdf(Vector3 p_world_pos) const;

@@ -715,6 +715,10 @@ Runtime methods:
 | `get_damage_at(world_pos)` | `float` | Crack damage ratio in `[0, 1]`. |
 | `query_sphere_materials(center, radius)` | `PackedInt32Array` | Per-material solid sample histogram (index 0 = air). |
 | `get_dominant_material_in_sphere(center, radius)` | `int` | Most common non-air material ID, or 0. |
+| `sweep_sphere(from, to, radius)` | `Vector3` | Swept-sphere SDF contact for wall-pin / charge checks, or `+INF` when clear. |
+| `measure_wall_thickness(impact_pos, direction, max_thickness)` | `float` | Wall thickness in meters, or `max_thickness + 1.0` when solid throughout. |
+| `sweep_sphere(from, to, radius)` | `Vector3` | Sweep a sphere along a segment against the SDF; contact point or `+INF` when clear. |
+| `measure_wall_thickness(impact_pos, direction, max_thickness)` | `float` | Thickness of the wall along `direction`, or `max_thickness + 1.0` when solid throughout. |
 | `get_surface_height(x, z)` | `float` | Top surface height at world X/Z. |
 | `undo()` / `redo()` | `bool` | Revert or re-apply one history action. |
 | `undo_all()` / `redo_all()` | `int` | Coalesced full-stack revert or re-apply. |
@@ -760,9 +764,12 @@ removed.
 | `F` | Toggle Fly / Play mode |
 | `M` / `F8` | Start or abort the automated benchmark suite |
 | `W` / `A` / `S` / `D` | Move (fly) or run (play) |
-| `Space` / `E` | Fly up; jump in Play mode |
-| `Ctrl` / `Q` | Fly down |
-| `Shift` | Sprint / speed boost |
+| `Space` | Fly up; jump or ledge-mantle in Play mode |
+| `E` | Fly up; toggle the Kelvin Ice Path in Play mode |
+| `Ctrl` / `Q` | Fly down; `Ctrl`/`C` slope-slide in Play mode, `Q` ground-slam while airborne |
+| `Shift` | Fly speed boost; stamina dash in Play mode (tap `Space` during the dash for a Dash-Jump) |
+| `V` | Toggle 3rd-person over-the-shoulder / 1st-person view in Play mode |
+| `G` | Shoulder Charge in Play mode (swept wall-pin, thin-wall breach, target capture) |
 | Mouse | Look |
 | `1` | Add terrain |
 | `2` | Paint terrain (hold and drag) |
@@ -825,6 +832,27 @@ Inspector:
 | `max_ray_distance` | `250.0` | Crosshair raycast length |
 | `pickaxe_hit_radius` | `1.5` | Play-mode pickaxe chip radius |
 | `pickaxe_impact_fraction` | `0.42` | Swing point where the chip lands |
+
+### Hero play mode
+
+`F` switches between Fly and a Deadlock-style third-person hero controller (`V` toggles
+first person). Movement and collision are driven by the C++ SDF queries rather than
+PhysicsServer3D: body probes at waist/chest/head depenetrate the capsule and slide velocity
+along `sample_sdf_normal`, with a 3-probe ledge mantle (wall face, ledge top, waist/head
+clearance), stamina dash + Dash-Jump, slope sliding, elemental underfoot reactions, a
+Kelvin Ice Path (`E`) that emits `trigger_elemental_capsule` every 1.1 m, and a Lash ground
+slam (`Q`) that carves a 5.5 m crater. `G` starts an Abrams-style shoulder charge using
+`sweep_sphere` and `measure_wall_thickness` to choose between a glancing wall slide, a
+thin-wall breach, or a solid wall-pin that stuns a captured companion.
+
+The same movement code is available as a reusable node: `voxel_hero_controller.gd` defines
+`class_name VoxelHeroController` (`extends Node3D`) with `@export` tuning for the capsule,
+stamina/dash/slide, mantling, shoulder charge, camera, and abilities. It exposes `dashed`,
+`dash_jumped`, `mantle_started`, `mantle_completed`, `ground_slam_impacted`,
+`shoulder_charge_started`, `target_captured_by_charge`, `wall_pin_impacted`, and
+`wall_breached`. Assign `terrain` (a `VoxelTerrain3D`), optionally fill `chargeable_targets`,
+then call `step_controller(delta, input_move, want_jump, want_dash, want_crouch_slide,
+want_shoulder_charge)` from your own `_process`.
 
 ### First-person pickaxe viewmodel
 
