@@ -7,12 +7,15 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <limits>
+#include <string>
 #include <thread>
 #include <utility>
 
 #if defined(VOXEL_WITH_GODOT_CPP)
 #include <godot_cpp/classes/physics_server3d.hpp>
+#include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/classes/world3d.hpp>
@@ -31,6 +34,42 @@ uint64_t monotonic_ticks_usec() noexcept {
         std::chrono::duration_cast<std::chrono::microseconds>(now).count());
 #endif
 }
+
+template <typename StrT>
+std::string to_std_string(const StrT& s) {
+    if constexpr (requires { s.utf8().get_data(); }) {
+        return std::string(s.utf8().get_data());
+    } else {
+        return std::string(s.c_str());
+    }
+}
+
+/// Resolves `res://` / `user://` asset paths to a filesystem path and falls back
+/// to `res://`-relative and plain relative lookups for offline/baked `.vreg` files.
+std::string resolve_asset_filepath(const String& p_filepath) {
+    std::string raw = to_std_string(p_filepath);
+#if defined(VOXEL_WITH_GODOT_CPP)
+    if (auto* ps = ProjectSettings::get_singleton()) {
+        if (raw.rfind("res://", 0) == 0 || raw.rfind("user://", 0) == 0) {
+            return to_std_string(ps->globalize_path(p_filepath));
+        }
+        if (!std::filesystem::exists(raw)) {
+            const String res_path = String("res://") + p_filepath;
+            const std::string globalized = to_std_string(ps->globalize_path(res_path));
+            if (std::filesystem::exists(globalized)) {
+                return globalized;
+            }
+        }
+    }
+#endif
+    if (raw.rfind("res://", 0) == 0) {
+        std::string stripped = raw.substr(6);
+        if (std::filesystem::exists(stripped)) {
+            return stripped;
+        }
+    }
+    return raw;
+}
 } // namespace
 
 void VoxelTerrain3D::_bind_methods() {
@@ -42,8 +81,14 @@ void VoxelTerrain3D::_bind_methods() {
     ClassDB::bind_method(D_METHOD("add_terrain_with_material", "position", "radius", "material"),
                          &VoxelTerrain3D::add_terrain_with_material);
     ClassDB::bind_method(D_METHOD("place_boulder", "position", "radius"), &VoxelTerrain3D::place_boulder);
+    ClassDB::bind_method(D_METHOD("carve_capsule", "from", "to", "radius"),
+                         &VoxelTerrain3D::carve_capsule);
+    ClassDB::bind_method(D_METHOD("add_capsule_with_material", "from", "to", "radius", "material"),
+                         &VoxelTerrain3D::add_capsule_with_material);
+    ClassDB::bind_method(D_METHOD("trigger_elemental_capsule", "from", "to", "radius", "element_kind"),
+                         &VoxelTerrain3D::trigger_elemental_capsule);
     ClassDB::bind_method(D_METHOD("stamp_asset", "vreg_path", "chunk_coords", "recreate_delay_seconds"),
-                         &VoxelTerrain3D::stamp_asset);
+                         &VoxelTerrain3D::stamp_asset, DEFVAL(0.0f));
     ClassDB::bind_method(D_METHOD("remove_structure", "structure_id"),
                          &VoxelTerrain3D::remove_structure);
     ClassDB::bind_method(D_METHOD("undo"), &VoxelTerrain3D::undo);
@@ -60,6 +105,16 @@ void VoxelTerrain3D::_bind_methods() {
     ClassDB::bind_method(D_METHOD("raycast_terrain", "from", "to"), &VoxelTerrain3D::raycast_terrain);
     ClassDB::bind_method(D_METHOD("raycast_terrain_material", "from", "to"),
                          &VoxelTerrain3D::raycast_terrain_material);
+    ClassDB::bind_method(D_METHOD("raycast_terrain_normal", "from", "to"),
+                         &VoxelTerrain3D::raycast_terrain_normal);
+    ClassDB::bind_method(D_METHOD("sample_sdf", "world_pos"), &VoxelTerrain3D::sample_sdf);
+    ClassDB::bind_method(D_METHOD("sample_sdf_normal", "world_pos"), &VoxelTerrain3D::sample_sdf_normal);
+    ClassDB::bind_method(D_METHOD("get_material_at", "world_pos"), &VoxelTerrain3D::get_material_at);
+    ClassDB::bind_method(D_METHOD("get_damage_at", "world_pos"), &VoxelTerrain3D::get_damage_at);
+    ClassDB::bind_method(D_METHOD("query_sphere_materials", "center", "radius"),
+                         &VoxelTerrain3D::query_sphere_materials);
+    ClassDB::bind_method(D_METHOD("get_dominant_material_in_sphere", "center", "radius"),
+                         &VoxelTerrain3D::get_dominant_material_in_sphere);
     ClassDB::bind_method(D_METHOD("get_surface_height", "x", "z"), &VoxelTerrain3D::get_surface_height);
     ClassDB::bind_method(D_METHOD("save_world"), &VoxelTerrain3D::save_world);
     ClassDB::bind_method(D_METHOD("set_save_directory_path", "path"), &VoxelTerrain3D::set_save_directory_path);
@@ -568,16 +623,89 @@ void VoxelTerrain3D::place_boulder(Vector3 p_position, float p_radius) {
     _enqueue_fill(p_position, p_radius, voxel::MaterialHardness::kMaterialBoulder);
 }
 
+void VoxelTerrain3D::carve_capsule(Vector3 p_from, Vector3 p_to, float p_radius) {
+    trigger_elemental_capsule(p_from, p_to, p_radius, static_cast<int>(voxel::ElementalKind::None));
+}
+
+void VoxelTerrain3D::add_capsule_with_material(Vector3 p_from, Vector3 p_to, float p_radius, int p_material) {
+    if (!core_engine || p_radius <= 0.0f) {
+        const std::string reason = "engine not ready or radius is non-positive";
+#if defined(VOXEL_WITH_GODOT_CPP)
+        emit_signal("terrain_add_failed", String(reason.c_str()));
+#else
+        emitted_signals_.push_back(EmittedSignalRecord{"terrain_add_failed", {}, 0.0f, 0, reason, 0});
+#endif
+        return;
+    }
+
+    const uint8_t material = static_cast<uint8_t>(std::clamp(p_material, 1, 7));
+    const float inv_scale = 1.0f / voxel_scale;
+    const voxel::Vec3f native_from{
+        p_from.x * inv_scale, p_from.y * inv_scale, p_from.z * inv_scale};
+    const voxel::Vec3f native_to{
+        p_to.x * inv_scale, p_to.y * inv_scale, p_to.z * inv_scale};
+    const float grid_radius = p_radius * inv_scale;
+
+    if (core_engine->worker_pool->enqueue_capsule_fill(native_from, native_to, grid_radius, material)) {
+#if defined(VOXEL_WITH_GODOT_CPP)
+        emit_signal("terrain_add_requested", p_from, p_radius);
+#else
+        emitted_signals_.push_back(
+            EmittedSignalRecord{"terrain_add_requested", p_from, p_radius, 0, {}, 0});
+#endif
+    } else {
+        const std::string reason = "edit queue full, engine shutting down, or out of bounds";
+#if defined(VOXEL_WITH_GODOT_CPP)
+        emit_signal("terrain_add_failed", String(reason.c_str()));
+#else
+        emitted_signals_.push_back(EmittedSignalRecord{"terrain_add_failed", {}, 0.0f, 0, reason, 0});
+#endif
+    }
+}
+
+void VoxelTerrain3D::trigger_elemental_capsule(Vector3 p_from, Vector3 p_to, float p_radius, int p_element_kind) {
+    if (!core_engine || p_radius <= 0.0f) {
+        const std::string reason = "engine not ready or radius is non-positive";
+#if defined(VOXEL_WITH_GODOT_CPP)
+        emit_signal("explosion_failed", String(reason.c_str()));
+#else
+        emitted_signals_.push_back(EmittedSignalRecord{"explosion_failed", {}, 0.0f, 0, reason, 0});
+#endif
+        return;
+    }
+
+    const int clamped_kind = std::clamp(p_element_kind, 0, 3);
+    const auto elem_kind = static_cast<voxel::ElementalKind>(clamped_kind);
+    const float inv_scale = 1.0f / voxel_scale;
+    const voxel::Vec3f native_from{
+        p_from.x * inv_scale, p_from.y * inv_scale, p_from.z * inv_scale};
+    const voxel::Vec3f native_to{
+        p_to.x * inv_scale, p_to.y * inv_scale, p_to.z * inv_scale};
+    const float grid_radius = p_radius * inv_scale;
+
+    if (core_engine->worker_pool->enqueue_elemental_capsule(native_from, native_to, grid_radius, elem_kind)) {
+#if defined(VOXEL_WITH_GODOT_CPP)
+        emit_signal("explosion_requested", p_from, p_radius);
+#else
+        emitted_signals_.push_back(
+            EmittedSignalRecord{"explosion_requested", p_from, p_radius, 0, {}, 0});
+#endif
+    } else {
+        const std::string reason = "edit queue full, engine shutting down, or out of bounds";
+#if defined(VOXEL_WITH_GODOT_CPP)
+        emit_signal("explosion_failed", String(reason.c_str()));
+#else
+        emitted_signals_.push_back(EmittedSignalRecord{"explosion_failed", {}, 0.0f, 0, reason, 0});
+#endif
+    }
+}
+
 int64_t VoxelTerrain3D::stamp_asset(const String& p_vreg_path, Vector3 p_chunk_coords, float p_recreate_delay_seconds) {
     if (!core_engine) {
         return 0;
     }
     drain_pending_edits_for_undo_redo();
-#if defined(VOXEL_WITH_GODOT_CPP)
-    const std::string vreg_path(p_vreg_path.utf8().get_data());
-#else
-    const std::string vreg_path(p_vreg_path);
-#endif
+    const std::string vreg_path = resolve_asset_filepath(p_vreg_path);
     const voxel::ChunkKey origin = voxel::ChunkKey::from_coords(
         static_cast<int32_t>(std::llround(p_chunk_coords.x)),
         static_cast<int32_t>(std::llround(p_chunk_coords.y)),
@@ -863,6 +991,313 @@ int VoxelTerrain3D::raycast_terrain_material(Vector3 p_from, Vector3 p_to) const
         return -1;
     }
     return static_cast<int>(hit->material_id);
+}
+
+Vector3 VoxelTerrain3D::raycast_terrain_normal(Vector3 p_from, Vector3 p_to) const {
+    const Vector3 hit = raycast_terrain(p_from, p_to);
+    if (!std::isfinite(hit.x)) {
+        return hit;
+    }
+    return sample_sdf_normal(hit);
+}
+
+float VoxelTerrain3D::sample_sdf(Vector3 p_world_pos) const {
+    if (!core_engine) {
+        return std::numeric_limits<float>::infinity();
+    }
+    const float s = (voxel_scale > 0.0f) ? voxel_scale : 1.0f;
+    const float inv_s = 1.0f / s;
+    const float gx = p_world_pos.x * inv_s;
+    const float gy = p_world_pos.y * inv_s;
+    const float gz = p_world_pos.z * inv_s;
+
+    const int32_t ix = static_cast<int32_t>(std::floor(gx));
+    const int32_t iy = static_cast<int32_t>(std::floor(gy));
+    const int32_t iz = static_cast<int32_t>(std::floor(gz));
+
+    const float fx = gx - static_cast<float>(ix);
+    const float fy = gy - static_cast<float>(iy);
+    const float fz = gz - static_cast<float>(iz);
+
+    auto sample_lattice = [&](int32_t sx, int32_t sy, int32_t sz) -> float {
+        const auto mapped = voxel::map_world_sample(sx, sy, sz);
+        if (const voxel::ChunkSlot* slot = core_engine->store.find_slot(mapped.chunk)) {
+            std::shared_lock<std::shared_mutex> rl(slot->mutex);
+            if (slot->state == voxel::ChunkLifecycleState::Resident) {
+                return voxel::TsdfFormat::decode(slot->get_tsdf(mapped.local));
+            }
+        }
+        // Fall back to the procedural field for unloaded chunks. The generator
+        // returns world meters, so divide by the voxel size to keep every lattice
+        // sample in canonical voxel units; the final interpolation result is
+        // converted back to world meters below.
+        return core_engine->procgen.evaluate_composite_density(
+                   static_cast<float>(sx) * s,
+                   static_cast<float>(sy) * s,
+                   static_cast<float>(sz) * s) / s;
+    };
+
+    const float c000 = sample_lattice(ix,     iy,     iz);
+    const float c100 = sample_lattice(ix + 1, iy,     iz);
+    const float c010 = sample_lattice(ix,     iy + 1, iz);
+    const float c110 = sample_lattice(ix + 1, iy + 1, iz);
+    const float c001 = sample_lattice(ix,     iy,     iz + 1);
+    const float c101 = sample_lattice(ix + 1, iy,     iz + 1);
+    const float c011 = sample_lattice(ix,     iy + 1, iz + 1);
+    const float c111 = sample_lattice(ix + 1, iy + 1, iz + 1);
+
+    const float c00 = c000 + fx * (c100 - c000);
+    const float c10 = c010 + fx * (c110 - c010);
+    const float c01 = c001 + fx * (c101 - c001);
+    const float c11 = c011 + fx * (c111 - c011);
+
+    const float c0 = c00 + fy * (c10 - c00);
+    const float c1 = c01 + fy * (c11 - c01);
+
+    return (c0 + fz * (c1 - c0)) * s;
+}
+
+Vector3 VoxelTerrain3D::sample_sdf_normal(Vector3 p_world_pos) const {
+    if (!core_engine) {
+        return Vector3(0.0f, 1.0f, 0.0f);
+    }
+    const float s = (voxel_scale > 0.0f) ? voxel_scale : 1.0f;
+    const float h = 0.5f * s;
+
+    float gx = sample_sdf(Vector3(p_world_pos.x + h, p_world_pos.y, p_world_pos.z)) -
+               sample_sdf(Vector3(p_world_pos.x - h, p_world_pos.y, p_world_pos.z));
+    float gy = sample_sdf(Vector3(p_world_pos.x, p_world_pos.y + h, p_world_pos.z)) -
+               sample_sdf(Vector3(p_world_pos.x, p_world_pos.y - h, p_world_pos.z));
+    float gz = sample_sdf(Vector3(p_world_pos.x, p_world_pos.y, p_world_pos.z + h)) -
+               sample_sdf(Vector3(p_world_pos.x, p_world_pos.y, p_world_pos.z - h));
+
+    float len_sq = gx * gx + gy * gy + gz * gz;
+    if (len_sq <= 1e-10f) {
+        const float hw = 2.0f * s;
+        gx = sample_sdf(Vector3(p_world_pos.x + hw, p_world_pos.y, p_world_pos.z)) -
+             sample_sdf(Vector3(p_world_pos.x - hw, p_world_pos.y, p_world_pos.z));
+        gy = sample_sdf(Vector3(p_world_pos.x, p_world_pos.y + hw, p_world_pos.z)) -
+             sample_sdf(Vector3(p_world_pos.x, p_world_pos.y - hw, p_world_pos.z));
+        gz = sample_sdf(Vector3(p_world_pos.x, p_world_pos.y, p_world_pos.z + hw)) -
+             sample_sdf(Vector3(p_world_pos.x, p_world_pos.y, p_world_pos.z - hw));
+        len_sq = gx * gx + gy * gy + gz * gz;
+    }
+
+    if (len_sq <= 1e-10f || !std::isfinite(len_sq)) {
+        return Vector3(0.0f, 1.0f, 0.0f);
+    }
+    const float inv_len = 1.0f / std::sqrt(len_sq);
+    return Vector3(gx * inv_len, gy * inv_len, gz * inv_len);
+}
+
+int VoxelTerrain3D::get_material_at(Vector3 p_world_pos) const {
+    if (!core_engine) {
+        return -1;
+    }
+    const float s = (voxel_scale > 0.0f) ? voxel_scale : 1.0f;
+    const float inv_s = 1.0f / s;
+    const float gx = p_world_pos.x * inv_s;
+    const float gy = p_world_pos.y * inv_s;
+    const float gz = p_world_pos.z * inv_s;
+
+    const int32_t ix = static_cast<int32_t>(std::floor(gx));
+    const int32_t iy = static_cast<int32_t>(std::floor(gy));
+    const int32_t iz = static_cast<int32_t>(std::floor(gz));
+
+    auto fetch_sample = [&](int32_t sx, int32_t sy, int32_t sz, int16_t* out_q, uint8_t* out_mat) -> bool {
+        const auto mapped = voxel::map_world_sample(sx, sy, sz);
+        if (const voxel::ChunkSlot* slot = core_engine->store.find_slot(mapped.chunk)) {
+            std::shared_lock<std::shared_mutex> rl(slot->mutex);
+            if (slot->state == voxel::ChunkLifecycleState::Resident) {
+                *out_q = slot->get_tsdf(mapped.local);
+                *out_mat = slot->get_material(mapped.local);
+                return true;
+            }
+        }
+        return false;
+    };
+
+    int16_t q0 = 0;
+    uint8_t m0 = voxel::MaterialHardness::kMaterialAir;
+    const bool resident0 = fetch_sample(ix, iy, iz, &q0, &m0);
+    if (resident0 && q0 < 0 && m0 != voxel::MaterialHardness::kMaterialAir) {
+        return static_cast<int>(m0);
+    }
+
+    // If p_world_pos is right on the d=0 zero-crossing skin (e.g. a raycast hit point
+    // or character foot), inspect the 1-voxel neighborhood and pick the closest solid sample.
+    float best_dist_sq = 1e30f;
+    uint8_t best_mat = voxel::MaterialHardness::kMaterialAir;
+    for (int32_t dz = -1; dz <= 1; ++dz) {
+        for (int32_t dy = -1; dy <= 1; ++dy) {
+            for (int32_t dx = -1; dx <= 1; ++dx) {
+                int16_t q = 0;
+                uint8_t mat = voxel::MaterialHardness::kMaterialAir;
+                if (fetch_sample(ix + dx, iy + dy, iz + dz, &q, &mat) &&
+                    q < 0 && mat != voxel::MaterialHardness::kMaterialAir) {
+                    const float rx = static_cast<float>(ix + dx) - gx;
+                    const float ry = static_cast<float>(iy + dy) - gy;
+                    const float rz = static_cast<float>(iz + dz) - gz;
+                    const float d2 = rx * rx + ry * ry + rz * rz;
+                    if (d2 < best_dist_sq) {
+                        best_dist_sq = d2;
+                        best_mat = mat;
+                    }
+                }
+            }
+        }
+    }
+
+    if (best_mat != voxel::MaterialHardness::kMaterialAir) {
+        return static_cast<int>(best_mat);
+    }
+    if (!resident0) {
+        const float d = core_engine->procgen.evaluate_composite_density(
+            p_world_pos.x, p_world_pos.y, p_world_pos.z);
+        return (d <= 0.0f) ? static_cast<int>(voxel::MaterialHardness::kMaterialSoil)
+                           : static_cast<int>(voxel::MaterialHardness::kMaterialAir);
+    }
+    return static_cast<int>(m0);
+}
+
+float VoxelTerrain3D::get_damage_at(Vector3 p_world_pos) const {
+    if (!core_engine) {
+        return 0.0f;
+    }
+    const float s = (voxel_scale > 0.0f) ? voxel_scale : 1.0f;
+    const float inv_s = 1.0f / s;
+    const float gx = p_world_pos.x * inv_s;
+    const float gy = p_world_pos.y * inv_s;
+    const float gz = p_world_pos.z * inv_s;
+
+    const int32_t ix = static_cast<int32_t>(std::floor(gx));
+    const int32_t iy = static_cast<int32_t>(std::floor(gy));
+    const int32_t iz = static_cast<int32_t>(std::floor(gz));
+
+    float best_dist_sq = 1e30f;
+    float best_ratio = 0.0f;
+
+    for (int32_t dz = -1; dz <= 1; ++dz) {
+        for (int32_t dy = -1; dy <= 1; ++dy) {
+            for (int32_t dx = -1; dx <= 1; ++dx) {
+                const auto mapped = voxel::map_world_sample(ix + dx, iy + dy, iz + dz);
+                if (const voxel::ChunkSlot* slot = core_engine->store.find_slot(mapped.chunk)) {
+                    std::shared_lock<std::shared_mutex> rl(slot->mutex);
+                    if (slot->state == voxel::ChunkLifecycleState::Resident &&
+                        slot->get_tsdf(mapped.local) < 0) {
+                        const uint8_t mat = slot->get_material(mapped.local);
+                        const uint8_t dmg = slot->get_damage(mapped.local);
+                        const uint8_t thresh = voxel::MaterialHardness::break_threshold(mat);
+                        const float ratio = (thresh > 0U)
+                            ? std::clamp(static_cast<float>(dmg) / static_cast<float>(thresh), 0.0f, 1.0f)
+                            : 0.0f;
+                        const float rx = static_cast<float>(ix + dx) - gx;
+                        const float ry = static_cast<float>(iy + dy) - gy;
+                        const float rz = static_cast<float>(iz + dz) - gz;
+                        const float d2 = rx * rx + ry * ry + rz * rz;
+                        if (d2 < best_dist_sq) {
+                            best_dist_sq = d2;
+                            best_ratio = ratio;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return best_ratio;
+}
+
+PackedInt32Array VoxelTerrain3D::query_sphere_materials(Vector3 p_center, float p_radius) const {
+    PackedInt32Array counts;
+    counts.resize(8);
+    for (int i = 0; i < 8; ++i) {
+        counts[i] = 0;
+    }
+    if (!core_engine || p_radius <= 0.0f) {
+        return counts;
+    }
+
+    const float s = (voxel_scale > 0.0f) ? voxel_scale : 1.0f;
+    const float inv_s = 1.0f / s;
+    const float cx = p_center.x * inv_s;
+    const float cy = p_center.y * inv_s;
+    const float cz = p_center.z * inv_s;
+    const float r_vox = p_radius * inv_s;
+    const float r_sq = r_vox * r_vox;
+
+    const int32_t min_x = static_cast<int32_t>(std::floor(cx - r_vox));
+    const int32_t min_y = static_cast<int32_t>(std::floor(cy - r_vox));
+    const int32_t min_z = static_cast<int32_t>(std::floor(cz - r_vox));
+    const int32_t max_x = static_cast<int32_t>(std::ceil(cx + r_vox));
+    const int32_t max_y = static_cast<int32_t>(std::ceil(cy + r_vox));
+    const int32_t max_z = static_cast<int32_t>(std::ceil(cz + r_vox));
+
+    const int32_t chunk_x0 = voxel::ChunkKey::floor_div(min_x, 32);
+    const int32_t chunk_y0 = std::max<int32_t>(0, voxel::ChunkKey::floor_div(min_y, 32));
+    const int32_t chunk_z0 = voxel::ChunkKey::floor_div(min_z, 32);
+    const int32_t chunk_x1 = voxel::ChunkKey::floor_div(max_x, 32);
+    const int32_t chunk_y1 = std::min<int32_t>(world_height_chunks - 1,
+                                               voxel::ChunkKey::floor_div(max_y, 32));
+    const int32_t chunk_z1 = voxel::ChunkKey::floor_div(max_z, 32);
+
+    for (int32_t ckz = chunk_z0; ckz <= chunk_z1; ++ckz) {
+        for (int32_t cky = chunk_y0; cky <= chunk_y1; ++cky) {
+            for (int32_t ckx = chunk_x0; ckx <= chunk_x1; ++ckx) {
+                const voxel::ChunkKey ck = voxel::ChunkKey::from_coords(ckx, cky, ckz);
+                const voxel::ChunkSlot* slot = core_engine->store.find_slot(ck);
+                if (!slot) {
+                    continue;
+                }
+                std::shared_lock<std::shared_mutex> rl(slot->mutex);
+                if (slot->state != voxel::ChunkLifecycleState::Resident) {
+                    continue;
+                }
+
+                const voxel::IVec3 cmin = ck.min_world_sample();
+                const int32_t lx0 = std::max<int32_t>(0, min_x - cmin.x);
+                const int32_t ly0 = std::max<int32_t>(0, min_y - cmin.y);
+                const int32_t lz0 = std::max<int32_t>(0, min_z - cmin.z);
+                const int32_t lx1 = std::min<int32_t>(31, max_x - cmin.x);
+                const int32_t ly1 = std::min<int32_t>(31, max_y - cmin.y);
+                const int32_t lz1 = std::min<int32_t>(31, max_z - cmin.z);
+
+                for (int32_t lz = lz0; lz <= lz1; ++lz) {
+                    const float dz = static_cast<float>(cmin.z + lz) - cz;
+                    for (int32_t ly = ly0; ly <= ly1; ++ly) {
+                        const float dy = static_cast<float>(cmin.y + ly) - cy;
+                        for (int32_t lx = lx0; lx <= lx1; ++lx) {
+                            const float dx = static_cast<float>(cmin.x + lx) - cx;
+                            if (dx * dx + dy * dy + dz * dz > r_sq) {
+                                continue;
+                            }
+                            const voxel::LocalCoord lc{lx, ly, lz};
+                            if (slot->get_tsdf(lc) >= 0) {
+                                counts[0] = counts[0] + 1;
+                            } else {
+                                const uint8_t mat = slot->get_material(lc);
+                                const int idx = (mat < 8U) ? static_cast<int>(mat) : 1;
+                                counts[idx] = counts[idx] + 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return counts;
+}
+
+int VoxelTerrain3D::get_dominant_material_in_sphere(Vector3 p_center, float p_radius) const {
+    const PackedInt32Array counts = query_sphere_materials(p_center, p_radius);
+    int best_mat = static_cast<int>(voxel::MaterialHardness::kMaterialAir);
+    int32_t best_count = 0;
+    for (int mat = 1; mat < static_cast<int>(counts.size()); ++mat) {
+        if (counts[mat] > best_count) {
+            best_count = counts[mat];
+            best_mat = mat;
+        }
+    }
+    return best_mat;
 }
 
 float VoxelTerrain3D::get_surface_height(float p_x, float p_z) const {

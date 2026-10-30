@@ -67,6 +67,48 @@ struct SphereCsgTerm {
     /// When != None the term is a Water/Frost/Lava trigger volume instead of a CSG
     /// blast or fill: it transmutes/reacts with existing solid matter inside R.
     ElementalKind elemental_kind = ElementalKind::None;
+    /// When true the term is a swept capsule: the implicit shape is every point
+    /// within `radius` of the segment `center` -> `end_center`.
+    bool is_capsule = false;
+    Vec3f end_center{};
+
+    /// Returns the point on the capsule axis (or the sphere center for a sphere term)
+    /// closest to the query sample. All edit evaluation measures distance from here.
+    [[nodiscard]] Vec3f closest_axis_point(float px, float py, float pz) const noexcept {
+        if (!is_capsule) {
+            return center;
+        }
+        const float abx = end_center.x - center.x;
+        const float aby = end_center.y - center.y;
+        const float abz = end_center.z - center.z;
+        const float len_sq = abx * abx + aby * aby + abz * abz;
+        if (len_sq <= 1e-8f) {
+            return center;
+        }
+        const float apx = px - center.x;
+        const float apy = py - center.y;
+        const float apz = pz - center.z;
+        const float t = std::clamp((apx * abx + apy * aby + apz * abz) / len_sq, 0.0f, 1.0f);
+        return Vec3f{center.x + t * abx, center.y + t * aby, center.z + t * abz};
+    }
+
+    [[nodiscard]] static constexpr SphereCsgTerm make_capsule(
+        Vec3f from,
+        Vec3f to,
+        float r,
+        bool fill = false,
+        uint8_t mat = MaterialHardness::kMaterialSoil,
+        ElementalKind elem = ElementalKind::None) noexcept {
+        SphereCsgTerm term{};
+        term.center = from;
+        term.end_center = to;
+        term.radius = r;
+        term.is_fill = fill;
+        term.fill_material = mat;
+        term.elemental_kind = elem;
+        term.is_capsule = true;
+        return term;
+    }
 };
 
 /// Bit-exact per-chunk state captured for Undo / Redo. Captures and restores all
@@ -183,12 +225,18 @@ struct EditTransaction {
             const float r_horiz = (s.elemental_kind == ElementalKind::Frost) ? (s.radius * 1.35f) : s.radius;
             const float r_eff_xz = r_horiz + delta;
             const float r_eff_y  = s.radius + delta;
-            min_x = std::min(min_x, static_cast<int32_t>(std::floor(s.center.x - r_eff_xz)));
-            min_y = std::min(min_y, static_cast<int32_t>(std::floor(s.center.y - r_eff_y)));
-            min_z = std::min(min_z, static_cast<int32_t>(std::floor(s.center.z - r_eff_xz)));
-            max_x = std::max(max_x, static_cast<int32_t>(std::ceil(s.center.x + r_eff_xz)));
-            max_y = std::max(max_y, static_cast<int32_t>(std::ceil(s.center.y + r_eff_y)));
-            max_z = std::max(max_z, static_cast<int32_t>(std::ceil(s.center.z + r_eff_xz)));
+            const float x0 = s.is_capsule ? std::min(s.center.x, s.end_center.x) : s.center.x;
+            const float y0 = s.is_capsule ? std::min(s.center.y, s.end_center.y) : s.center.y;
+            const float z0 = s.is_capsule ? std::min(s.center.z, s.end_center.z) : s.center.z;
+            const float x1 = s.is_capsule ? std::max(s.center.x, s.end_center.x) : s.center.x;
+            const float y1 = s.is_capsule ? std::max(s.center.y, s.end_center.y) : s.center.y;
+            const float z1 = s.is_capsule ? std::max(s.center.z, s.end_center.z) : s.center.z;
+            min_x = std::min(min_x, static_cast<int32_t>(std::floor(x0 - r_eff_xz)));
+            min_y = std::min(min_y, static_cast<int32_t>(std::floor(y0 - r_eff_y)));
+            min_z = std::min(min_z, static_cast<int32_t>(std::floor(z0 - r_eff_xz)));
+            max_x = std::max(max_x, static_cast<int32_t>(std::ceil(x1 + r_eff_xz)));
+            max_y = std::max(max_y, static_cast<int32_t>(std::ceil(y1 + r_eff_y)));
+            max_z = std::max(max_z, static_cast<int32_t>(std::ceil(z1 + r_eff_xz)));
         }
 
         tx.sample_min = IVec3{min_x, min_y, min_z};
@@ -488,9 +536,10 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
             int hits = 0;
             for (const SphereCsgTerm& s : tx.spheres) {
                 if (s.is_fill || s.elemental_kind != ElementalKind::None) continue;
-                const float dx = px - s.center.x;
-                const float dy = py - s.center.y;
-                const float dz = pz - s.center.z;
+                const Vec3f axis_pt = s.closest_axis_point(px, py, pz);
+                const float dx = px - axis_pt.x;
+                const float dy = py - axis_pt.y;
+                const float dz = pz - axis_pt.z;
                 const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
                 const float d = s.radius - dist;
                 d_blast = std::max(d_blast, d);
@@ -553,11 +602,12 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
 
                         for (const SphereCsgTerm& s : tx.spheres) {
                             if (!s.is_fill || s.elemental_kind != ElementalKind::None) continue;
-                            const float dx = px - s.center.x;
-                            const float dy = py - s.center.y;
-                            const float dz = pz - s.center.z;
+                            const Vec3f axis_pt = s.closest_axis_point(px, py, pz);
+                            const float dx = px - axis_pt.x;
+                            const float dy = py - axis_pt.y;
+                            const float dz = pz - axis_pt.z;
                             const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
-                            const float d_fill = dist - s.radius; // Negative inside sphere (solid)
+                            const float d_fill = dist - s.radius; // Negative inside sphere/capsule (solid)
                             if (d_fill < delta) {
                                 touched_by_fill = true;
                                 if (d_fill < d_fill_min) {
@@ -591,9 +641,10 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                         // 1b. Handle Bananza-style Elemental Trigger Volumes (Water, Frost, Lava)
                         for (const SphereCsgTerm& s : tx.spheres) {
                             if (s.elemental_kind == ElementalKind::None) continue;
-                            const float dx = px - s.center.x;
-                            const float dy = py - s.center.y;
-                            const float dz = pz - s.center.z;
+                            const Vec3f axis_pt = s.closest_axis_point(px, py, pz);
+                            const float dx = px - axis_pt.x;
+                            const float dy = py - axis_pt.y;
+                            const float dz = pz - axis_pt.z;
                             const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
 
                             // For Frost / Ice Bridge, shape the SDF as a Flat-Topped 31-Degree Ramped
@@ -605,8 +656,8 @@ inline std::optional<EditTransactionCompletedPayload> execute_next_edit_phase(
                                 const float r_xz = std::sqrt(dx * dx + dz * dz);
                                 const float flat_r = 0.45f * s.radius;
                                 const float ramp_out = std::max(0.0f, r_xz - flat_r);
-                                const float y_top = (s.center.y + 0.22f * s.radius) - 0.60f * ramp_out;
-                                const float y_bot = (s.center.y - 0.90f * s.radius) + 0.64f * ramp_out;
+                                const float y_top = (axis_pt.y + 0.22f * s.radius) - 0.60f * ramp_out;
+                                const float y_bot = (axis_pt.y - 0.90f * s.radius) + 0.64f * ramp_out;
                                 const float d_upper = (py - y_top) / ((r_xz > flat_r) ? 1.1662f : 1.0f);
                                 const float d_lower = (y_bot - py) / ((r_xz > flat_r) ? 1.1923f : 1.0f);
                                 const float d_rim   = r_xz - 1.35f * s.radius;
@@ -1195,6 +1246,33 @@ public:
         return enqueue_sphere_transaction(/*is_fill=*/true, position, radius, material);
     }
 
+    /// Swept capsule CSG blast: carves every sample within `radius` of the segment
+    /// `from` -> `to` (beam tunnels, drill dashes, blade sweeps).
+    [[nodiscard]] bool enqueue_capsule_carve(Vec3f from, Vec3f to, float radius) {
+        return enqueue_term(SphereCsgTerm::make_capsule(
+            from, to, radius, /*fill=*/false, MaterialHardness::kMaterialSoil,
+            ElementalKind::None));
+    }
+
+    /// Swept capsule fill: places `fill_material` along the segment (bridges, ramps).
+    [[nodiscard]] bool enqueue_capsule_fill(Vec3f from,
+                                            Vec3f to,
+                                            float radius,
+                                            uint8_t fill_material) {
+        return enqueue_term(SphereCsgTerm::make_capsule(
+            from, to, radius, /*fill=*/true, fill_material, ElementalKind::None));
+    }
+
+    /// Swept elemental capsule: continuous Water/Frost/Lava reaction along the segment
+    /// (e.g. a continuous Frost ice path under a moving character).
+    [[nodiscard]] bool enqueue_elemental_capsule(Vec3f from,
+                                                 Vec3f to,
+                                                 float radius,
+                                                 ElementalKind kind) {
+        return enqueue_term(SphereCsgTerm::make_capsule(
+            from, to, radius, /*fill=*/false, MaterialHardness::kMaterialSoil, kind));
+    }
+
     [[nodiscard]] std::optional<CompletionRecord> try_pop_completion() {
         std::optional<CompletionRecord> out;
         {
@@ -1318,18 +1396,25 @@ private:
                                                   float radius,
                                                   uint8_t fill_material,
                                                   ElementalKind elemental_kind = ElementalKind::None) {
-        if (radius <= 0.0f ||
-            !running_.load(std::memory_order_acquire) ||
-            shutting_down_.load(std::memory_order_acquire)) {
-            return false;
-        }
-
         SphereCsgTerm term{};
         term.center = position;
         term.radius = radius;
         term.is_fill = is_fill;
         term.fill_material = fill_material;
         term.elemental_kind = elemental_kind;
+        return enqueue_term(term);
+    }
+
+    [[nodiscard]] bool enqueue_term(SphereCsgTerm term) {
+        const bool is_fill = term.is_fill;
+        const uint8_t fill_material = term.fill_material;
+        const ElementalKind elemental_kind = term.elemental_kind;
+
+        if (term.radius <= 0.0f ||
+            !running_.load(std::memory_order_acquire) ||
+            shutting_down_.load(std::memory_order_acquire)) {
+            return false;
+        }
 
         {
             std::lock_guard<std::mutex> lock(queue_mutex_);

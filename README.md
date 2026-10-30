@@ -221,8 +221,9 @@ $VoxelTerrain3D.world_height_chunks = 8
 
 Destruction is asynchronous CSG on the TSDF. A sphere edit is phased into bounded
 lock sets, expands the evaluation band by the narrow-band delta, and prunes isolated
-floating voxels. Carves and fills run on the edit worker lane so they cannot starve
-streaming or meshing work.
+floating voxels. The same pipeline sweeps a capsule along a segment for beam tunnels,
+drill dashes, and continuous element paths. Carves and fills run on the edit worker
+lane so they cannot starve streaming or meshing work.
 
 | Method | Effect |
 | --- | --- |
@@ -231,6 +232,9 @@ streaming or meshing work.
 | `add_terrain_with_material(position, radius, material)` | Add a sphere with an explicit material ID. |
 | `place_boulder(position, radius)` | Add a boulder-material sphere. |
 | `trigger_elemental_sphere(position, radius, kind)` | Apply water, frost, or lava reactions. |
+| `carve_capsule(from, to, radius)` | Carve every sample within `radius` of the segment. |
+| `add_capsule_with_material(from, to, radius, material)` | Fill a swept capsule with material `1..7`. |
+| `trigger_elemental_capsule(from, to, radius, kind)` | Sweep water, frost, or lava reactions along the segment. |
 
 ```gdscript
 var terrain := $VoxelTerrain3D
@@ -238,6 +242,8 @@ var terrain := $VoxelTerrain3D
 terrain.trigger_explosion(Vector3(16, 70, 16), 8.5)
 terrain.add_terrain(Vector3(16, 70, 16), 6.0)
 terrain.place_boulder(Vector3(24, 68, 16), 4.0)
+terrain.carve_capsule(beam_origin, beam_hit, 1.5)          # drill / beam tunnel
+terrain.trigger_elemental_capsule(prev_feet, feet, 3.5, 2) # continuous Frost ice path
 ```
 
 Edits report through signals:
@@ -529,6 +535,25 @@ work at any distance.
 - [Performance analysis: main-thread and memory budgets](docs/Voxel%20Performance%20Analysis.md)
 - [AI & navigation: collision gating is independent of navigation](docs/AI%20Companion%20%26%20Navigation.md#8-gotchas-quirks--limitations)
 
+### Rolling boulders
+
+`Shift + 4` selects a rolling variant of the Boulder tool. Left-click spawns a `RigidBody3D`
+with a `SphereShape3D`, continuous collision detection, and the terrain shader in
+object-space pattern mode, so it rolls across the per-chunk concave colliders without its
+granite texture swimming. When it has been at rest for `boulder_settle_seconds`, the demo
+probes the voxel surface and calls `terrain.place_boulder()`, converting the prop into
+permanent 5-hit destructible terrain.
+
+`Ctrl + Click` in rolling mode spawns a crushing roller that calls `trigger_explosion()`
+along its path while moving faster than `boulder_crush_speed`. Explosions wake nearby
+sleeping bodies and apply a radial impulse, fills wake bodies inside the edited volume, and
+`Shift + R` clears every rolling body.
+
+Rolling props are session-only (they are not written by `save_world`), are capped at
+`boulder_max_count`, and despawn outside the effective streaming radius. The player and AI
+companion are kinematic demo controllers rather than physics bodies, so rollers pass
+through them but still block their physics raycasts.
+
 ### Triplanar shading
 
 `voxel_triplanar.gdshader` blends world-space triplanar material colors by slope, adds
@@ -676,10 +701,20 @@ Runtime methods:
 | `add_terrain(position, radius)` | `void` | Add soil. |
 | `add_terrain_with_material(position, radius, material)` | `void` | Add with an explicit material ID. |
 | `place_boulder(position, radius)` | `void` | Add boulder material. |
+| `carve_capsule(from, to, radius)` | `void` | Swept capsule carve (beam tunnels, drill dashes). |
+| `add_capsule_with_material(from, to, radius, material)` | `void` | Swept capsule fill with material `1..7`. |
+| `trigger_elemental_capsule(from, to, radius, kind)` | `void` | Swept water/frost/lava reaction along the segment. |
 | `stamp_asset(vreg_path, chunk_coords, recreate_delay_seconds)` | `int` | Stamp a `.vreg`; returns `structure_id`, or 0 on failure. |
 | `remove_structure(structure_id)` | `bool` | Restore the pre-stamp world. |
 | `raycast_terrain(from, to)` | `Vector3` | Surface hit, or `+INF` on miss. |
 | `raycast_terrain_material(from, to)` | `int` | Material ID, or -1 on miss. |
+| `raycast_terrain_normal(from, to)` | `Vector3` | Surface normal at the first hit, or `+INF` on miss. |
+| `sample_sdf(world_pos)` | `float` | Trilinear signed density (negative = solid). |
+| `sample_sdf_normal(world_pos)` | `Vector3` | Normalized SDF gradient; `+Y` when degenerate. |
+| `get_material_at(world_pos)` | `int` | Material ID of the nearest solid sample, or -1. |
+| `get_damage_at(world_pos)` | `float` | Crack damage ratio in `[0, 1]`. |
+| `query_sphere_materials(center, radius)` | `PackedInt32Array` | Per-material solid sample histogram (index 0 = air). |
+| `get_dominant_material_in_sphere(center, radius)` | `int` | Most common non-air material ID, or 0. |
 | `get_surface_height(x, z)` | `float` | Top surface height at world X/Z. |
 | `undo()` / `redo()` | `bool` | Revert or re-apply one history action. |
 | `undo_all()` / `redo_all()` | `int` | Coalesced full-stack revert or re-apply. |
@@ -732,7 +767,9 @@ removed.
 | `1` | Add terrain |
 | `2` | Paint terrain (hold and drag) |
 | `3` | Paint delete (hold and drag) |
-| `4` | Place boulder |
+| `4` | Place boulder (static 5-hit voxel stamp) |
+| `Shift + 4` | Rolling boulder mode; click spawns a dynamic `RigidBody3D` that bakes into 5-hit voxels once it settles |
+| `Ctrl + Click` (rolling mode) | Crushing roller that carves a crater trail while moving fast |
 | `5` | Small hit chip blast |
 | `6` | Explode |
 | `7` | Large explode |
@@ -771,7 +808,14 @@ Inspector:
 | `add_radius` | `6.0` | Add terrain |
 | `paint_radius` | `3.5` | Paint terrain |
 | `paint_delete_radius` | `3.5` | Paint delete |
-| `boulder_radius` | `4.0` | Place boulder |
+| `boulder_radius` | `4.0` | Place boulder / rolling boulder |
+| `boulder_gravity_scale` | `2.4` | Rolling boulder fall rate (matches the demo's 24 m/s² player gravity) |
+| `boulder_settle_seconds` | `1.2` | Rest time before a roller bakes into 5-hit voxels |
+| `boulder_max_count` | `24` | Live rolling-body cap (oldest despawns first) |
+| `boulder_crush_speed` | `8.0` | Minimum speed before a crushing roller carves |
+| `boulder_crush_interval` | `0.18` | Seconds between crush blasts |
+| `boulder_crush_radius_scale` | `0.55` | Crush blast radius as a fraction of the boulder radius |
+| `boulder_max_crushing` | `2` | Concurrent crushing rollers before new spawns lose the crush flag |
 | `small_hit_radius` | `1.5` | Small hit |
 | `explosion_radius` | `8.5` | Explode |
 | `large_explosion_radius` | `18.0` | Large explode |

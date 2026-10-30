@@ -3,6 +3,8 @@ extends Node3D
 ## Streams 32^3 chunks around the active Camera3D and applies terrain tools on
 ## left-click. Tools progress from construction to destruction to elements:
 ##   Keys 1-4: Add terrain / Paint terrain / Paint delete / Place boulder
+##   Shift+4:  Rolling boulder mode (dynamic RigidBody3D that bakes into 5-hit
+##             voxels once settled; Ctrl+Click spawns a crushing roller)
 ##   Keys 5-7: Small hit (small_hit_radius) / Explode / Large explode
 ##   Keys 8-0: Water Quench / Frost-Ice Bridge / Lava-Magma
 ## Paint and paint-delete are hold-and-drag brushes. T toggles the add/paint
@@ -55,6 +57,18 @@ extends Node3D
 @export var paint_radius: float = 3.5
 @export var paint_delete_radius: float = 3.5
 @export var boulder_radius: float = 4.0
+## Rolling boulders (Shift+4) fall faster than the project default so they feel
+## consistent with the demo's tuned 24 m/s^2 player gravity.
+@export var boulder_gravity_scale: float = 2.4
+## A rolling boulder must stay at rest this long before it bakes into 5-hit voxels.
+@export var boulder_settle_seconds: float = 1.2
+@export var boulder_max_count: int = 24
+## Minimum speed before a crushing boulder (Ctrl+Click) carves the terrain it rolls over.
+@export var boulder_crush_speed: float = 8.0
+@export var boulder_crush_interval: float = 0.18
+@export var boulder_crush_radius_scale: float = 0.55
+## Simultaneous crushing boulders allowed before new spawns drop the crush flag.
+@export var boulder_max_crushing: int = 2
 @export var elemental_radius: float = 8.5
 @export var brush_spacing_factor: float = 0.6
 @export var brush_interval: float = 0.05
@@ -193,6 +207,7 @@ Play    WASD run   Shift sprint   Space jump   LMB swing pickaxe
 Move    W/A/S/D   Space or E up   Ctrl or Q down   Shift sprint
 Look    Mouse   Esc releases cursor   click recaptures
 Build   1 Add terrain   2 Paint   3 Paint delete   4 Boulder
+Roller  Shift+4 rolling boulder   Ctrl+Click crushing roller
 Carve   5 Small hit     6 Explode   7 Large explode
 Element 8 Water   9 Frost/Ice   0 Lava/Magma
 Stamps  B timed ruin   Shift+B permanent ruin
@@ -322,6 +337,16 @@ var _last_fail_warn_ms: int = 0
 var _look_at_name: String = "Sky"
 var _look_at_accum: float = 0.0
 
+## Dynamic rolling boulders spawned by Shift+4. They are session-only props: they
+## are not part of the C++ undo history until they settle and bake back into voxels.
+var _rolling_boulders: Array[RigidBody3D] = []
+var _boulder_material: ShaderMaterial = null
+var _boulder_rolling: bool = false
+## Bake / crush fills complete asynchronously, so remember which request each
+## terrain_add_completed / explosion_completed signal belongs to for undo accounting.
+var _pending_bake_fills: Array[Dictionary] = []
+var _pending_crush_blasts: Array[Dictionary] = []
+
 var _companion_initialized: bool = false
 var _companion_vertical_vel: float = 0.0
 var _pending_path_goal: Vector3 = Vector3.ZERO
@@ -432,9 +457,13 @@ func _ready() -> void:
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 	terrain.explosion_requested.connect(_on_explosion_requested)
 	terrain.explosion_completed.connect(_on_explosion_completed)
+	# Dynamic props: a blast wakes/launches nearby rolling boulders, while a fill
+	# (including a boulder settling back into voxels) only needs to wake them.
+	terrain.explosion_completed.connect(_on_terrain_blast_physics)
 	terrain.explosion_failed.connect(_on_explosion_failed)
 	terrain.terrain_add_requested.connect(_on_terrain_add_requested)
 	terrain.terrain_add_completed.connect(_on_terrain_add_completed)
+	terrain.terrain_add_completed.connect(_on_terrain_fill_physics)
 	terrain.terrain_add_failed.connect(_on_terrain_add_failed)
 	terrain.chunk_committed.connect(_on_chunk_committed)
 	terrain.structure_damaged.connect(_on_structure_damaged)
@@ -1645,7 +1674,7 @@ func _unhandled_input(event: InputEvent) -> void:
 			KEY_3:
 				_set_tool(Tool.PAINT_DELETE)
 			KEY_4:
-				_set_tool(Tool.BOULDER)
+				_set_tool(Tool.BOULDER, event.shift_pressed)
 			KEY_5:
 				_set_tool(Tool.SMALL_HIT)
 			KEY_6:
@@ -1734,6 +1763,7 @@ func _process(delta: float) -> void:
 	if _tool_pressed and _mode == Mode.FLY and _is_drag_tool():
 		_process_brush(delta)
 
+	_update_rolling_boulders(delta)
 	_update_stream_focus(false)
 	_apply_companion_gravity_and_ground_snap(delta)
 	_poll_pending_path_query()
@@ -1880,12 +1910,23 @@ func _refresh_look_at_material() -> void:
 	else:
 		_look_at_name = "Material %d" % material_id
 
-func _set_tool(tool: int) -> void:
+func _set_tool(tool: int, rolling_boulder: bool = false) -> void:
+	# Assign before the early-out so Shift+4 still toggles the mode while the
+	# Boulder tool is already selected; selecting any other tool clears it.
+	_boulder_rolling = rolling_boulder and tool == Tool.BOULDER
 	if tool == _active_tool:
+		if tool == Tool.BOULDER:
+			if _boulder_rolling:
+				print("[VoxelTerrain3D] Boulder mode: rolling (Shift+4) | Ctrl+Click = crushing roller")
+			else:
+				print("[VoxelTerrain3D] Boulder mode: static 5-hit stamp (Shift+4 = rolling)")
 		return
 	_active_tool = tool
 	_last_boom_point = Vector3(INF, INF, INF)
-	print("[VoxelTerrain3D] Active tool: [%s] %s" % [TOOL_KEYS[tool], TOOL_NAMES[tool]])
+	var suffix := ""
+	if _boulder_rolling:
+		suffix = " (rolling)"
+	print("[VoxelTerrain3D] Active tool: [%s] %s%s" % [TOOL_KEYS[tool], TOOL_NAMES[tool], suffix])
 
 func _toggle_add_material() -> void:
 	_add_material = MATERIAL_ROCK if _add_material == MATERIAL_SOIL else MATERIAL_SOIL
@@ -2004,8 +2045,13 @@ func _apply_tool_at(point: Vector3) -> void:
 			terrain.trigger_explosion(point, paint_delete_radius)
 			_note_undo_cpp_op({"kind": "explosion", "point": point, "radius": paint_delete_radius})
 		Tool.BOULDER:
-			terrain.place_boulder(point, boulder_radius)
-			_note_undo_cpp_op({"kind": "boulder", "point": point, "radius": boulder_radius})
+			if _boulder_rolling:
+				# Rolling bodies are transient props, so they add no click-time undo
+				# op; the bake/crush completions register their own native edit later.
+				spawn_rolling_boulder(point, boulder_radius, true, Input.is_key_pressed(KEY_CTRL))
+			else:
+				terrain.place_boulder(point, boulder_radius)
+				_note_undo_cpp_op({"kind": "boulder", "point": point, "radius": boulder_radius})
 		Tool.SMALL_HIT:
 			terrain.trigger_explosion(point, small_hit_radius)
 			_note_undo_cpp_op({"kind": "explosion", "point": point, "radius": small_hit_radius})
@@ -2021,6 +2067,273 @@ func _apply_tool_at(point: Vector3) -> void:
 		_:
 			terrain.trigger_explosion(point, explosion_radius)
 			_note_undo_cpp_op({"kind": "explosion", "point": point, "radius": explosion_radius})
+
+# ==============================================================================
+# Rolling Physics Boulders (Shift+4 / Ctrl+Click)
+# ==============================================================================
+
+## Spawns a dynamic granite boulder above `hit_point`. Boulders roll on the
+## per-chunk PhysicsServer3D concave shapes and, once settled, bake back into
+## permanent 5-hit voxel terrain. `crush` boulders carve the ground they roll over.
+func spawn_rolling_boulder(hit_point: Vector3, radius: float = 2.0, bake_when_settled: bool = true, crush: bool = false) -> RigidBody3D:
+	if _rolling_boulders.size() >= boulder_max_count:
+		var oldest := _rolling_boulders.pop_front() as RigidBody3D
+		if is_instance_valid(oldest):
+			oldest.queue_free()
+	var crushing := 0
+	for existing in _rolling_boulders:
+		if is_instance_valid(existing) and bool(existing.get_meta("crush", false)):
+			crushing += 1
+	if crush and crushing >= boulder_max_crushing:
+		crush = false
+
+	var center := _find_boulder_spawn_center(hit_point, radius)
+	var body := RigidBody3D.new()
+	body.name = "RollingBoulder"
+	body.mass = maxf(40.0, (4.0 / 3.0) * PI * pow(radius, 3.0) * 25.0)
+	body.gravity_scale = boulder_gravity_scale
+	body.continuous_cd = true
+	body.angular_damp = 0.35
+	body.linear_damp = 0.05
+
+	# Smoother than a default PhysicsMaterial so the sphere glides over internal
+	# Surface Nets triangle edges instead of catching on them.
+	var phys_mat := PhysicsMaterial.new()
+	phys_mat.friction = 0.45
+	phys_mat.bounce = 0.08
+	body.physics_material_override = phys_mat
+
+	var col := CollisionShape3D.new()
+	col.name = "CollisionShape3D"
+	var sphere_shape := SphereShape3D.new()
+	sphere_shape.radius = radius
+	col.shape = sphere_shape
+	body.add_child(col)
+
+	var mesh_inst := MeshInstance3D.new()
+	mesh_inst.name = "BoulderMesh"
+	mesh_inst.mesh = _build_boulder_sphere_mesh(radius)
+	var boulder_mat := _get_boulder_material()
+	if boulder_mat != null:
+		mesh_inst.material_override = boulder_mat
+	body.add_child(mesh_inst)
+
+	body.set_meta("radius", radius)
+	body.set_meta("crush", crush)
+	body.set_meta("last_crush_ms", 0)
+	body.set_meta("last_crush_pos", center)
+	if bake_when_settled:
+		body.set_meta("settle_timer", 0.0)
+
+	add_child(body)
+	body.global_position = center
+	_rolling_boulders.append(body)
+	return body
+
+## Picks the spawn height from the highest ground under the sphere footprint so a
+## boulder aimed at a slope does not start intersecting uphill geometry. The
+## concave terrain shape is one-sided, so spawning inside it would fall through.
+func _find_boulder_spawn_center(hit_point: Vector3, radius: float) -> Vector3:
+	var offsets: Array[Vector3] = [
+		Vector3.ZERO,
+		Vector3(radius * 0.7, 0.0, 0.0),
+		Vector3(-radius * 0.7, 0.0, 0.0),
+		Vector3(0.0, 0.0, radius * 0.7),
+		Vector3(0.0, 0.0, -radius * 0.7),
+	]
+	var up_clearance := radius * 2.0 + 2.0
+	var down_reach := radius * 4.0 + 4.0
+	var best_y := -INF
+	var found := false
+	for offset in offsets:
+		var from: Vector3 = hit_point + offset + Vector3(0.0, up_clearance, 0.0)
+		var hit := terrain.raycast_terrain(from, from - Vector3(0.0, down_reach, 0.0))
+		if is_finite(hit.x):
+			best_y = maxf(best_y, hit.y)
+			found = true
+	var surface_y := best_y if found else hit_point.y
+	return Vector3(hit_point.x, surface_y + radius + 0.2, hit_point.z)
+
+## Shares one duplicated terrain material across every boulder. The duplicate only
+## flips the shader's pattern space so the granite does not swim while it tumbles.
+func _get_boulder_material() -> ShaderMaterial:
+	if _boulder_material != null:
+		return _boulder_material
+	var terrain_mat := terrain.terrain_material
+	if terrain_mat is ShaderMaterial:
+		var dup := (terrain_mat as ShaderMaterial).duplicate() as ShaderMaterial
+		dup.set_shader_parameter("pattern_in_object_space", true)
+		_boulder_material = dup
+	return _boulder_material
+
+## Builds the boulder sphere with the exact vertex-color domain the terrain shader
+## expects: R = damage ratio (0 = pristine), G = persistent-damage rock flag,
+## B = hits-to-break / 255 (5/255 = placed boulder), A = baked-paint weight (0).
+func _build_boulder_sphere_mesh(radius: float) -> ArrayMesh:
+	var prim := SphereMesh.new()
+	prim.radius = radius
+	prim.height = radius * 2.0
+	prim.radial_segments = 32
+	prim.rings = 16
+	var arrays := prim.get_mesh_arrays()
+	var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+	var colors := PackedColorArray()
+	colors.resize(verts.size())
+	colors.fill(Color(0.0, 1.0, 5.0 / 255.0, 0.0))
+	arrays[Mesh.ARRAY_COLOR] = colors
+	# The terrain shader reads UV2.x for its baked albedo; the paint weight is 0,
+	# but supplying the attribute keeps the surface format explicit.
+	var uv2 := PackedVector2Array()
+	uv2.resize(verts.size())
+	arrays[Mesh.ARRAY_TEX_UV2] = uv2
+	var arr_mesh := ArrayMesh.new()
+	arr_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	return arr_mesh
+
+## Explosions carve the ground asynchronously; once the edit transaction commits,
+## sleeping RigidBody3Ds underneath it must be woken or they hang over the crater.
+func _on_terrain_blast_physics(center: Vector3, radius: float, _affected_chunks: int) -> void:
+	var wake_radius := radius + 6.0
+	var blast_radius := radius + 4.0
+	for i in range(_rolling_boulders.size() - 1, -1, -1):
+		var body := _rolling_boulders[i]
+		if not is_instance_valid(body):
+			_rolling_boulders.remove_at(i)
+			continue
+		var offset := body.global_position - center
+		var dist := offset.length()
+		if dist <= wake_radius:
+			body.sleeping = false
+		if dist <= blast_radius and dist > 0.001:
+			# A crushing roller is exactly one radius above its own contact blast. If
+			# the crush radius is tuned above the default, skip the self-impulse so it
+			# keeps trenching instead of hopping on every carve.
+			var grace_ms := int(body.get_meta("self_blast_grace_ms", 0))
+			if Time.get_ticks_msec() < grace_ms:
+				continue
+			var falloff := clampf(1.0 - (dist / blast_radius), 0.0, 1.0)
+			var dir := (offset / dist + Vector3.UP * 0.35).normalized()
+			body.apply_central_impulse(dir * (body.mass * 14.0 * falloff))
+
+## Fills (Add/Paint and boulder bakes) never blast, but they can bury a sleeping
+## boulder, so wake anything inside the edited volume's neighbourhood.
+func _on_terrain_fill_physics(center: Vector3, radius: float, _affected_chunks: int) -> void:
+	var wake_radius := radius + 6.0
+	for body in _rolling_boulders:
+		if is_instance_valid(body) and body.global_position.distance_to(center) <= wake_radius:
+			body.sleeping = false
+
+func _update_rolling_boulders(delta: float) -> void:
+	if _rolling_boulders.is_empty():
+		return
+	# collision_distance_chunks is -1 here ("collide every resident chunk"), so use
+	# the effective streaming radius rather than a negative despawn distance.
+	var view_chunks := terrain.get_effective_view_distance_chunks()
+	if view_chunks <= 0:
+		view_chunks = terrain.view_distance_chunks
+	var max_live_dist := float(view_chunks + 1) * 32.0 * terrain.voxel_scale
+	var world_floor := terrain.surface_base_height \
+		- float(terrain.world_height_chunks) * 32.0 * terrain.voxel_scale - 16.0
+
+	for i in range(_rolling_boulders.size() - 1, -1, -1):
+		var body := _rolling_boulders[i]
+		if not is_instance_valid(body):
+			_rolling_boulders.remove_at(i)
+			continue
+		var pos := body.global_position
+		if pos.distance_to(camera.global_position) > max_live_dist or pos.y < world_floor:
+			_rolling_boulders.remove_at(i)
+			body.queue_free()
+			continue
+
+		if bool(body.get_meta("crush", false)):
+			_update_crushing_boulder(body, pos)
+
+		if body.has_meta("settle_timer"):
+			if body.sleeping or (body.linear_velocity.length() < 0.25 and body.angular_velocity.length() < 0.4):
+				var settled := float(body.get_meta("settle_timer")) + delta
+				body.set_meta("settle_timer", settled)
+				if settled >= boulder_settle_seconds:
+					_try_bake_rolling_boulder(i)
+			else:
+				body.set_meta("settle_timer", 0.0)
+
+## Titan-style crushing rollers carve a throttled crater trail along their path.
+## Blasts are centered on the ground contact point, not the sphere center, so they
+## actually bite into the terrain the boulder is rolling over.
+func _update_crushing_boulder(body: RigidBody3D, pos: Vector3) -> void:
+	if body.linear_velocity.length() < boulder_crush_speed:
+		return
+	var now := Time.get_ticks_msec()
+	var last_ms := int(body.get_meta("last_crush_ms", 0))
+	var last_pos: Vector3 = body.get_meta("last_crush_pos", pos)
+	if now - last_ms < int(boulder_crush_interval * 1000.0):
+		return
+	if pos.distance_to(last_pos) < 0.75:
+		return
+	var radius := float(body.get_meta("radius", 1.0))
+	var ground := terrain.raycast_terrain(pos, pos - Vector3(0.0, radius * 2.5, 0.0))
+	# Only carve while actually in contact; airborne blasts would waste a worker edit.
+	if not is_finite(ground.x) or pos.distance_to(ground) > radius * 1.35:
+		return
+	var blast_radius := radius * boulder_crush_radius_scale
+	terrain.trigger_explosion(ground, blast_radius)
+	_pending_crush_blasts.append({"point": ground, "radius": blast_radius})
+	body.set_meta("last_crush_ms", now)
+	body.set_meta("last_crush_pos", pos)
+	body.set_meta("self_blast_grace_ms", now + 500)
+
+## Bakes a settled boulder into permanent 5-hit voxels. A downward voxel probe
+## ensures it actually reached the terrain instead of resting on another boulder.
+func _try_bake_rolling_boulder(index: int) -> void:
+	var body := _rolling_boulders[index]
+	var radius := float(body.get_meta("radius", 1.0))
+	var center := body.global_position
+	var hit := terrain.raycast_terrain(center, center - Vector3(0.0, radius * 3.0, 0.0))
+	var grounded := is_finite(hit.x) and center.distance_to(hit) <= radius * 2.0
+	if not grounded:
+		# Came to rest on a prop or mid-air: retry later instead of baking in the air.
+		body.set_meta("settle_timer", 0.0)
+		return
+	var bake_radius := radius * 0.95
+	terrain.place_boulder(center, bake_radius)
+	_pending_bake_fills.append({"point": center, "radius": bake_radius})
+	_rolling_boulders.remove_at(index)
+	body.queue_free()
+
+## Bakes and crush blasts land in the native undo manager without a click-time
+## GDScript action. Register a synthetic one-op action so `cpp_ops` stays in
+## lockstep with terrain.undo() and multi-op brush strokes are not over-undone.
+func _register_async_edit(label: String, point: Vector3, radius: float) -> void:
+	if _mode == Mode.BENCHMARK:
+		return
+	var op := {"kind": "boulder", "point": point, "radius": radius}
+	if not _active_undo_action.is_empty():
+		_note_undo_cpp_op(op)
+		return
+	_begin_undo_action(label)
+	_note_undo_cpp_op(op)
+	_end_undo_action()
+
+## Matches a completion signal to a queued bake/crush request. Signals report
+## grid-rounded world coordinates (up to half a voxel off), hence the tolerances.
+func _consume_pending_edit(pending: Array[Dictionary], point: Vector3, radius: float) -> bool:
+	for i in range(pending.size() - 1, -1, -1):
+		var entry: Dictionary = pending[i]
+		var entry_point: Vector3 = entry.get("point", Vector3.ZERO)
+		if entry_point.distance_to(point) <= 1.0 \
+				and absf(float(entry.get("radius", 0.0)) - radius) <= 0.5:
+			pending.remove_at(i)
+			return true
+	return false
+
+func _clear_rolling_boulders() -> void:
+	for body in _rolling_boulders:
+		if is_instance_valid(body):
+			body.queue_free()
+	_rolling_boulders.clear()
+	_pending_bake_fills.clear()
+	_pending_crush_blasts.clear()
 
 func _raycast_crosshair() -> Dictionary:
 	var space_state := get_world_3d().direct_space_state
@@ -2239,6 +2552,11 @@ func _on_explosion_completed(pos: Vector3, radius: float, affected_chunks: int) 
 	# around new craters or across freshly frozen Ice bridges!
 	if _companion_initialized and _goal_mesh_inst.visible:
 		_has_pending_path_query = true
+	# A crushing roller's carve was completed by the worker pool; give it a matching
+	# undo action so native and GDScript undo depths stay in sync. A zero-chunk
+	# completion records no native entry, so it must not create a synthetic action.
+	if _consume_pending_edit(_pending_crush_blasts, pos, radius) and affected_chunks > 0:
+		_register_async_edit("Boulder crush", pos, radius)
 
 func _on_explosion_failed(reason: String) -> void:
 	_rebake_in_progress = false
@@ -2256,6 +2574,10 @@ func _on_terrain_add_completed(pos: Vector3, radius: float, affected_chunks: int
 			var lat_ms := float(Time.get_ticks_usec() - t0) / 1000.0
 			_bench_blast_latencies_ms.push_back(lat_ms)
 	_print_throttled("[VoxelTerrain3D] Add terrain completed at %s radius=%.1f chunks=%d" % [pos, radius, affected_chunks])
+	# A settled roller just stamped itself back into the grid; record the edit so
+	# undo consumes exactly one native entry per GDScript action.
+	if _consume_pending_edit(_pending_bake_fills, pos, radius) and affected_chunks > 0:
+		_register_async_edit("Boulder settled", pos, radius)
 
 func _on_terrain_add_failed(reason: String) -> void:
 	_warn_throttled("[VoxelTerrain3D] Add terrain failed: " + reason)
@@ -2558,6 +2880,7 @@ func _perform_undo_all_and_reset() -> void:
 		_tool_pressed = false
 		_end_undo_action()
 	_last_boom_point = Vector3(INF, INF, INF)
+	_clear_rolling_boulders()
 
 	var steps_undone := 0
 	if terrain != null and terrain.has_method("undo_all"):
@@ -2596,6 +2919,7 @@ func _reset_terrain_for_benchmark_pass() -> void:
 	_current_waypoint_idx = 0
 	_has_pending_path_query = false
 	_rebake_in_progress = false
+	_clear_rolling_boulders()
 	if _path_immediate_mesh != null:
 		_path_immediate_mesh.clear_surfaces()
 	if _goal_mesh_inst != null:

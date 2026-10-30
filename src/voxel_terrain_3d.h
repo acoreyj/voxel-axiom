@@ -71,6 +71,14 @@ public:
     /// Places a 5-hit boulder: fills a sphere of MaterialHardness::kMaterialBoulder
     /// that shatters only after 5 explosions.
     void place_boulder(Vector3 p_position, float p_radius);
+    /// Swept-capsule CSG edits: every sample within `p_radius` of the segment
+    /// `p_from` -> `p_to` is carved / filled / elementally reacted. Used for beam
+    /// tunnels, drill dashes, blade sweeps, and continuous Frost ice bridges.
+    void carve_capsule(Vector3 p_from, Vector3 p_to, float p_radius);
+    /// Fills a swept capsule with `p_material` (1 = soil, 2 = 3-hit hard rock,
+    /// 5 = 3-hit obsidian, 7 = 5-hit boulder); values are clamped to [1, 7].
+    void add_capsule_with_material(Vector3 p_from, Vector3 p_to, float p_radius, int p_material);
+    void trigger_elemental_capsule(Vector3 p_from, Vector3 p_to, float p_radius, int p_element_kind);
     /// Stamps an offline-baked `.vreg` asset region (see the `voxel_baker` CLI)
     /// into the live world: `p_chunk_coords` is the region's origin chunk
     /// (region-local chunk 0, 0, 0). `p_recreate_delay_seconds > 0` reconstitutes
@@ -91,6 +99,24 @@ public:
     /// 0 air, 1 soil, 2 hard rock, 3 lava, 4 water, 5 obsidian, 6 ice, 7 boulder),
     /// or -1 when nothing is hit (same miss conditions as raycast_terrain).
     [[nodiscard]] int raycast_terrain_material(Vector3 p_from, Vector3 p_to) const;
+    /// Returns the surface normal at the first `raycast_terrain` hit (central-difference
+    /// gradient of `sample_sdf`), or +INF when nothing is hit.
+    [[nodiscard]] Vector3 raycast_terrain_normal(Vector3 p_from, Vector3 p_to) const;
+    /// O(1) trilinear reconstruction of the signed-density field at a world position
+    /// (negative = solid). Falls back to the procedural generator for unloaded chunks.
+    [[nodiscard]] float sample_sdf(Vector3 p_world_pos) const;
+    /// Normalized central-difference gradient of `sample_sdf`; +Y when degenerate.
+    [[nodiscard]] Vector3 sample_sdf_normal(Vector3 p_world_pos) const;
+    /// Material ID of the closest solid sample around a world position, or -1 when the
+    /// engine is not ready.
+    [[nodiscard]] int get_material_at(Vector3 p_world_pos) const;
+    /// Accumulated crack damage ratio in [0, 1] of the closest solid sample.
+    [[nodiscard]] float get_damage_at(Vector3 p_world_pos) const;
+    /// Per-material solid sample histogram (index = MaterialHardness::kMaterial*, 0 = air)
+    /// over the resident samples inside the sphere.
+    [[nodiscard]] PackedInt32Array query_sphere_materials(Vector3 p_center, float p_radius) const;
+    /// Most common non-air material ID in the sphere, or 0 when no solid samples.
+    [[nodiscard]] int get_dominant_material_in_sphere(Vector3 p_center, float p_radius) const;
     /// Top-most terrain surface height at world (x, z); main thread only. Casts the
     /// vertical surface ray first (edited terrain) and falls back to the procedural
     /// generator when no crossing is found (column not streamed).

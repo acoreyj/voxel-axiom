@@ -16,6 +16,10 @@ uniform vec3 crack_glow_color : source_color = vec3(1.0, 0.42, 0.08);
 uniform bool debug_damage_indicator = true;
 uniform float slope_sharpness : hint_range(1.0, 16.0) = 6.0;
 uniform float noise_scale : hint_range(0.01, 1.0) = 0.14;
+// Dynamic props (rolling boulders) sample the rock pattern in object space so the
+// granite stays locked to the tumbling mesh instead of swimming through world space.
+// Terrain leaves this false and keeps its world-space pattern.
+uniform bool pattern_in_object_space = false;
 // Chiseled geometric facet normals: blends the screen-space triangle face normal
 // into Hard Rock and painted monument surfaces so 1.0 m Surface Nets meshes show
 // crisp monolithic planes on brow, nose bridge, lips and jaw without making
@@ -229,7 +233,9 @@ vec3 baked_srgb_to_linear(vec3 c) {
 }
 
 void vertex() {
-	v_world_pos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	// World-space by default (terrain chunks); object-space for props that rotate,
+	// so the procedural rock pattern does not slide across a tumbling boulder.
+	v_world_pos = pattern_in_object_space ? VERTEX : (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
 	v_world_normal = normalize((MODEL_NORMAL_MATRIX * NORMAL).xyz);
 	v_damage_ratio = COLOR.r;
 	v_is_hard_rock = COLOR.g;

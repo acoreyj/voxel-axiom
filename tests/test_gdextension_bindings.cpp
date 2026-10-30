@@ -15,6 +15,7 @@ namespace {
 
 using godot::ClassRegistryTracker;
 using godot::MODULE_INITIALIZATION_LEVEL_SCENE;
+using godot::PackedInt32Array;
 using godot::PackedVector3Array;
 using godot::Vector3;
 using godot::VoxelAICompanion;
@@ -804,6 +805,103 @@ void test_gdextension_underground_atomic_crater_commit_no_see_through() {
                 total_edit_meshes_committed);
 }
 
+// ============================================================================
+// 13. Fast SDF, Surface Normal, Material/Damage Queries & Swept Capsule Edits
+//     Verifies O(1) trilinear SDF sampling, central-difference surface normals,
+//     surface-skin material/damage lookups, sphere material histograms, and
+//     swept capsule carve / fill / Frost bridge edits + undo/redo.
+// ============================================================================
+void test_gdextension_fast_sdf_surface_queries_and_capsule_edits() {
+    ++g_tests_run;
+
+    const std::filesystem::path save_dir = "/tmp/voxel_gdextension_fast_queries_test";
+    std::filesystem::remove_all(save_dir);
+
+    VoxelTerrain3D terrain;
+    terrain.set_save_directory_path(save_dir.string());
+    terrain.set_view_distance_chunks(1);
+    terrain.set_prefetch_distance_chunks(0);
+    terrain.set_world_height_chunks(3);
+    terrain.set_upload_budget_ms(8.0f);
+    terrain._enter_tree();
+
+    terrain.set_stream_focus(Vector3(16.0f, 68.0f, 16.0f), Vector3(0.0f, 0.0f, 0.0f));
+    wait_until_terrain_fully_committed(terrain);
+
+    // 1. Verify sample_sdf sign above, on, and below the surface
+    const float surf_y = terrain.get_surface_height(16.0f, 16.0f);
+    REQUIRE(std::isfinite(surf_y));
+    REQUIRE(terrain.sample_sdf(Vector3(16.0f, surf_y + 3.0f, 16.0f)) > 0.25f);
+    REQUIRE(terrain.sample_sdf(Vector3(16.0f, surf_y - 3.0f, 16.0f)) < -0.25f);
+
+    // 2. Verify sample_sdf_normal and raycast_terrain_normal point upward on the hill surface
+    const Vector3 surf_n = terrain.sample_sdf_normal(Vector3(16.0f, surf_y, 16.0f));
+    const float n_len = std::sqrt(surf_n.x * surf_n.x + surf_n.y * surf_n.y + surf_n.z * surf_n.z);
+    REQUIRE(std::abs(n_len - 1.0f) < 1e-3f);
+    REQUIRE(surf_n.y > 0.6f);
+
+    const Vector3 ray_n = terrain.raycast_terrain_normal(
+        Vector3(16.0f, surf_y + 12.0f, 16.0f),
+        Vector3(16.0f, surf_y - 12.0f, 16.0f));
+    REQUIRE(std::isfinite(ray_n.x));
+    REQUIRE(ray_n.y > 0.6f);
+
+    // 3. Place a 3-hit HardRock boulder, chip it once, and verify get_material_at,
+    //    get_damage_at, query_sphere_materials, and get_dominant_material_in_sphere.
+    const Vector3 boulder_pos(16.0f, surf_y + 1.0f, 16.0f);
+    terrain.add_terrain_with_material(
+        boulder_pos, 4.0f, static_cast<int>(voxel::MaterialHardness::kMaterialHardRock));
+    wait_until_terrain_fully_committed(terrain);
+
+    REQUIRE(terrain.get_material_at(boulder_pos) ==
+            static_cast<int>(voxel::MaterialHardness::kMaterialHardRock));
+    REQUIRE(terrain.get_dominant_material_in_sphere(boulder_pos, 3.0f) ==
+            static_cast<int>(voxel::MaterialHardness::kMaterialHardRock));
+    const PackedInt32Array hist = terrain.query_sphere_materials(boulder_pos, 3.0f);
+    REQUIRE(hist.size() == 8ULL);
+    REQUIRE(hist[voxel::MaterialHardness::kMaterialHardRock] > 20);
+
+    // Chip the boulder once -> damage ratio should be ~1/3 (~0.333)
+    terrain.trigger_explosion(boulder_pos, 4.5f);
+    wait_until_terrain_fully_committed(terrain);
+    const float dmg_ratio = terrain.get_damage_at(boulder_pos);
+    REQUIRE(dmg_ratio > 0.25f && dmg_ratio < 0.45f);
+
+    // 4. Swept capsule carve (tunnel / beam) and Frost capsule (continuous Ice Path)
+    const Vector3 cap_from(6.0f, surf_y - 1.5f, 8.0f);
+    const Vector3 cap_to(26.0f, surf_y - 1.5f, 8.0f);
+    terrain.carve_capsule(cap_from, cap_to, 3.0f);
+    wait_until_terrain_fully_committed(terrain);
+    // Midpoint of carved capsule trench should now be air (sample_sdf > 0)
+    REQUIRE(terrain.sample_sdf(Vector3(16.0f, surf_y - 1.5f, 8.0f)) > 0.0f);
+
+    // Swept Frost capsule across the trench builds a continuous Ice skyway
+    terrain.trigger_elemental_capsule(cap_from, cap_to, 3.5f,
+                                     static_cast<int>(voxel::ElementalKind::Frost));
+    wait_until_terrain_fully_committed(terrain);
+    REQUIRE(terrain.get_dominant_material_in_sphere(Vector3(16.0f, surf_y - 1.5f, 8.0f), 2.5f) ==
+            static_cast<int>(voxel::MaterialHardness::kMaterialIce));
+
+    // 5. Swept capsule fill builds a continuous hard-rock bridge in the air
+    const Vector3 fill_from(6.0f, surf_y + 4.0f, 8.0f);
+    const Vector3 fill_to(26.0f, surf_y + 4.0f, 8.0f);
+    terrain.add_capsule_with_material(fill_from, fill_to, 1.5f,
+                                      static_cast<int>(voxel::MaterialHardness::kMaterialHardRock));
+    wait_until_terrain_fully_committed(terrain);
+    REQUIRE(terrain.get_dominant_material_in_sphere(Vector3(16.0f, surf_y + 4.0f, 8.0f), 1.0f) ==
+            static_cast<int>(voxel::MaterialHardness::kMaterialHardRock));
+
+    // Verify undo_all restores everything cleanly
+    REQUIRE(terrain.undo_all() >= 5);
+    wait_until_terrain_fully_committed(terrain);
+    REQUIRE(std::abs(terrain.get_surface_height(16.0f, 16.0f) - surf_y) < 0.05f);
+
+    terrain._exit_tree();
+    std::filesystem::remove_all(save_dir);
+
+    std::printf("[PASS] test_gdextension_fast_sdf_surface_queries_and_capsule_edits (O(1) SDF/normal/material/damage + capsule CSG verified)\n");
+}
+
 } // namespace
 
 int main() {
@@ -820,6 +918,7 @@ int main() {
     test_gdextension_moai_stamp_baked_colors_and_remove_structure();
     test_gdextension_undo_redo_and_benchmark_pass_reset();
     test_gdextension_underground_atomic_crater_commit_no_see_through();
+    test_gdextension_fast_sdf_surface_queries_and_capsule_edits();
     std::printf("=== ALL %d TEST SUITES PASSED (%d assertions verified) ===\n",
                 g_tests_run, g_assertions_checked);
     return EXIT_SUCCESS;

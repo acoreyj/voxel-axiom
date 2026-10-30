@@ -5,6 +5,7 @@
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/core/defs.hpp>
 #include <godot_cpp/godot.hpp>
+#include <godot_cpp/variant/packed_int32_array.hpp>
 #else
 #include <cstdint>
 #include <string>
@@ -29,6 +30,7 @@ struct Vector3 {
 };
 
 using PackedVector3Array = std::vector<Vector3>;
+using PackedInt32Array = std::vector<int32_t>;
 using String = std::string;
 
 class ClassRegistryTracker {
