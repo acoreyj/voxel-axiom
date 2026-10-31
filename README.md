@@ -900,6 +900,18 @@ aim_dir, max_distance, targets)` each frame. Cast through `start_hyper_beam()`,
 `status_effect_applied`, `status_effect_removed`, `damage_dealt`, and
 `elemental_combo_triggered`.
 
+### Grim Wanderer character model
+
+Third-person Play Mode loads `models/grim-wanderer/grim_wanderer.glb` (1.9 m, 65-joint
+Mixamo rig, 64 in-place clips) under `HeroVisualRig`; the procedural capsule/visor remains as
+a fallback if the GLB is missing. Locomotion maps to `aa_idle` / `bs_rifle_aiming_idle`,
+`bs_walking` / `bs_rifle_run` / strafes / backpedal, `mgl_standing_sprint_forward`,
+`aa_falling_idle`, `aa_crouched_sneaking_left` (slide), `aa_cover_to_stand` (mantle), and
+`aa_hard_landing`. Combat uses `bs_firing_rifle`, `bs_reloading`, and `bs_toss_grenade` for
+melee/casts, with `bs_hit_reaction` for damage, wall pins, and Frozen/Stunned lockouts. The
+clips are in-place; the controller still drives movement. The rig origin is the pelvis, and
+the clips place the feet on `y = 0` (always play an animation when spawning).
+
 ### Primary weapon and ricochet rounds
 
 `VoxelAbilitySystem` also owns a `WeaponSpec`: a 24-round Pulse Carbine at ~7.1 rounds/sec

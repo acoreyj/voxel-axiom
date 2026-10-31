@@ -363,6 +363,12 @@ var _last_ice_path_anchor: Vector3 = Vector3(INF, INF, INF)
 var _hero_visual_root: Node3D = null
 var _hero_torso_mesh: MeshInstance3D = null
 var _hero_visor_mesh: MeshInstance3D = null
+var _hero_model: Node3D = null
+var _hero_anim: AnimationPlayer = null
+var _hero_anim_current: String = ""
+var _hero_anim_lock: float = 0.0
+var _hero_prev_grounded: bool = true
+var _hero_prev_vel_y: float = 0.0
 var _last_safe_feet: Vector3 = Vector3.ZERO
 var _spawn_pending: bool = false
 var _spawn_wait: float = 0.0
@@ -1403,6 +1409,27 @@ func _setup_hero_visual_rig() -> void:
 	_hero_visor_mesh.position = Vector3(0.0, play_eye_height - 0.12, -play_body_radius * 0.72)
 	_hero_visual_root.add_child(_hero_visor_mesh)
 
+	# Skinned Mixamo character (64 in-place clips). Falls back to the capsule rig
+	# above when the model is unavailable.
+	var packed: PackedScene = load("res://models/grim-wanderer/grim_wanderer.glb") as PackedScene
+	if packed != null:
+		_hero_model = packed.instantiate() as Node3D
+		if _hero_model != null:
+			_hero_model.name = "GrimWandererModel"
+			_hero_model.rotation.y = PI  # Asset faces +Z; hero forward is -Z.
+			_hero_visual_root.add_child(_hero_model)
+			_hero_anim = _hero_model.find_child("AnimationPlayer", true, false) as AnimationPlayer
+			if _hero_anim != null:
+				_play_hero_anim("aa_idle", 0.0, 1.0, true)
+			else:
+				push_warning("[HeroModel] Grim Wanderer has no AnimationPlayer; using static pose")
+			_hero_torso_mesh.visible = false
+			_hero_visor_mesh.visible = false
+		else:
+			push_warning("[HeroModel] Failed to instantiate Grim Wanderer; using capsule rig")
+	else:
+		push_warning("[HeroModel] Could not load Grim Wanderer GLB; using capsule rig")
+
 func _setup_ability_system_and_beam_visuals() -> void:
 	_gas = VoxelAbilitySystem.new()
 	_gas.name = "VoxelAbilitySystem"
@@ -1413,6 +1440,10 @@ func _setup_ability_system_and_beam_visuals() -> void:
 
 	_gas.ability_cast_blocked.connect(func(ability_id: String, reason: String) -> void:
 		print("[GAS] %s blocked: %s" % [ability_id, reason])
+	)
+	_gas.damage_dealt.connect(func(target: Node3D, _amount: float, _is_spirit: bool, _source: String) -> void:
+		if target == self and _mode == Mode.PLAY:
+			_play_hero_action("bs_hit_reaction", 0.4, 1.0)
 	)
 	_gas.status_effect_applied.connect(func(target: Node3D, effect_id: String, stacks: int, dur: float) -> void:
 		var t_name := "Hero" if target == self else "Companion"
@@ -1562,6 +1593,8 @@ func _start_pickaxe_swing() -> void:
 	_swing_elapsed = 0.0
 	_swing_hit_solid_recoil = 0.0
 	_swing_impact_time = PICKAXE_SWING_TIME * pickaxe_impact_fraction
+	if _mode == Mode.PLAY:
+		_play_hero_action("bs_toss_grenade", PICKAXE_SWING_TIME, 5.8)
 
 func _update_pickaxe_swing(delta: float) -> void:
 	if _viewmodel_root == null:
@@ -1927,6 +1960,7 @@ func _fire_primary_ricochet_carbine() -> void:
 	var res := _gas.fire_ricochet_weapon(muzzle, camera.global_position, aim_fwd, max_ray_distance, is_sliding, targets)
 	if not bool(res.get("fired", false)):
 		return
+	_play_hero_action("bs_firing_rifle", 0.135, 2.0)
 
 	# Check if any bullet or ricochet hit an Option 1 pristine statue to trigger its voxel swap!
 	var phys_hit := _raycast_crosshair()
@@ -2146,6 +2180,7 @@ func _try_start_ledge_mantle(move_dir: Vector3) -> bool:
 	_player_vel_y = 0.0
 	_player_grounded = false
 	print("[HeroController] Ledge Mantle started -> climbing +%.2f m onto crater/cliff rim!" % climb_h)
+	_play_hero_action("aa_cover_to_stand", 0.34, 4.4)
 	return true
 
 func _step_hero_mantle(delta: float) -> void:
@@ -2193,6 +2228,7 @@ func _try_dash() -> void:
 	_player_vel.x = _dash_dir.x * play_dash_speed
 	_player_vel.z = _dash_dir.z * play_dash_speed
 	_player_vel_y = maxf(_player_vel_y, 0.0)
+	_play_hero_action("mgl_standing_sprint_forward", 0.26, 1.4)
 
 func _try_jump() -> void:
 	if _mode != Mode.PLAY:
@@ -2215,6 +2251,7 @@ func _try_jump() -> void:
 		_player_vel.z = _dash_dir.z * play_dash_jump_horiz_boost
 		_player_vel_y = play_dash_jump_vert_speed
 		print("[HeroController] Dash-Jump triggered! Horiz speed=%.1f m/s" % play_dash_jump_horiz_boost)
+		_play_hero_action("mgl_standing_jump_running", 0.55, 2.0)
 		return
 
 	# 2. Try Ledge Mantle if close to a cliff/crater wall
@@ -2230,6 +2267,7 @@ func _try_jump() -> void:
 		_player_grounded = false
 		_coyote_timer = 0.0
 		_hero_state = HeroState.AIRBORNE
+		_play_hero_action("bs_rifle_jump", 0.55, 1.2)
 
 func _try_shoulder_charge() -> void:
 	if _mode != Mode.PLAY or _hero_state == HeroState.MANTLING or _hero_state == HeroState.SHOULDER_CHARGE:
@@ -2246,6 +2284,7 @@ func _try_shoulder_charge() -> void:
 	_charge_dir = Vector3(-sin(_yaw), 0.0, -cos(_yaw)).normalized()
 	_player_vel = _charge_dir * play_charge_speed
 	print("[HeroController] Abrams Shoulder Charge started! (Steer with mouse | Captures companion & pins/breaches walls)")
+	_play_hero_action("mgl_standing_sprint_forward", 0.35, 1.5)
 
 func _step_hero_shoulder_charge(delta: float) -> void:
 	_charge_timer += delta
@@ -2347,6 +2386,7 @@ func _step_hero_shoulder_charge(delta: float) -> void:
 					_telegraphs.spawn_impact_ring_decal(
 						hit_pos, wall_normal, play_charge_wall_pin_blast_radius,
 						Color(1.0, 0.55, 0.12), 0.65)
+				_play_hero_action("bs_hit_reaction", 0.5, 1.0)
 				if _charge_pinned_companion:
 					ai_companion.global_position = Vector3(
 						hit_pos.x + wall_n_xz.x * 0.65,
@@ -2406,6 +2446,7 @@ func _try_ground_slam() -> void:
 	_player_vel.z = aim_fwd.z
 	_player_vel_y = -28.0
 	print("[HeroController] Lash Ground Strike dive initiated!")
+	_play_hero_action("aa_falling_idle", 0.3, 1.3)
 
 func _step_hero_ground_slam(delta: float) -> void:
 	var step_vec := Vector3(_player_vel.x, _player_vel_y, _player_vel.z) * delta
@@ -2417,6 +2458,7 @@ func _step_hero_ground_slam(delta: float) -> void:
 		_player_vel_y = 0.0
 		_player_grounded = true
 		_hero_state = HeroState.GROUNDED
+		_play_hero_action("aa_hard_landing", 0.5, 2.5)
 		if _gas != null:
 			var targets: Array[Node3D] = []
 			if _companion_initialized:
@@ -2503,6 +2545,103 @@ func _update_hero_camera_and_visuals(delta: float) -> void:
 	_play_pcam.global_position = final_cam
 	_play_pcam.rotation = Vector3(_pitch, _yaw, 0.0)
 
+func _play_hero_anim(name: String, blend: float = 0.15, speed: float = 1.0, loop: bool = true) -> void:
+	if _hero_anim == null:
+		return
+	var anim: Animation = _hero_anim.get_animation(name)
+	if anim == null:
+		return
+	anim.loop_mode = Animation.LOOP_LINEAR if loop else Animation.LOOP_NONE
+	_hero_anim_current = name
+	_hero_anim.play(name, blend, speed)
+
+## Locks the locomotion driver for `duration` seconds and restarts a one-shot clip.
+func _play_hero_action(name: String, duration: float, speed: float = 1.0) -> void:
+	if _hero_anim == null:
+		return
+	var anim: Animation = _hero_anim.get_animation(name)
+	if anim == null:
+		return
+	anim.loop_mode = Animation.LOOP_NONE
+	_hero_anim_lock = maxf(_hero_anim_lock, duration)
+	_hero_anim_current = name
+	if _hero_anim.current_animation == name:
+		_hero_anim.stop()
+		_hero_anim.play(name, 0.05, speed)
+	else:
+		_hero_anim.play(name, 0.08, speed)
+
+func _update_hero_animations(delta: float) -> void:
+	if _hero_anim == null:
+		return
+	_hero_anim_lock = maxf(0.0, _hero_anim_lock - delta)
+	var speed := Vector2(_player_vel.x, _player_vel.z).length()
+	var frozen := _gas != null and (_gas.hero_tags & (VoxelAbilitySystem.Tag.FROZEN | VoxelAbilitySystem.Tag.STUNNED)) != 0
+	if frozen:
+		if _hero_anim.current_animation != "bs_hit_reaction":
+			_play_hero_anim("bs_hit_reaction", 0.1, 0.0, false)
+		_hero_prev_grounded = _player_grounded
+		_hero_prev_vel_y = _player_vel_y
+		return
+	if _hero_anim_lock > 0.0:
+		_hero_prev_grounded = _player_grounded
+		_hero_prev_vel_y = _player_vel_y
+		return
+	if _player_grounded and not _hero_prev_grounded and _hero_prev_vel_y < -14.0:
+		_play_hero_action("aa_hard_landing", 0.5, 2.5)
+		_hero_prev_grounded = _player_grounded
+		_hero_prev_vel_y = _player_vel_y
+		return
+
+	var clip := "aa_idle"
+	var rate := 1.0
+	if _hero_state == HeroState.SLIDING:
+		clip = "aa_crouched_sneaking_left"
+		rate = 1.4
+	elif _hero_state == HeroState.MANTLING:
+		clip = "aa_cover_to_stand"
+		rate = 4.4
+	elif _hero_state == HeroState.GROUND_SLAM:
+		clip = "aa_falling_idle"
+		rate = 1.3
+	elif _hero_state == HeroState.SHOULDER_CHARGE:
+		clip = "mgl_standing_sprint_forward"
+		rate = 1.3
+	elif _hero_state == HeroState.DASHING:
+		clip = "mgl_standing_sprint_forward"
+		rate = 1.4
+	elif not _player_grounded:
+		clip = "aa_falling_idle"
+	elif speed < 0.25:
+		var armed := _play_ads_held or _play_fire_held or \
+			(_gas != null and _gas.primary_weapon.is_reloading)
+		clip = "bs_rifle_aiming_idle" if armed else "aa_idle"
+	else:
+		var forward := Vector3(-sin(_yaw), 0.0, -cos(_yaw))
+		var right := Vector3(cos(_yaw), 0.0, -sin(_yaw))
+		var vdir := Vector3(_player_vel.x, 0.0, _player_vel.z)
+		var fdot := vdir.dot(forward)
+		var rdot := vdir.dot(right)
+		if fdot < -0.3:
+			clip = "bs_run_backwards" if speed > 7.0 else "bs_walking_backwards"
+		elif absf(rdot) > absf(fdot) * 0.85 and absf(rdot) > 0.8:
+			clip = "bs_strafe_right" if rdot > 0.0 else "bs_strafe_left"
+		elif speed > 11.0:
+			clip = "mgl_standing_sprint_forward"
+			rate = clampf(speed / 10.0, 1.0, 1.6)
+		elif speed > 7.0:
+			clip = "bs_rifle_run"
+			rate = clampf(speed / 9.5, 0.8, 1.4)
+		else:
+			clip = "bs_walking"
+			rate = clampf(speed / 5.5, 0.7, 1.3)
+	if _ice_path_active and _player_grounded and speed > 3.0 and _hero_state != HeroState.SLIDING:
+		clip = "mgl_standing_run_forward"
+	if clip != _hero_anim_current:
+		_play_hero_anim(clip, 0.18, rate, true)
+	_hero_prev_grounded = _player_grounded
+	_hero_prev_vel_y = _player_vel_y
+
 func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
 		_yaw -= event.relative.x * mouse_sensitivity
@@ -2525,6 +2664,7 @@ func _unhandled_input(event: InputEvent) -> void:
 					print("[GAS] Spawned Kelvin Frozen Shelter (Hollow Ice Dome #%d, r=%.1fm, TTL=%.1fs - press 1 again to shatter early)!" % [
 						int(dome_res.get("structure_id", 0)), float(dome_res.get("radius", 8.5)), float(dome_res.get("duration", 6.5))
 					])
+					_play_hero_action("bs_toss_grenade", 0.8, 4.0)
 				elif dome_res.get("action") == "dismissed":
 					print("[GAS] Dismissed Kelvin Frozen Shelter (#%d) early!" % int(dome_res.get("structure_id", 0)))
 				return
@@ -2541,6 +2681,7 @@ func _unhandled_input(event: InputEvent) -> void:
 					print("[GAS] Raised McGinnis Spectral Wall (#%d, width=%.1fm, 3-Hit Rock, TTL=%.1fs - press 2 to drop or G to Wall-Pin into it)!" % [
 						int(wall_res.get("structure_id", 0)), float(wall_res.get("width", 14.0)), float(wall_res.get("duration", 7.5))
 					])
+					_play_hero_action("bs_toss_grenade", 0.8, 4.0)
 				elif wall_res.get("action") == "dismissed":
 					print("[GAS] Dropped McGinnis Spectral Wall (#%d) early!" % int(wall_res.get("structure_id", 0)))
 				return
@@ -2580,6 +2721,7 @@ func _unhandled_input(event: InputEvent) -> void:
 						and not (event.ctrl_pressed or event.meta_pressed):
 					if _gas.start_hyper_beam(_gas.hero_tags):
 						print("[GAS] Bebop Hyper Beam CHANNELING (2.6s molten laser trench, Unstoppable)!")
+						_play_hero_action("bs_firing_rifle", 0.5, 1.0)
 				elif event.shift_pressed and (event.ctrl_pressed or event.meta_pressed):
 					_perform_redo()
 				else:
@@ -2590,6 +2732,7 @@ func _unhandled_input(event: InputEvent) -> void:
 					var orb_origin := _player_feet + Vector3(0.0, play_eye_height - 0.1, 0.0)
 					if _gas.spawn_bouncing_cryo_orb(orb_origin, aim_fwd, _gas.hero_tags, self):
 						print("[GAS] Fired Cryo-Bounce Orb (ricochets off SDF normals, Chills/Freezes companion in Voxel Ice)!")
+						_play_hero_action("bs_toss_grenade", 0.8, 4.0)
 			KEY_G:
 				if _mode == Mode.PLAY and not event.echo:
 					_try_shoulder_charge()
@@ -2635,6 +2778,7 @@ func _unhandled_input(event: InputEvent) -> void:
 				if _mode == Mode.PLAY and not event.shift_pressed and _gas != null:
 					if _gas.start_weapon_reload():
 						print("[Weapon] Reloading Pulse Carbine (%.2fs)... (Press Shift+R to reset statues)" % _gas.primary_weapon.reload_duration)
+						_play_hero_action("bs_reloading", 1.55, 2.13)
 				elif event.shift_pressed or event.ctrl_pressed or event.meta_pressed:
 					_perform_undo_all_and_reset()
 				else:
@@ -2720,6 +2864,7 @@ func _process(delta: float) -> void:
 		_process_benchmark(delta)
 	elif _mode == Mode.PLAY:
 		_process_play(delta)
+		_update_hero_animations(delta)
 	else:
 		_process_fly(delta)
 
