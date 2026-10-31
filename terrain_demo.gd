@@ -243,7 +243,7 @@ Build   1 Add terrain   2 Paint   3 Paint delete   4 Boulder
 Roller  Shift+4 rolling boulder   Ctrl+Click crushing roller
 Carve   5 Small hit     6 Explode   7 Large explode
 Element 8 Water   9 Frost/Ice   0 Lava/Magma
-Stamps  B timed ruin   Shift+B permanent ruin   K Sparring Bot AI
+Stamps  B timed ruin   Shift+B permanent ruin   K Sparring Bot AI   J 3D Telegraph
 History Undo %d (Z) | Redo %d (Y) | Reset All (Shift+R)
 World   R reset statues   T material   P place companion
 Mouse   Play LMB pickaxe   Fly LMB tool   RMB cave path   Shift+RMB place companion"""
@@ -357,6 +357,7 @@ var _play_fire_held: bool = false
 var _play_ads_held: bool = false
 var _ads_blend: float = 0.0
 var _bot_ai: VoxelCombatBotAI = null
+var _telegraphs: VoxelAbilityTelegraphs = null
 var _ice_path_active: bool = false
 var _last_ice_path_anchor: Vector3 = Vector3(INF, INF, INF)
 var _hero_visual_root: Node3D = null
@@ -1419,6 +1420,9 @@ func _setup_ability_system_and_beam_visuals() -> void:
 	)
 	_gas.elemental_combo_triggered.connect(func(combo_name: String, world_pos: Vector3, radius: float) -> void:
 		print("[GAS] *** %s *** at %s (scaled radius=%.1f m)!" % [combo_name, str(world_pos), radius])
+		if _telegraphs != null:
+			_telegraphs.spawn_impact_ring_decal(
+				world_pos, Vector3.UP, radius, Color(1.0, 0.55, 0.12), 0.75)
 	)
 
 	# 3D Bebop Hyper Beam ribbon & molten impact core
@@ -1473,7 +1477,16 @@ func _setup_ability_system_and_beam_visuals() -> void:
 	)
 	_bot_ai.bot_lobbed_mortar.connect(func(_orig: Vector3, target_pos: Vector3) -> void:
 		print("[BotAI] Lobbed arcing Magma Mortar toward %s!" % str(target_pos))
+		if _telegraphs != null:
+			_telegraphs.spawn_impact_ring_decal(
+				target_pos, Vector3.UP, _bot_ai.mortar_splash_radius,
+				Color(1.0, 0.25, 0.08), 0.85)
 	)
+
+	_telegraphs = VoxelAbilityTelegraphs.new()
+	_telegraphs.name = "VoxelAbilityTelegraphs"
+	_telegraphs.terrain = terrain
+	add_child(_telegraphs)
 
 func _enter_play() -> void:
 	_mode = Mode.PLAY
@@ -2330,6 +2343,10 @@ func _step_hero_shoulder_charge(delta: float) -> void:
 				if _companion_initialized and _goal_mesh_inst.visible:
 					_rebake_in_progress = true
 				terrain.trigger_explosion(hit_pos, play_charge_wall_pin_blast_radius)
+				if _telegraphs != null:
+					_telegraphs.spawn_impact_ring_decal(
+						hit_pos, wall_normal, play_charge_wall_pin_blast_radius,
+						Color(1.0, 0.55, 0.12), 0.65)
 				if _charge_pinned_companion:
 					ai_companion.global_position = Vector3(
 						hit_pos.x + wall_n_xz.x * 0.65,
@@ -2407,8 +2424,13 @@ func _step_hero_ground_slam(delta: float) -> void:
 			var res := _gas.resolve_ground_strike_combo(hit, targets)
 			var dom_mat := int(res.get("material", MATERIAL_SOIL))
 			var mat_name: String = MATERIAL_ID_NAMES[dom_mat] if dom_mat >= 0 and dom_mat < MATERIAL_ID_NAMES.size() else "Terrain"
+			var slam_r := float(res.get("radius", play_ground_slam_radius))
+			if _telegraphs != null:
+				var ring_c := Color(0.2, 0.95, 1.0) if dom_mat == 6 else \
+					(Color(1.0, 0.32, 0.08) if dom_mat == 3 else Color(1.0, 0.82, 0.2))
+				_telegraphs.spawn_impact_ring_decal(hit, Vector3.UP, slam_r, ring_c, 0.72)
 			print("[GAS] Ground Strike impacted %s -> %s (radius=%.1f m, dmg=%.0f)!" % [
-				mat_name, String(res.get("combo", "Crater")), float(res.get("radius", play_ground_slam_radius)), float(res.get("damage", 125.0))
+				mat_name, String(res.get("combo", "Crater")), slam_r, float(res.get("damage", 125.0))
 			])
 		else:
 			terrain.trigger_explosion(hit, play_ground_slam_radius)
@@ -2637,6 +2659,10 @@ func _unhandled_input(event: InputEvent) -> void:
 						_companion_initialized = true
 					var active := _bot_ai.toggle_combat_ai()
 					print("[BotAI] Sparring Combat Bot AI: %s (at %s)" % ["ENABLED" if active else "DISABLED (Path Follow)", str(ai_companion.global_position)])
+			KEY_J:
+				if not event.echo and _telegraphs != null:
+					var mode_txt := _telegraphs.cycle_telegraph_mode()
+					print("[Telegraphs] 3D Ability Telegraph Mode -> %s" % mode_txt)
 
 	elif event is InputEventMouseButton:
 		# While the cursor is released, a click recaptures instead of firing a
@@ -2713,6 +2739,28 @@ func _process(delta: float) -> void:
 		_apply_companion_gravity_and_ground_snap(delta)
 		_poll_pending_path_query()
 		_step_companion_along_path(delta)
+	if _telegraphs != null:
+		var cross_pt := _pickaxe_aim_point()
+		var spirit := _gas.hero_attributes.get_spirit_power() if _gas != null else 42.0
+		var slam_r := _gas.get_ability("lash_ground_strike").compute_scaled_radius(spirit) \
+			if (_gas != null and _gas.get_ability("lash_ground_strike") != null) else play_ground_slam_radius
+		var dome_r := _gas.get_ability("kelvin_frozen_shelter").compute_scaled_radius(spirit) \
+			if (_gas != null and _gas.get_ability("kelvin_frozen_shelter") != null) else 8.5
+		var wall_hw := _gas.get_ability("mcginnis_spectral_wall").compute_scaled_radius(spirit) \
+			if (_gas != null and _gas.get_ability("mcginnis_spectral_wall") != null) else 7.0
+		_telegraphs.update_telegraphs(
+			delta,
+			_mode == Mode.PLAY,
+			_player_feet,
+			_yaw,
+			_hero_state,
+			_player_grounded,
+			cross_pt,
+			_active_radius(),
+			slam_r,
+			dome_r,
+			wall_hw
+		)
 	_update_pending_pristine_hides(delta)
 	_update_hud(delta)
 
@@ -2813,9 +2861,13 @@ func _update_hud(delta: float) -> void:
 			comp_line = "
 Companion: %.0f/750 HP | Status: %s | Bot AI (K): %s" % [c_hp, c_eff, bot_txt]
 		var w_hud := _gas.format_weapon_hud(_hero_state == HeroState.SLIDING, _play_ads_held) if _gas != null else "Pulse Carbine"
+		var tele_line := ""
+		if _telegraphs != null and not _telegraphs.active_combo_preview_text.is_empty():
+			tele_line = "
+Telegraph (J): %s" % _telegraphs.active_combo_preview_text
 		tool_text = "%s | %s | HP: %.0f | Spirit: %.0f | Stamina: [%s] | Underfoot: %s | Buffs: %s
-Abilities: %s%s" % [
-			HERO_STATE_NAMES[_hero_state], w_hud, hero_hp, spirit_val, pips, foot_mat_name, hero_buffs, cd_bar, comp_line
+Abilities: %s%s%s" % [
+			HERO_STATE_NAMES[_hero_state], w_hud, hero_hp, spirit_val, pips, foot_mat_name, hero_buffs, cd_bar, comp_line, tele_line
 		]
 
 	_look_at_accum += delta

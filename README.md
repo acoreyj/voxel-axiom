@@ -795,6 +795,7 @@ removed.
 | `T` | Toggle add/paint material (soil / hard rock) |
 | `P` | Place the companion at the crosshair |
 | `K` | Toggle the Sparring Combat Bot AI on the companion (auto-places it) |
+| `J` | Cycle 3D ability telegraph previews (Auto / Spectral Wall / Ice Dome / Off) |
 | `Right Click` (Fly) | Query a 3D cave path to the crosshair |
 | `Right Click` (Play) | Hold for over-the-shoulder ADS zoom |
 | `Shift + Right Click` | Place the companion and query a path |
@@ -952,6 +953,31 @@ Standalone usage: add a `VoxelCombatBotAI` node, assign `terrain`, `companion_no
 `step_bot_ai(delta, hero_feet, hero_vel, is_stunned_or_pinned)` each frame. Signals:
 `bot_state_changed`, `bot_fired_bolt`, `bot_lobbed_mortar`, `bot_breached_cover`, and
 `bot_escaped_hazard`.
+
+### Ability telegraphs and impact decals
+
+`voxel_ability_telegraphs.gd` defines `class_name VoxelAbilityTelegraphs` (`extends Node3D`).
+`J` cycles its preview modes: **Auto Context**, **Spectral Wall**, **Ice Dome**, and **Off**.
+Live telegraphs are draped over the terrain by raycasting each perimeter sample and offsetting
+along `sample_sdf_normal()`:
+
+- **Ground Strike** (airborne): a dive line and 32-segment landing ring, colored by
+  `get_dominant_material_in_sphere()` — orange for Lava (+35% Magma Eruption), cyan for Ice,
+  azure for Water, gold otherwise.
+- **Shoulder Charge**: a swept `sweep_sphere()` wall disc, color-coded by
+  `measure_wall_thickness()` and impact angle (green breachable, orange/gold solid pin, blue
+  glancing slide).
+- **Spectral Wall**: a 14 m × 6.5 m terrain-draped curtain preview.
+- **Ice Dome**: the 8.5 m base ring plus two orthogonal hemisphere arches.
+- **Fly Mode**: a cyan tool-radius ring and surface-normal pin at the crosshair.
+
+Ability impacts, wall pins, elemental combos, and bot mortars also spawn expanding,
+terrain-hugging shockwave ring decals via `spawn_impact_ring_decal()`.
+
+Standalone usage: add a `VoxelAbilityTelegraphs` node, assign `terrain`, and call
+`update_telegraphs(delta, is_play_mode, hero_feet, hero_yaw, hero_state, is_grounded,
+crosshair_hit, fly_tool_radius, slam_radius, dome_radius, wall_half_width)` each frame.
+`cycle_telegraph_mode()` returns the new mode name.
 
 ### Statue pairs
 
