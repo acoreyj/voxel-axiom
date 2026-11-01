@@ -762,20 +762,21 @@ removed.
 
 | Input | Action |
 | --- | --- |
-| `F` | Toggle Fly / Play mode |
+| `F` | Toggle Fly / Classic Play (first-person pickaxe) |
+| `H` | Toggle Fly / Hero Play (third-person abilities) |
 | `M` / `F8` | Start or abort the automated benchmark suite |
 | `W` / `A` / `S` / `D` | Move (fly) or run (play) |
-| `Space` | Fly up; jump or ledge-mantle in Play mode |
-| `E` | Fly up; toggle the Kelvin Ice Path in Play mode |
-| `Ctrl` / `Q` | Fly down; `Ctrl`/`C` slope-slide in Play mode, `Q` ground-slam while airborne |
-| `Shift` | Fly speed boost; stamina dash in Play mode (tap `Space` during the dash for a Dash-Jump) |
-| `V` | Toggle 3rd-person over-the-shoulder / 1st-person view in Play mode |
-| `G` | Shoulder Charge in Play mode (swept wall-pin, thin-wall breach, target capture) |
-| `Z` | Bebop Hyper Beam in Play mode (`Ctrl + Z` still undoes) |
-| `X` | Fire a bouncing Cryo Orb in Play mode |
+| `Space` | Fly up; jump in Classic Play; jump or ledge-mantle in Hero Play |
+| `E` | Fly up; toggle the Kelvin Ice Path in Hero Play |
+| `Ctrl` / `Q` | Fly down; `Ctrl`/`C` slope-slide in Hero Play, `Q` ground-slam while airborne |
+| `Shift` | Fly speed boost; sprint in Classic Play; stamina dash in Hero Play (tap `Space` during the dash for a Dash-Jump) |
+| `V` | Toggle 3rd-person over-the-shoulder / 1st-person view in Hero Play |
+| `G` | Shoulder Charge in Hero Play (swept wall-pin, thin-wall breach, target capture) |
+| `Z` | Bebop Hyper Beam in Hero Play (`Ctrl + Z` still undoes) |
+| `X` | Fire a bouncing Cryo Orb in Hero Play |
 | Mouse | Look |
-| `1` | Add terrain (Fly) / Kelvin Frozen Shelter (Play) |
-| `2` | Paint terrain (Fly, hold and drag) / McGinnis Spectral Wall (Play) |
+| `1` | Add terrain (Fly) / Kelvin Frozen Shelter (Hero) |
+| `2` | Paint terrain (Fly, hold and drag) / McGinnis Spectral Wall (Hero) |
 | `3` | Paint delete (hold and drag) |
 | `4` | Place boulder (static 5-hit voxel stamp) |
 | `Shift + 4` | Rolling boulder mode; click spawns a dynamic `RigidBody3D` that bakes into 5-hit voxels once it settles |
@@ -789,7 +790,7 @@ removed.
 | `B` | Stamp configured asset with reconstitution timer |
 | `Shift + B` | Stamp configured asset permanently |
 | `R` | Reset all six demo statues |
-| `Z` / `Ctrl + Z` | Undo the last edit, stroke, stamp, or statue swap (`Ctrl + Z` in Play mode) |
+| `Z` / `Ctrl + Z` | Undo the last edit, stroke, stamp, or statue swap (`Ctrl + Z` in Hero Play) |
 | `Y` / `Ctrl + Y` / `Ctrl + Shift + Z` | Redo the last undone action |
 | `Shift + R` / `Ctrl + R` | Undo every terrain edit and restore all statues to the pristine baseline |
 | `T` | Toggle add/paint material (soil / hard rock) |
@@ -797,13 +798,14 @@ removed.
 | `K` | Toggle the Sparring Combat Bot AI on the companion (auto-places it) |
 | `J` | Cycle 3D ability telegraph previews (Auto / Spectral Wall / Ice Dome / Off) |
 | `Right Click` (Fly) | Query a 3D cave path to the crosshair |
-| `Right Click` (Play) | Hold for over-the-shoulder ADS zoom |
+| `Right Click` (Hero) | Hold for over-the-shoulder ADS zoom |
 | `Shift + Right Click` | Place the companion and query a path |
 | `Left Click` (Fly) | Apply the active terrain tool |
-| `Left Click` (Play) | Hold to fire the ricochet carbine (infinite ammo while sliding) |
-| `R` (Play) | Reload the 24-round magazine (`Shift + R` resets statues) |
-| `M` / `Middle Click` (Play) | Heavy melee lunge and pickaxe carve |
-| `H` | Show or hide the controls overlay |
+| `Left Click` (Classic Play) | Swing the pickaxe |
+| `Left Click` (Hero) | Hold to fire the ricochet carbine (infinite ammo while sliding) |
+| `R` (Hero) | Reload the 24-round magazine (`Shift + R` resets statues) |
+| `M` / `Middle Click` (Hero) | Heavy melee lunge and pickaxe carve |
+| `F1` | Show or hide the controls overlay |
 | `U` | Hide all UI except the reticle and pickaxe; press again to restore |
 | `Escape` | Release mouse capture; click to recapture |
 
@@ -843,7 +845,7 @@ Inspector:
 
 ### Hero play mode
 
-`F` switches between Fly and a Deadlock-style third-person hero controller (`V` toggles
+`H` switches between Fly and a Deadlock-style third-person hero controller (`V` toggles
 first person). Movement and collision are driven by the C++ SDF queries rather than
 PhysicsServer3D: body probes at waist/chest/head depenetrate the capsule and slide velocity
 along `sample_sdf_normal`, with a 3-probe ledge mantle (wall face, ledge top, waist/head
@@ -861,6 +863,12 @@ stamina/dash/slide, mantling, shoulder charge, camera, and abilities. It exposes
 `wall_breached`. Assign `terrain` (a `VoxelTerrain3D`), optionally fill `chargeable_targets`,
 then call `step_controller(delta, input_move, want_jump, want_dash, want_crouch_slide,
 want_shoulder_charge)` from your own `_process`.
+
+### Classic first-person play mode
+
+`F` toggles the original first-person pickaxe controller: WASD run, `Shift` sprint, `Space`
+jump, and LMB pickaxe swing, with no stamina, abilities, weapon, or hero HUD. `H` enters the
+new Hero Play mode instead.
 
 ### GAS-lite ability system
 
@@ -1329,7 +1337,7 @@ These are kept for provenance. Use v4 for current behavior.
 | Craters look blockier than expected | Voxel resolution too coarse | Lower `voxel_scale` and re-bake assets; see [voxel size guide](voxel_size_configuration_guide.md#choosing-a-scale). |
 | Benchmark reports are missing in an exported build | `res://` is read-only in exports | Read `user://voxel_benchmark_report.md` and `user://voxel_benchmark_results.json` from the Godot user data directory; see [automated benchmark suite](#automated-benchmark-suite). |
 | `undo()` / `redo()` missing or "Nothing to undo" | Loaded GDExtension predates the undo bindings, or history was cleared | Rebuild the extension and confirm `bin/libvoxel_engine.windows.release.x86_64.dll` is current; see [undo and redo](#undo-and-redo). |
-| Pickaxe viewmodel is invisible | It is only shown in Play mode | Press `F` to enter Play mode. |
+| Pickaxe viewmodel is invisible | It is only shown in Classic/Hero Play | Press `F` for Classic Play or `H` for Hero Play. |
 | CMake cannot find `godot::cpp` | `GODOT_CPP_DIR` not set | Pass `-DGODOT_CPP_DIR=/path/to/godot-cpp` or add the godot-cpp subdirectory. |
 
 ---

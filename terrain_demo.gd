@@ -168,7 +168,7 @@ enum Tool { ADD_TERRAIN, PAINT, PAINT_DELETE, BOULDER, SMALL_HIT, EXPLODE, LARGE
 
 ## Fly is the free camera; Play is the Deadlock-style 3rd/1st-person Hero Controller;
 ## Benchmark sweeps multiple VoxelTerrain3D settings and logs hardware + FPS/latency metrics.
-enum Mode { FLY, PLAY, BENCHMARK }
+enum Mode { FLY, CLASSIC, PLAY, BENCHMARK }
 
 enum BenchmarkPhase { SETTLE, STREAM_FLIGHT, DESTRUCTION_CSG, NAVIGATION_3D }
 
@@ -231,12 +231,12 @@ const HERO_STATE_NAMES := ["Grounded", "Airborne", "Dashing", "Sliding", "Mantli
 
 const TOOL_NAMES := ["Add terrain", "Paint terrain", "Paint delete", "Place boulder", "Small hit", "Explode", "Large explode", "Water quench", "Frost / Ice", "Lava / Magma"]
 const TOOL_KEYS := ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"]
-const CONTROLS_TEXT := """CONTROLS  (H hide keys | U hide all UI)
-Mode    F fly / hero play   V toggle 3rd/1st person (in Play)   M (or F8) benchmark
+const CONTROLS_TEXT := """CONTROLS  (F1 hide keys | U hide all UI)
+Mode    F classic play (pickaxe)   H hero play   V 3rd/1st (hero)   M (or F8) benchmark
 Hero    WASD move   Shift dash (Space mid-dash = Dash-Jump!)   Ctrl/C slope slide
 Climb   Space jump/mantle   G Charge   E IcePath   Q Slam   Z HyperBeam   X CryoOrb
-Build   1 Ice Dome   2 Spectral Wall   Shift+4 roller   LMB pickaxe
-Weapon  Play: LMB Ricochet Gun (Slide=Inf Ammo!)   RMB Aim Zoom   R Reload   M Melee
+Build   1 Ice Dome   2 Spectral Wall   Shift+4 roller
+Weapon  Hero: LMB Ricochet Gun (Slide=Inf Ammo!)   RMB Aim Zoom   R Reload   M Melee
 Move    W/A/S/D   Space or E up   Ctrl or Q down   Shift sprint
 Look    Mouse   Esc releases cursor   click recaptures
 Build   1 Add terrain   2 Paint   3 Paint delete   4 Boulder
@@ -246,7 +246,7 @@ Element 8 Water   9 Frost/Ice   0 Lava/Magma
 Stamps  B timed ruin   Shift+B permanent ruin   K Sparring Bot AI   J 3D Telegraph
 History Undo %d (Z) | Redo %d (Y) | Reset All (Shift+R)
 World   R reset statues   T material   P place companion
-Mouse   Play LMB pickaxe   Fly LMB tool   RMB cave path   Shift+RMB place companion"""
+Mouse   Classic LMB pickaxe   Hero LMB gun   Fly LMB tool   RMB cave path   Shift+RMB companion"""
 const MATERIAL_NAMES := ["Soil", "Rock"]
 ## MaterialHardness::kMaterial* IDs -> display names for the "Looking at" HUD readout.
 const MATERIAL_ID_NAMES := ["Air", "Soil", "Hard Rock", "Lava", "Water", "Obsidian", "Ice", "Boulder"]
@@ -1095,10 +1095,24 @@ func _toggle_mode() -> void:
 	if _mode == Mode.BENCHMARK:
 		_stop_benchmark(true)
 		return
-	if _mode == Mode.FLY:
+	if _mode == Mode.CLASSIC:
+		_exit_classic()
+	elif _mode == Mode.PLAY:
+		_exit_play()
+		_enter_classic()
+	else:
+		_enter_classic()
+
+func _toggle_hero_mode() -> void:
+	if _mode == Mode.BENCHMARK:
+		_stop_benchmark(true)
+		return
+	if _mode == Mode.PLAY:
+		_exit_play()
+	elif _mode == Mode.CLASSIC:
 		_enter_play()
 	else:
-		_exit_play()
+		_enter_play()
 
 func _setup_pickaxe_viewmodel() -> void:
 	_viewmodel_root = camera.get_node_or_null("ViewmodelRoot") as Node3D
@@ -1107,7 +1121,7 @@ func _setup_pickaxe_viewmodel() -> void:
 		_viewmodel_root.name = "ViewmodelRoot"
 		camera.add_child(_viewmodel_root)
 	_viewmodel_root.position = BASE_VIEWMODEL_POS
-	_viewmodel_root.visible = (_mode == Mode.PLAY)
+	_viewmodel_root.visible = (_mode == Mode.PLAY or _mode == Mode.CLASSIC)
 
 	_shoulder_pivot = _viewmodel_root.get_node_or_null("ShoulderPivot") as Node3D
 	if _shoulder_pivot == null:
@@ -1520,6 +1534,7 @@ func _setup_ability_system_and_beam_visuals() -> void:
 	add_child(_telegraphs)
 
 func _enter_play() -> void:
+	var from_classic := _mode == Mode.CLASSIC
 	_mode = Mode.PLAY
 	_tool_pressed = false
 	_play_fire_held = false
@@ -1539,7 +1554,7 @@ func _enter_play() -> void:
 	_last_ice_path_anchor = Vector3(INF, INF, INF)
 	_stamina_charges = play_max_stamina
 	_stamina_regen_progress = 0.0
-	var eye := camera.global_position
+	var eye := (_player_feet + Vector3(0.0, play_eye_height, 0.0)) if from_classic else camera.global_position
 	var ground_y := _ground_probe(eye + Vector3(0.0, play_step_height, 0.0), 400.0)
 	_spawn_pending = not is_finite(ground_y)
 	_spawn_wait = 0.0
@@ -1584,6 +1599,160 @@ func _exit_play() -> void:
 	_fly_pcam.priority = 1
 	_play_pcam.priority = 0
 	print("[HeroController] Exited to Fly Mode (F to enter Hero Play Mode)")
+
+func _enter_classic() -> void:
+	_mode = Mode.CLASSIC
+	_tool_pressed = false
+	_play_fire_held = false
+	_play_ads_held = false
+	_ads_blend = 0.0
+	_swing_active = false
+	_swing_hit_done = false
+	_swing_elapsed = 0.0
+	_swing_hit_solid_recoil = 0.0
+	if _hero_visual_root != null:
+		_hero_visual_root.visible = false
+	if _viewmodel_root != null:
+		_viewmodel_root.visible = true
+		_viewmodel_root.position = BASE_VIEWMODEL_POS
+		_shoulder_pivot.rotation = BASE_SHOULDER_ROT
+		_elbow_pivot.rotation = BASE_ELBOW_ROT
+		_wrist_pivot.rotation = BASE_WRIST_ROT
+	var eye := camera.global_position
+	var ground_y := _ground_probe(eye + Vector3(0.0, play_step_height, 0.0), 400.0)
+	_spawn_pending = not is_finite(ground_y)
+	_spawn_wait = 0.0
+	_player_feet = Vector3(eye.x, eye.y - play_eye_height, eye.z)
+	if is_finite(ground_y):
+		_player_feet.y = ground_y
+	else:
+		# Taking over while hovering over a void: spawn on the visible terrain
+		# under the crosshair instead of dropping into the void below.
+		var aim := _pickaxe_aim_point()
+		if is_finite(aim.x):
+			var aim_ground := _ground_probe(aim + Vector3(0.0, play_step_height, 0.0), 400.0)
+			_player_feet = Vector3(aim.x, aim_ground if is_finite(aim_ground) else aim.y, aim.z)
+			_spawn_pending = false
+	_last_safe_feet = _player_feet
+	_player_vel = Vector3.ZERO
+	_player_vel_y = 0.0
+	_player_grounded = true
+	_hero_state = HeroState.GROUNDED
+	camera.fov = play_fov
+	_play_pcam.global_position = _player_feet + Vector3(0.0, play_eye_height, 0.0)
+	_play_pcam.rotation = Vector3(_pitch, _yaw, 0.0)
+	_play_pcam.priority = 1
+	_fly_pcam.priority = 0
+	print("[ClassicPlay] First-person pickaxe mode (F to fly, H for Hero mode)")
+
+func _exit_classic() -> void:
+	_mode = Mode.FLY
+	_swing_active = false
+	_swing_hit_done = false
+	_player_vel = Vector3.ZERO
+	_player_vel_y = 0.0
+	_player_grounded = false
+	_velocity = Vector3.ZERO
+	if _viewmodel_root != null:
+		_viewmodel_root.visible = false
+	camera.fov = _base_fov
+	_fly_pcam.global_transform = camera.global_transform
+	_fly_pcam.priority = 1
+	_play_pcam.priority = 0
+	print("[ClassicPlay] Exited to Fly Mode (F to re-enter, H for Hero mode)")
+
+func _process_classic(delta: float) -> void:
+	if _spawn_pending:
+		_spawn_wait += delta
+		var spawn_ground := _ground_probe(
+			camera.global_position + Vector3(0.0, play_step_height, 0.0), 400.0)
+		if is_finite(spawn_ground):
+			_player_feet = Vector3(_player_feet.x, spawn_ground, _player_feet.z)
+			_last_safe_feet = _player_feet
+			_player_vel = Vector3.ZERO
+			_player_vel_y = 0.0
+			_player_grounded = true
+			_spawn_pending = false
+		else:
+			_player_vel = Vector3.ZERO
+			_player_vel_y = 0.0
+			_player_grounded = false
+			_play_pcam.global_position = _player_feet + Vector3(0.0, play_eye_height, 0.0)
+			_play_pcam.rotation = Vector3(_pitch, _yaw, 0.0)
+			_update_pickaxe_swing(delta)
+			if _spawn_wait > 4.0:
+				_spawn_pending = false
+			return
+
+	var forward := Vector3(-sin(_yaw), 0.0, -cos(_yaw))
+	var right := Vector3(cos(_yaw), 0.0, -sin(_yaw))
+	var input_dir := Vector3.ZERO
+	if Input.is_key_pressed(KEY_W):
+		input_dir += forward
+	if Input.is_key_pressed(KEY_S):
+		input_dir -= forward
+	if Input.is_key_pressed(KEY_A):
+		input_dir -= right
+	if Input.is_key_pressed(KEY_D):
+		input_dir += right
+
+	var speed := play_run_speed if Input.is_key_pressed(KEY_SHIFT) else play_walk_speed
+	var wish := input_dir.normalized() * speed if input_dir.length_squared() > 0.0 else Vector3.ZERO
+	_player_vel = wish
+	_velocity = wish
+	_move_classic_horizontal(wish * delta)
+
+	var prev_y := _player_feet.y
+	_player_vel_y = maxf(_player_vel_y - play_gravity * delta, -80.0)
+	_player_feet.y += _player_vel_y * delta
+	var probe_top := maxf(prev_y, _player_feet.y) + play_step_height
+	var ground_y := _ground_probe(
+		Vector3(_player_feet.x, probe_top, _player_feet.z),
+		probe_top - _player_feet.y + 1.0
+	)
+	if not is_finite(ground_y) and not _player_grounded:
+		var rescue_y := _ground_probe(
+			Vector3(_player_feet.x, _player_feet.y + 2.0, _player_feet.z), 4.0)
+		if is_finite(rescue_y) and rescue_y >= _player_feet.y - 0.2:
+			ground_y = rescue_y
+	if is_finite(ground_y):
+		var within_step := ground_y - prev_y <= play_step_height + 0.05
+		var crossing := _player_feet.y <= ground_y
+		var snap_to_ground := _player_grounded and _player_vel_y <= 0.0 \
+			and _player_feet.y - ground_y <= 0.35
+		if within_step and (crossing or snap_to_ground):
+			_player_feet.y = ground_y
+			_player_vel_y = 0.0
+			_player_grounded = true
+		else:
+			_player_grounded = false
+	else:
+		_player_grounded = false
+
+	if _player_grounded:
+		_last_safe_feet = _player_feet
+	elif _player_feet.y < _last_safe_feet.y - 80.0 or _player_feet.y < -64.0:
+		_player_feet = _last_safe_feet
+		_player_vel = Vector3.ZERO
+		_player_vel_y = 0.0
+		_player_grounded = true
+
+	_play_pcam.global_position = _player_feet + Vector3(0.0, play_eye_height, 0.0)
+	_play_pcam.rotation = Vector3(_pitch, _yaw, 0.0)
+	_update_pickaxe_swing(delta)
+
+func _move_classic_horizontal(motion: Vector3) -> void:
+	if motion.length_squared() < 0.000001:
+		return
+	if not _player_path_blocked(motion):
+		_player_feet += motion
+		return
+	var slide_x := Vector3(motion.x, 0.0, 0.0)
+	var slide_z := Vector3(0.0, 0.0, motion.z)
+	if absf(slide_x.x) > 0.0001 and not _player_path_blocked(slide_x):
+		_player_feet += slide_x
+	if absf(slide_z.z) > 0.0001 and not _player_path_blocked(slide_z):
+		_player_feet += slide_z
 
 func _start_pickaxe_swing() -> void:
 	if _swing_active:
@@ -2231,6 +2400,11 @@ func _try_dash() -> void:
 	_play_hero_action("mgl_standing_sprint_forward", 0.26, 1.4)
 
 func _try_jump() -> void:
+	if _mode == Mode.CLASSIC:
+		if _player_grounded:
+			_player_vel_y = play_jump_speed
+			_player_grounded = false
+		return
 	if _mode != Mode.PLAY:
 		return
 	var forward := Vector3(-sin(_yaw), 0.0, -cos(_yaw))
@@ -2685,6 +2859,8 @@ func _unhandled_input(event: InputEvent) -> void:
 				elif wall_res.get("action") == "dismissed":
 					print("[GAS] Dropped McGinnis Spectral Wall (#%d) early!" % int(wall_res.get("structure_id", 0)))
 				return
+		if _mode == Mode.CLASSIC and event.keycode in [KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_0, KEY_B]:
+			return
 		if _mode == Mode.PLAY and event.keycode in [KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_0, KEY_B]:
 			return
 		match event.keycode:
@@ -2764,6 +2940,8 @@ func _unhandled_input(event: InputEvent) -> void:
 			KEY_B:
 				_stamp_asset_at_crosshair(0.0 if Input.is_key_pressed(KEY_SHIFT) else stamp_recreate_delay_seconds)
 			KEY_H:
+				_toggle_hero_mode()
+			KEY_F1:
 				_controls_visible = not _controls_visible
 				controls_label.visible = _controls_visible and not _ui_hidden
 			KEY_U:
@@ -2829,6 +3007,11 @@ func _unhandled_input(event: InputEvent) -> void:
 				if event.pressed:
 					_fire_primary_ricochet_carbine()
 				return
+			if _mode == Mode.CLASSIC:
+				_tool_pressed = false
+				if event.pressed:
+					_start_pickaxe_swing()
+				return
 			_tool_pressed = event.pressed
 			if event.pressed:
 				if _is_drag_tool():
@@ -2843,7 +3026,7 @@ func _unhandled_input(event: InputEvent) -> void:
 			else:
 				if not _active_undo_action.is_empty():
 					_end_undo_action()
-		elif event.button_index == MOUSE_BUTTON_MIDDLE and event.pressed and _mode == Mode.PLAY:
+		elif event.button_index == MOUSE_BUTTON_MIDDLE and event.pressed and (_mode == Mode.PLAY or _mode == Mode.CLASSIC):
 			_player_vel += Vector3(-sin(_yaw), 0.0, -cos(_yaw)) * 4.5
 			_start_pickaxe_swing()
 		elif event.button_index == MOUSE_BUTTON_RIGHT:
@@ -2865,6 +3048,8 @@ func _process(delta: float) -> void:
 	elif _mode == Mode.PLAY:
 		_process_play(delta)
 		_update_hero_animations(delta)
+	elif _mode == Mode.CLASSIC:
+		_process_classic(delta)
 	else:
 		_process_fly(delta)
 
@@ -2874,7 +3059,7 @@ func _process(delta: float) -> void:
 	_update_rolling_boulders(delta)
 	_update_stream_focus(false)
 	if _bot_ai != null and _bot_ai.combat_enabled and _companion_initialized:
-		var hero_pos := _player_feet if _mode == Mode.PLAY else (camera.global_position - Vector3(0.0, 1.5, 0.0))
+		var hero_pos := _player_feet if (_mode == Mode.PLAY or _mode == Mode.CLASSIC) else (camera.global_position - Vector3(0.0, 1.5, 0.0))
 		var is_stunned := _companion_stun_timer > 0.0 or _charge_pinned_companion or \
 			(_gas != null and _gas.is_target_stunned(ai_companion))
 		# Update companion visual tint & stun timer
@@ -2988,10 +3173,12 @@ func _update_hud(delta: float) -> void:
 		]
 		return
 
-	var mode_name := ("Hero 3P" if play_third_person else "Hero 1P") if _mode == Mode.PLAY else "Fly"
+	var mode_name := ("Hero 3P" if play_third_person else "Hero 1P") if _mode == Mode.PLAY else ("Classic Play" if _mode == Mode.CLASSIC else "Fly")
 	var pips := "■".repeat(_stamina_charges) + "□".repeat(maxi(0, play_max_stamina - _stamina_charges))
 	var foot_mat_name: String = MATERIAL_ID_NAMES[_foot_material] if _foot_material >= 0 and _foot_material < MATERIAL_ID_NAMES.size() else "Air"
 	var tool_text := "[%s] %s%s" % [TOOL_KEYS[_active_tool], TOOL_NAMES[_active_tool], material_state]
+	if _mode == Mode.CLASSIC:
+		tool_text = "Pickaxe (LMB swing)"
 	if _mode == Mode.PLAY:
 		var spirit_val := _gas.hero_attributes.get_spirit_power() if _gas != null else 42.0
 		var hero_hp := _gas.hero_attributes.health if _gas != null else 750.0
