@@ -1337,7 +1337,7 @@ These are kept for provenance. Use v4 for current behavior.
 | Craters look blockier than expected | Voxel resolution too coarse | Lower `voxel_scale` and re-bake assets; see [voxel size guide](voxel_size_configuration_guide.md#choosing-a-scale). |
 | Benchmark reports are missing in an exported build | `res://` is read-only in exports | Read `user://voxel_benchmark_report.md` and `user://voxel_benchmark_results.json` from the Godot user data directory; see [automated benchmark suite](#automated-benchmark-suite). |
 | `undo()` / `redo()` missing or "Nothing to undo" | Loaded GDExtension predates the undo bindings, or history was cleared | Rebuild the extension and confirm `bin/libvoxel_engine.windows.release.x86_64.dll` is current; see [undo and redo](#undo-and-redo). |
-| Pickaxe viewmodel is invisible | It is only shown in Classic/Hero Play | Press `F` for Classic Play or `H` for Hero Play. |
+| Pickaxe viewmodel is invisible | It is only shown in Classic Play | Press `F` for Classic Play; Hero Play uses the Grim Wanderer model. |
 | CMake cannot find `godot::cpp` | `GODOT_CPP_DIR` not set | Pass `-DGODOT_CPP_DIR=/path/to/godot-cpp` or add the godot-cpp subdirectory. |
 
 ---

@@ -1121,7 +1121,7 @@ func _setup_pickaxe_viewmodel() -> void:
 		_viewmodel_root.name = "ViewmodelRoot"
 		camera.add_child(_viewmodel_root)
 	_viewmodel_root.position = BASE_VIEWMODEL_POS
-	_viewmodel_root.visible = (_mode == Mode.PLAY or _mode == Mode.CLASSIC)
+	_viewmodel_root.visible = (_mode == Mode.CLASSIC)
 
 	_shoulder_pivot = _viewmodel_root.get_node_or_null("ShoulderPivot") as Node3D
 	if _shoulder_pivot == null:
@@ -1545,7 +1545,7 @@ func _enter_play() -> void:
 	_swing_elapsed = 0.0
 	_swing_hit_solid_recoil = 0.0
 	if _viewmodel_root != null:
-		_viewmodel_root.visible = true
+		_viewmodel_root.visible = false
 		_viewmodel_root.position = BASE_VIEWMODEL_POS
 		_shoulder_pivot.rotation = BASE_SHOULDER_ROT
 		_elbow_pivot.rotation = BASE_ELBOW_ROT
