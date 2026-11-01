@@ -1768,8 +1768,8 @@ func _start_pickaxe_swing() -> void:
 func _update_pickaxe_swing(delta: float) -> void:
 	if _viewmodel_root == null:
 		return
-	# Allow holding Left Mouse Button in Play mode to continuously swing the pickaxe
-	if _mode == Mode.PLAY and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED and Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
+	# Allow holding Left Mouse Button in Classic Play to continuously swing the pickaxe
+	if _mode == Mode.CLASSIC and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED and Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
 		if not _swing_active:
 			_start_pickaxe_swing()
 
@@ -2606,7 +2606,7 @@ func _step_hero_shoulder_charge(delta: float) -> void:
 		_companion_vertical_vel = 0.0
 
 func _try_ground_slam() -> void:
-	if _mode != Mode.PLAY or _player_grounded or _hero_state == HeroState.MANTLING:
+	if _mode != Mode.PLAY or _hero_state == HeroState.MANTLING:
 		return
 	if _gas != null:
 		var check := _gas.can_activate_ability("lash_ground_strike", _gas.hero_tags | VoxelAbilitySystem.Tag.AIRBORNE)
@@ -2614,6 +2614,11 @@ func _try_ground_slam() -> void:
 			print("[GAS] Ground Strike blocked: %s" % String(check.get("reason", "")))
 			return
 		_gas.commit_ability_cooldown("lash_ground_strike")
+	# Allow an in-place ground pound too: a short hop gives the dive one frame
+	# to contact the floor when the player presses Q while standing.
+	if _player_grounded:
+		_player_grounded = false
+		_player_feet.y += 0.05
 	_hero_state = HeroState.GROUND_SLAM
 	var aim_fwd := Vector3(-sin(_yaw), 0.0, -cos(_yaw)) * 8.0
 	_player_vel.x = aim_fwd.x

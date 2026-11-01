@@ -882,7 +882,7 @@ mode, cooldown/charges, Spirit scaling), 11 Hz channel ticks, and SDF-bouncing p
 | --- | --- | --- |
 | `E` | Kelvin Ice Path | Toggle a Frost capsule bridge and grant Ice Surge (+18 Spirit, +24% speed). |
 | `G` | Abrams Shoulder Charge | Capture a target, deal `110 + 1.5 * Spirit` on a wall pin, +50% shatter bonus on cracked rock, and apply Wall-Pin Stun. |
-| `Q` | Lash Ground Strike | Airborne slam with Lava/Ice/Water elemental combo variants. |
+| `Q` | Lash Ground Strike | Airborne dive or in-place ground pound with Lava/Ice/Water elemental combo variants. |
 | `Z` | Bebop Hyper Beam | 2.6 s CHANNELING + UNSTOPPABLE lava trench; voxel edits are throttled to 11 Hz. |
 | `X` | Cryo Bounce Orb | Two-charge ricochet orb; bounces off `sweep_sphere` normals and applies Chilled/Frozen ice shells. |
 | `1` | Kelvin Frozen Shelter | Hollow 8.5 m Ice Dome (TTL 6.5 s); press again to shatter early. |
