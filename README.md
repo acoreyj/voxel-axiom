@@ -112,7 +112,15 @@ asset baker or tests, step 1 produces `voxel_baker` and the CTest suites.
 | **Undo / redo** | Bit-exact per-chunk snapshot history for edits, stamps, and structure removals, plus a coalesced full-world reset | [Undo and redo](#undo-and-redo) |
 | **Physics collision** | Per-chunk concave `PhysicsServer3D` bodies with distance gating and optional subsampling | [Design v4, Section 4.4](docs/Voxel%20Design%20Doc%20v4.md#44-physics-collision) |
 | **Triplanar shading** | Material-aware PBR shader with grass, soil, rock, lava, water, obsidian, ice, and crack glow | [`voxel_triplanar.gdshader`](voxel_triplanar.gdshader) |
-| **First-person pickaxe** | Procedurally built arm and pickaxe viewmodel with windup, strike, follow-through, solid-hit recoil, bob, mouse sway, and impact sparks | [`terrain_demo.gd`](terrain_demo.gd) |
+| **First-person pickaxe** | Procedurally built arm and pickaxe viewmodel with windup, strike, follow-through, solid-hit recoil, bob, mouse sway, and impact sparks (Classic Play) | [`terrain_demo.gd`](terrain_demo.gd) |
+| **Classic / Hero play modes** | `F` enters the original first-person pickaxe controller; `H` enters the third-person hero sandbox | [Gameplay Systems](docs/Gameplay%20Systems%20%26%20Hero%20Sandbox.md#1-modes) |
+| **SDF hero movement** | Capsule collide-and-slide, 3-probe ledge mantling, stamina dash/dash-jump, slope slides, and O(1) surface queries | [Gameplay Systems §2](docs/Gameplay%20Systems%20%26%20Hero%20Sandbox.md#2-hero-play-controller) |
+| **GAS-lite abilities** | Tags, attributes, status effects, seven Deadlock-style abilities, cooldowns, and Spirit scaling | [Gameplay Systems §4](docs/Gameplay%20Systems%20%26%20Hero%20Sandbox.md#4-gas-lite-ability-system) |
+| **Ricochet carbine** | 24-round automatic weapon, two SDF ricochets, headshots, ADS, reload, slide-infinite ammo, and 3D tracers | [Gameplay Systems §5](docs/Gameplay%20Systems%20%26%20Hero%20Sandbox.md#5-primary-weapon) |
+| **Temporary voxel constructs** | Kelvin Ice Dome and McGinnis Spectral Wall with TTLs, early dismissal, and per-voxel damage-preserving backups | [Gameplay Systems §6](docs/Gameplay%20Systems%20%26%20Hero%20Sandbox.md#6-temporary-voxel-constructs) |
+| **Combat bot AI** | Five-state FSM with LoS, 3D pursuit, safe strafing, plasma bolts, magma mortars, and breach blasts | [Gameplay Systems §7](docs/Gameplay%20Systems%20%26%20Hero%20Sandbox.md#7-combat-bot-ai) |
+| **Ability telegraphs** | Terrain-draped rings, wall discs, curtains, dome arches, and expanding impact shockwaves | [Gameplay Systems §8](docs/Gameplay%20Systems%20%26%20Hero%20Sandbox.md#8-ability-telegraphs-and-impact-decals) |
+| **Grim Wanderer model** | 1.9 m, 65-joint Mixamo rig with 64 clips and a controller-driven animation state machine | [Hero Character & Animation](docs/Hero%20Character%20%26%20Animation.md) |
 | **Clean-screen UI toggle** | One button (or `U`) hides the stats readout, controls overlay, world labels, and the button itself, leaving only the reticle and pickaxe for screenshots | [`terrain_demo.gd`](terrain_demo.gd) |
 | **Instrumentation** | Lock-free per-stage timings for generate, mesh, commit, edit, streaming, and navigation | [Performance analysis](docs/Voxel%20Performance%20Analysis.md), [`stage_timings.hpp`](include/stage_timings.hpp) |
 | **Benchmark suite** | Five streaming/collision presets measure frame percentiles, streaming, CSG latency, navigation, VRAM, RAM, and draw calls; writes Markdown and JSON reports | [Automated benchmark suite](#automated-benchmark-suite) |
@@ -1290,6 +1298,8 @@ voxel/
 | Document | What it covers |
 | --- | --- |
 | [Voxel Design Doc v4](docs/Voxel%20Design%20Doc%20v4.md) | Current architecture: chunk store, concurrency, streaming, worker pool, persistence, GDExtension wrapper, physics, navigation, build, verification, milestones. Start here for a deep technical read. |
+| [Gameplay Systems & Hero Sandbox](docs/Gameplay%20Systems%20%26%20Hero%20Sandbox.md) | Modes, controls, SDF hero controller, GAS-lite abilities, ricochet carbine, temporary constructs, combat bot, telegraphs, demo wiring, build/test matrix, tuning. |
+| [Hero Character & Animation](docs/Hero%20Character%20%26%20Animation.md) | Grim Wanderer GLB, Mixamo rig, origin/orientation, controller-to-clip mapping, 64-clip inventory, extension caveats. |
 | [AI Companion & Navigation](docs/AI%20Companion%20%26%20Navigation.md) | `VoxelAICompanion` API, 4x2x4 navigation groups, revision/epoch model, bake lifecycle, cave-tuned NavMesh parameters, demo usage, gotchas, verification map. |
 | [Asset Stamping and Reconstitution](docs/asset%20stamping%20and%20reconstitution.md) | `voxel_baker` options, narrow-band TSDF baking, RGB5551 color, Union/Overwrite blending, damage tracking, C++ API, tests, troubleshooting. |
 | [Voxel Performance Analysis](docs/Voxel%20Performance%20Analysis.md) | Measured baselines, P0/P1/P2 findings, fixed/open status, verification plan, measurement ledger, repo hygiene. |
